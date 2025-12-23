@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 board:
-  name: NiNi_slimevr
-  vendor: NiNi_Unicorn & MINGYUE
+  name: nini_slimevr_uf2
+  vendor: nordic
   socs:
     - name: nrf52833
+      variants:
+      - name: 'i2c'
+      - name: 'spi'
