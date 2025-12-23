@@ -85,6 +85,12 @@
 		pwm-led0 = &pwm_led0;
 	};
 
+	pwmclock: pwmclock {
+		compatible = "pwm-clock";
+		#clock-cells = <1>;
+		pwms = <&pwm1 0 PWM_HZ(32768) PWM_POLARITY_NORMAL>;
+	};
+
 	battery-divider {
 		compatible = "voltage-divider";
 		status = "okay";
@@ -98,6 +104,7 @@
 		int0-gpios = <&gpio0 2 0>;
 		led-gpios = <&gpio0 4 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_LOW)>;
 		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		clk-gpios = <&gpio0 31 GPIO_OPEN_DRAIN>;
 	};
 
 };
