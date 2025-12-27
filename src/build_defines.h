@@ -51,6 +51,7 @@ static uint8_t get_server_constant_tracker_status(int status) __attribute__((unu
 #define SVR_IMU_BMI160 8
 #define SVR_IMU_ICM20948 9
 #define SVR_IMU_ICM42688 10
+#define SVR_IMU_IIM42652 19
 #define SVR_IMU_BMI270 11
 #define SVR_IMU_LSM6DS3TRC 12
 #define SVR_IMU_LSM6DSV 13
@@ -183,6 +184,8 @@ static uint8_t get_server_constant_imu_id(int id)
 		return SVR_IMU_ICM20948;
 	case IMU_ICM42688:
 		return SVR_IMU_ICM42688;
+	case IMU_IIM42652:
+		return SVR_IMU_IIM42652;
 	case IMU_ICM45686:
 		return SVR_IMU_ICM45686;
 	case IMU_ISM330IS:
@@ -201,6 +204,8 @@ static uint8_t get_server_constant_imu_id(int id)
 		return SVR_IMU_LSM6DSV;
 	case IMU_ISM330BX:
 		return SVR_IMU_LSM6DSV; // not really
+	case IMU_BNO085:
+		return SVR_IMU_BNO085;
 	default:
 		return SVR_IMU_UNKNOWN;
 	}

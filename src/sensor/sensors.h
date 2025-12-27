@@ -29,6 +29,7 @@
 
 #include "imu/BMI270.h"
 #include "imu/ICM42688.h"
+#include "imu/IIM42652.h"
 #include "imu/ICM45686.h"
 #include "imu/LSM6DSM.h"
 #include "imu/LSM6DSO.h"
@@ -59,6 +60,7 @@ const char *dev_imu_names[] = {
 	"MPU-9250",
 	"ICM-20948",
 	"ICM-42688-P/ICM-42688-V",
+	"IIM-42652",
 	"ICM-45686",
 	"LSM6DSO16IS/ISM330IS",
 	"LSM6DS3",
@@ -78,6 +80,7 @@ const sensor_imu_t *sensor_imus[] = {
 	&sensor_imu_none,  // cardinal sin
 	&sensor_imu_none,
 	&sensor_imu_icm42688,
+	&sensor_imu_iim42652,
 	&sensor_imu_icm45686,
 	&sensor_imu_none, // will not implement, does not have FIFO
 	&sensor_imu_lsm6dsm, // compatible with driver (unfortunately)
