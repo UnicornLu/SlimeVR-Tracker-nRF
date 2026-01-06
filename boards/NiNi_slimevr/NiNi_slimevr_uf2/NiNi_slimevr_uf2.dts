@@ -132,7 +132,8 @@
 		reg = <0>;
 		spi-max-frequency = <8000000>;
 	};
-}
+};
+
 zephyr_udc0: &usbd {
 	compatible = "nordic,nrf-usbd";
 	status = "okay";
