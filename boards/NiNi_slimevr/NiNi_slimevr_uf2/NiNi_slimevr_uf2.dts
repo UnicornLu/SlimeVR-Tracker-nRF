@@ -6,21 +6,6 @@
 
 //move to dtsi?
 &pinctrl {
-	//i2c0_default: i2c0_default {
-		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 28)>, <NRF_PSEL(TWIM_SCL, 0, 29)>;
-			bias-disable;
-		};
-	};
-
-	//i2c0_sleep: i2c0_sleep {
-		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 28)>, <NRF_PSEL(TWIM_SCL, 0, 29)>;
-			bias-disable;
-			low-power-enable;
-		};
-	};
-
 	pwm0_default: pwm0_default {
 		group1 {
 			psels = <NRF_PSEL(PWM_OUT0, 0, 4)>;
@@ -75,7 +60,7 @@
 	buttons {
 		compatible = "gpio-keys";
 		button0: button_0 {
-			gpios = <&gpio0 18 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			gpios = <&gpio0 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 			label = "Push button switch 0";
 		};
 	};
@@ -123,30 +108,6 @@
 
 &gpio1 {
 	status = "okay";
-};
-
-&i2c0 {
-	compatible = "nordic,nrf-twim";
-	status = "okay";
-	zephyr,concat-buf-size = <1023>;
-	zephyr,flash-buf-max-size = <1023>;
-	clock-frequency = <I2C_BITRATE_FAST>;
-	pinctrl-0 = <&i2c0_default>;
-	pinctrl-1 = <&i2c0_sleep>;
-	pinctrl-names = "default", "sleep";
-
-	//imu: imu@0 { // any address out of range (00, 7f, etc. will search all addresses and stored address first if available, specify an address here to search first otherwise
-		compatible = "i2c-device";
-		label = "imu";
-		reg = <0>;
-	};
-
-	mag: mag@0 {
-		compatible = "i2c-device";
-		label = "mag";
-		reg = <0>;
-	};
-
 };
 
 &pwm0 {
