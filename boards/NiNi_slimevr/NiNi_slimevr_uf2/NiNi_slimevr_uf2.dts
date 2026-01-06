@@ -79,7 +79,7 @@
 	};
 
 	zephyr,user {
-		int0-gpios = <&gpio0 0 30>;
+		int0-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;
 		led-gpios = <&gpio0 4 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_LOW)>;
 		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
@@ -117,6 +117,22 @@
 	pinctrl-names = "default", "sleep";
 };
 
+&spi2 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+
+	imu: imu@0 {
+		compatible = "zephyr,spidev";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+	};
+}
 zephyr_udc0: &usbd {
 	compatible = "nordic,nrf-usbd";
 	status = "okay";
