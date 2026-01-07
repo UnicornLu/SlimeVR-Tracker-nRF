@@ -127,7 +127,7 @@
 
 	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
 
-	imu: imu@0 {
+	imu_spi: imu@0 {
 		compatible = "zephyr,spidev";
 		reg = <0>;
 		spi-max-frequency = <8000000>;
