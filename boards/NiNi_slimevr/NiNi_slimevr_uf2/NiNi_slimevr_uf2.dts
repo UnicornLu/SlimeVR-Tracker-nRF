@@ -6,31 +6,33 @@
 
 //move to dtsi?
 &pinctrl {
-	i2c0_default: i2c0_default {
-		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>, <NRF_PSEL(TWIM_SCL, 0, 6)>;
-			bias-disable;
-		};
-	};
-
-	i2c0_sleep: i2c0_sleep {
-		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>, <NRF_PSEL(TWIM_SCL, 0, 6)>;
-			bias-disable;
-			low-power-enable;
-		};
-	};
-
 	pwm0_default: pwm0_default {
 		group1 {
 			psels = <NRF_PSEL(PWM_OUT0, 0, 4)>;
 			nordic,drive-mode = <NRF_DRIVE_D0S1>;
+			nordic,invert;
 		};
 	};
 
 	pwm0_sleep: pwm0_sleep {
 		group1 {
 			psels = <NRF_PSEL(PWM_OUT0, 0, 4)>;
+			low-power-enable;
+		};
+	};
+
+	/* I2C (TWIM) pinctrl for NiNi: SDA = P0.28, SCL = P0.29 */
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 28)>, <NRF_PSEL(TWIM_SCL, 0, 29)>;
+			bias-disable;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 28)>, <NRF_PSEL(TWIM_SCL, 0, 29)>;
+			bias-disable;
 			low-power-enable;
 		};
 	};
@@ -124,13 +126,6 @@
 	status = "okay";
 };
 
-&pwm0 {
-	status = "okay";
-	pinctrl-0 = <&pwm0_default>;
-	pinctrl-1 = <&pwm0_sleep>;
-	pinctrl-names = "default", "sleep";
-};
-
 &i2c0 {
 	compatible = "nordic,nrf-twim";
 	status = "okay";
@@ -141,11 +136,10 @@
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
 
-	imu: imu@69 { // ICM45686 on I2C address 0x69 (SDO tied to P0.29)
-		compatible = "invensense,icm45686";
-		label = "icm45686";
-		reg = <0x69>;
-		status = "okay";
+	imu: imu@0 {
+		compatible = "i2c-device";
+		label = "imu";
+		reg = <0>;
 	};
 
 	mag: mag@0 {
@@ -155,17 +149,25 @@
 	};
 };
 
-&spi1 {
-	compatible = "nordic,nrf-spim";
+&pwm0 {
 	status = "okay";
-	max-frequency = <DT_FREQ_M(8)>;
+	pinctrl-0 = <&pwm0_default>;
+	pinctrl-1 = <&pwm0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi2 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
 	pinctrl-names = "default", "sleep";
+
 	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu@0 {
-		compatible = "invensense,icm45686";
+		compatible = "vnd,spi-device";
 		spi-max-frequency = <DT_FREQ_M(8)>;
 		label = "imu-spi";
 		reg = <0>;
