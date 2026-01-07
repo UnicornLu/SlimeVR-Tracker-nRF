@@ -80,7 +80,7 @@
 
 	zephyr,user {
 		int0-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;
-		led-gpios = <&gpio0 4 (GPIO_OPEN_DRAIN | GPIO_ACTIVE_LOW)>;
+		led-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
 		chg-gpios = <&gpio1 09 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 
