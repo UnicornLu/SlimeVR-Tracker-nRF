@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /dts-v1/;
+
 #include <nordic/nrf52833_qdaa.dtsi>
 
-//move to dtsi?
+/* Rewritten to follow mochi_uf2.dts structure while preserving NiNi pin assignments */
+
 &pinctrl {
 	pwm0_default: pwm0_default {
 		group1 {
@@ -36,7 +38,8 @@
 			low-power-enable;
 		};
 	};
-		spi2_default: spi2_default {
+
+	spi2_default: spi2_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 2)>,
 					<NRF_PSEL(SPIM_MOSI, 0, 28)>,
@@ -53,9 +56,9 @@
 		};
 	};
 };
-//end
 
-/ {
+/
+{
 	model = "NiNi_slimevr_uf2";
 	compatible = "NiNi_slimevr_uf2";
 
@@ -97,9 +100,8 @@
 	zephyr,user {
 		int0-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;
 		led-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
-		chg-gpios = <&gpio1 09 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		chg-gpios = <&gpio1 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
-
 };
 
 &reg0 {
@@ -126,6 +128,13 @@
 	status = "okay";
 };
 
+&pwm0 {
+	status = "okay";
+	pinctrl-0 = <&pwm0_default>;
+	pinctrl-1 = <&pwm0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
 &i2c0 {
 	compatible = "nordic,nrf-twim";
 	status = "okay";
@@ -141,29 +150,14 @@
 		label = "imu";
 		reg = <0>;
 	};
-
-	mag: mag@0 {
-		compatible = "i2c-device";
-		label = "mag";
-		reg = <0>;
-	};
-};
-
-&pwm0 {
-	status = "okay";
-	pinctrl-0 = <&pwm0_default>;
-	pinctrl-1 = <&pwm0_sleep>;
-	pinctrl-names = "default", "sleep";
 };
 
 &spi2 {
 	status = "okay";
 	compatible = "nordic,nrf-spim";
-
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
 	pinctrl-names = "default", "sleep";
-
 	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu@0 {

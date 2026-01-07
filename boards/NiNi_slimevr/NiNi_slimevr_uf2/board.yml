@@ -3,9 +3,6 @@
 
 board:
   name: nini_slimevr_uf2
-  vendor: nordic
+  vendor: NiNi_Unicorn
   socs:
     - name: nrf52833
-      variants:
-      - name: 'i2c'
-      - name: 'spi'
