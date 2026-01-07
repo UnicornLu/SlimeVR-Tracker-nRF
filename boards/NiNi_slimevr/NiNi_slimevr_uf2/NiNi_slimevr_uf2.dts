@@ -117,7 +117,7 @@
 	pinctrl-names = "default", "sleep";
 };
 
-&spi1 {
+&spi2 {
 	compatible = "nordic,nrf-spim";
 	status = "okay";
 	max-frequency = <DT_FREQ_M(8)>;
