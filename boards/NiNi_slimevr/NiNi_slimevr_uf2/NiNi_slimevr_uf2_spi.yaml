@@ -1,0 +1,15 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+identifier: NiNi_slimevr_uf2/nrf52833/spi
+name: NiNi_slimevr_uf2_spi
+vendor: NiNi_Unicorn
+type: mcu
+arch: arm
+ram: 128
+flash: 512
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+

@@ -7,4 +7,5 @@ board:
   socs:
     - name: nrf52833
       variants:
+      - name: 'i2c'
       - name: 'spi'
