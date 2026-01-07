@@ -126,7 +126,7 @@
 	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu@0 {
-		compatible = "vnd,spi-device";
+		compatible = "invensense,icm45686";
 		spi-max-frequency = <DT_FREQ_M(8)>;
 		label = "imu-spi";
 		reg = <0>;
