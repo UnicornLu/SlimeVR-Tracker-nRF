@@ -1,4 +1,4 @@
-/ 
+/ {
 	battery-divider {
 		compatible = "voltage-divider";
 		status = "okay";
@@ -13,7 +13,7 @@
 	};
 };
 
-arduino_spi: &spi2 {
+arduino_spi: &spi3 {
 	imu_spi: imu_spi@0 {
 		compatible = "vnd,spi-device";
 		spi-max-frequency = <DT_FREQ_M(24)>;
@@ -21,3 +21,18 @@ arduino_spi: &spi2 {
 		reg = <0>;
 	};
 };
+
+leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
+		};
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+		};
+	};
