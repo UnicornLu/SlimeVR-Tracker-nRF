@@ -121,7 +121,7 @@
 };
 
 &spi2 {
-	status = "okay";
+	status = "enable";
 	compatible = "nordic,nrf-spim";
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
