@@ -413,7 +413,6 @@ static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 	wait_for_logging();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
-	uf2_clear_dfu_triggers();
 #endif
 	sys_poweroff();
 #else
