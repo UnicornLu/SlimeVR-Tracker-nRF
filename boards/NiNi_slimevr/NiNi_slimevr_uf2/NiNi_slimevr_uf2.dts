@@ -55,11 +55,7 @@
 
 	aliases {
 		sw0 = &button0;
-<<<<<<< Updated upstream
 		led0 = &led0;
-=======
-		led0 = led0;
->>>>>>> Stashed changes
 	};
 
 	battery-divider {
