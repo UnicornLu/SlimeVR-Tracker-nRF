@@ -28,12 +28,3 @@
 	};
 };
 
-/ {
-    /* Define SRAM region explicitly (board may be using stub.dts, so &sram0 doesn't exist) */
-    sram0: sram@20000000 {
-        compatible = "zephyr,memory-region", "mmio-sram";
-        reg = <0x20000000 0x1F000>; /* 124 KiB */
-        zephyr,memory-region = "SRAM";
-        status = "okay";
-    };
-};
