@@ -11,18 +11,8 @@
 		sw0 = &button0;
 		led0 = &led0;
 	};
-};
 
-arduino_spi: &spi3 {
-	imu_spi: imu_spi@0 {
-		compatible = "vnd,spi-device";
-		spi-max-frequency = <DT_FREQ_M(24)>;
-		label = "imu-spi";
-		reg = <0>;
-	};
-};
-
-leds {
+	leds {
 		compatible = "gpio-leds";
 		led0: led_0 {
 			gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
@@ -36,3 +26,13 @@ buttons {
 			label = "Push button switch 0";
 		};
 	};
+};
+
+arduino_spi: &spi3 {
+	imu_spi: imu_spi@0 {
+		compatible = "vnd,spi-device";
+		spi-max-frequency = <DT_FREQ_M(24)>;
+		label = "imu-spi";
+		reg = <0>;
+	};
+};
