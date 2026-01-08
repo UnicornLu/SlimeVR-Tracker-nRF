@@ -16,6 +16,8 @@
 #include <zephyr/device.h>
 #include <hal/nrf_spim.h>
 #include <hal/nrf_twim.h>
+#include <hal/nrf_power.h>
+
 
 #include "power.h"
 
