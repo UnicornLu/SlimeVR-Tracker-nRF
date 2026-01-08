@@ -1,7 +1,0 @@
-# Copyright (c) 2024 Nordic Semiconductor ASA
-# SPDX-License-Identifier: Apache-2.0
-
-config BOARD_NINI_SMOL_UF2
-	bool
-	select SOC_NRF52833_QDAA
-	default y
