@@ -26,6 +26,20 @@
 
 static uint32_t *dbl_reset_mem __attribute__((unused)) = ((uint32_t *)DFU_DBL_RESET_MEM); // retained
 
+#if ADAFRUIT_BOOTLOADER
+static inline void uf2_clear_dfu_triggers(void)
+{
+    /* 清 UF2 double-tap RAM magic */
+    *(volatile uint32_t *)DFU_DBL_RESET_MEM = 0;
+
+    /* 清 UF2 常用的 GPREGRET 触发位 */
+    NRF_POWER->GPREGRET = 0;
+#ifdef NRF_POWER_GPREGRET2_Msk
+    NRF_POWER->GPREGRET2 = 0;
+#endif
+}
+#endif
+
 enum sys_regulator {
 	SYS_REGULATOR_DCDC,
 	SYS_REGULATOR_LDO
