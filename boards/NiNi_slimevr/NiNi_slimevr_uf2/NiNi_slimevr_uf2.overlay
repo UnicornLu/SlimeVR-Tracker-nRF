@@ -1,0 +1,38 @@
+/ {
+	battery-divider {
+		compatible = "voltage-divider";
+		status = "okay";
+		io-channels = <&adc 3>; // Measure VDDHDIV5
+		output-ohms = <40200>;
+		full-ohms = <(100000+40200)>;
+	};
+
+	aliases {
+		sw0 = &button0;
+		led0 = &led0;
+	};
+};
+
+arduino_spi: &spi3 {
+	imu_spi: imu_spi@0 {
+		compatible = "vnd,spi-device";
+		spi-max-frequency = <DT_FREQ_M(24)>;
+		label = "imu-spi";
+		reg = <0>;
+	};
+};
+
+leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
+		};
+	};
+
+buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+		};
+	};
