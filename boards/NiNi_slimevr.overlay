@@ -8,11 +8,12 @@
 	};
 
 	leds {
-		compatible = "gpio-leds";
-		user_led0: led_0 {
-			gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
-		};
+    		compatible = "gpio-leds";
+    		user_led0: led_0 {
+        		gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+    		};
 	};
+
 
 	buttons {
 		compatible = "gpio-keys";
