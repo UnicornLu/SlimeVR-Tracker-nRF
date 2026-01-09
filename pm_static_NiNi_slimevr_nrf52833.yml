@@ -4,19 +4,8 @@ mcuboot:
 
 image_0:
   address: 0x00010000
-  size:    0x00030000   # 192KB
-
-image_1:
-  address: 0x00040000
-  size:    0x00030000   # 192KB
-
-scratch:
-  address: 0x00070000
-  size:    0x00008000   # 32KB
-
-# gap: 0x78000 ~ 0x7DFFF  (24KB)
+  size:    0x0006C000   # 432KB
 
 storage:
-  address: 0x0007E000
-  size:    0x00002000   # 8KB
-
+  address: 0x0007C000
+  size:    0x00004000   # 16KB
