@@ -26,12 +26,28 @@
 		};
 	};
 
-	aliases {
+	sram_retained: sram-retained@2001f000 {
+        compatible = "zephyr,memory-region", "mmio-sram";
+        reg = <0x2001f000 0x1000>;
+        zephyr,memory-region = "RETAINED_MEM";
+        status = "okay";
+
+        retainedmem0: retainedmem {
+            compatible = "zephyr,retained-ram";
+            status = "okay";
+        };
+    };
+	&sram0 {
+	/* Shrink SRAM size to avoid overlap with retained memory region */
+	reg = <0x20000000 DT_SIZE_K(124)>;
+	}; 
+};
+aliases {
 		sw0 = &button0;
 		led0 = &user_led0;
 		imu0 = &imu_spi;
-	};
-};
+		retainedmemdevice = &retainedmem0;
+	};   
 
 &pinctrl {
 	spi2_default: spi2_default {
