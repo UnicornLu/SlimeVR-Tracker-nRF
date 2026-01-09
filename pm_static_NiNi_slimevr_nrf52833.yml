@@ -1,10 +1,19 @@
-bootloader:
-  address: 0x0
-  end_address: 0x1000
-  region: flash_primary
-  size: 0x1000
-uf2_bootloader:
-  address: 0x74000
-  end_address: 0x80000
-  region: flash_primary
-  size: 0xc000
+mcuboot:
+  address: 0x00000000
+  size:    0x00010000   # 64KB
+
+image-0:
+  address: 0x00010000
+  size:    0x00030000   # 192KB
+
+image-1:
+  address: 0x00040000
+  size:    0x00030000   # 192KB
+
+scratch:
+  address: 0x00070000
+  size:    0x00008000   # 32KB
+
+storage:
+  address: 0x00078000
+  size:    0x00008000   # 32KB
