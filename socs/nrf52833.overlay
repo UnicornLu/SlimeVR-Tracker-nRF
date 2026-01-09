@@ -10,4 +10,7 @@
             status = "okay";
         };
     };
+	aliases {
+        retainedmemdevice = &retainedmem0;
+    };
 };
