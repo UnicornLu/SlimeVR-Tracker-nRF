@@ -21,3 +21,5 @@ mcuboot_secondary:
 storage:
   address: 0x0007A000
   size:    0x00006000   # 24KB  ← 注意：这里我先解释
+image_0:
+  span: [mcuboot_primary]
