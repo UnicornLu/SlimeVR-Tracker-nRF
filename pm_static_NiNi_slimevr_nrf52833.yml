@@ -1,19 +1,24 @@
 mcuboot:
   address: 0x00000000
-  size:    0x00010000   # 64KB
+  size:    0x00010000   # 64k
 
 image-0:
   address: 0x00010000
-  size:    0x00030000   # 192KB
+  size:    0x00030000   # 192k
 
 image-1:
   address: 0x00040000
-  size:    0x00030000   # 192KB
+  size:    0x00030000   # 192k
 
 scratch:
   address: 0x00070000
-  size:    0x00008000   # 32KB
+  size:    0x00008000   # 32k
 
+# 把 storage 放到末尾，但不写死 address，让 PM 去和 nvs_storage 等一起安排
 storage:
-  address: 0x00078000
-  size:    0x00008000   # 32KB
+  size: 0x00008000       # 32k
+  placement:
+    after:
+      - scratch
+    before:
+      - end
