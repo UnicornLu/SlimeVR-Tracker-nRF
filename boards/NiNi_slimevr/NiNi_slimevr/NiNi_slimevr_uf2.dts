@@ -27,8 +27,8 @@
 //end
 
 / {
-	model = "NiNi_slimevr_uf2";
-	compatible = "NiNi_slimevr_uf2";
+	model = "NiNi_slimevr";
+	compatible = "NiNi_slimevr";
 
 	chosen {
 		zephyr,sram = &sram0;

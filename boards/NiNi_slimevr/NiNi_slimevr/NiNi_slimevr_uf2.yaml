@@ -1,8 +1,8 @@
 # Copyright (c) 2024 Nordic Semiconductor ASA
 # SPDX-License-Identifier: Apache-2.0
 
-identifier: NiNi_slimevr_uf2
-name: NiNi_slimevr_uf2
+identifier: NiNi_slimevr
+name: NiNi_slimevr
 vendor: NiNi_Unicorn
 type: mcu
 arch: arm
