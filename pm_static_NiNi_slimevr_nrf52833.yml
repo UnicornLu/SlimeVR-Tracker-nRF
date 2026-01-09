@@ -2,13 +2,22 @@ mcuboot:
   address: 0x00000000
   size:    0x00010000   # 64KB
 
+# 主槽（image_0）
 mcuboot_primary:
   address: 0x00010000
-  size:    0x0006C000   # 432KB
+  size:    0x00063000   # 396KB
 
+# NVS（你日志里要 24KB）
+nvs_storage:
+  address: 0x00073000
+  size:    0x00006000   # 24KB
+
+# 给 legacy sysflash 一个占位 secondary（4KB）
+mcuboot_secondary:
+  address: 0x00079000
+  size:    0x00001000   # 4KB
+
+# storage（16KB）
 storage:
-  address: 0x0007C000
-  size:    0x00004000   # 16KB
-
-app:
-  span: [mcuboot_primary]
+  address: 0x0007A000
+  size:    0x00006000   # 24KB  ← 注意：这里我先解释
