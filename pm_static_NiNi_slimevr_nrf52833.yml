@@ -2,11 +2,11 @@ mcuboot:
   address: 0x00000000
   size:    0x00010000   # 64KB
 
-image-0:
+image_0:
   address: 0x00010000
   size:    0x00030000   # 192KB
 
-image-1:
+image_1:
   address: 0x00040000
   size:    0x00030000   # 192KB
 
