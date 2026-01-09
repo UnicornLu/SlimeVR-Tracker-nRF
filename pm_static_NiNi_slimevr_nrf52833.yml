@@ -1,13 +1,24 @@
+# 这份是给 MCUBoot 子镜像看的，目的只有一个：生成 PM_MCUBOOT_PRIMARY_ID/SECONDARY_ID
+
 mcuboot:
   address: 0x00000000
   size:    0x00010000   # 64KB
 
-# 尾部固定：storage 24KB（你日志里现在就是 24576）
-storage:
-  address: 0x0007A000
+# 主槽（你真实 app 会放这里）
+mcuboot_primary:
+  address: 0x00010000
+  size:    0x00064000   # 400KB  (留给 app 动态)
+
+# 给 legacy sysflash 生成 SECONDARY_ID 的占位（4KB）
+mcuboot_secondary:
+  address: 0x00074000
+  size:    0x00001000   # 4KB
+
+# NVS + storage（按你现在项目需求 24KB+24KB）
+nvs_storage:
+  address: 0x00075000
   size:    0x00006000   # 24KB
 
-# 尾部固定：nvs_storage 24KB（你日志里现在就是 24576）
-nvs_storage:
-  address: 0x00074000
-  size:    0x00006000   # 24KB
+storage:
+  address: 0x0007B000
+  size:    0x00005000   # 20KB
