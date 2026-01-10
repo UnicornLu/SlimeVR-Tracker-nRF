@@ -64,7 +64,7 @@
 	};
 };
 
-pinctrl {
+&pinctrl {
 	spi2_default: spi2_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 29)>,
