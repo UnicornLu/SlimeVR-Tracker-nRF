@@ -84,7 +84,7 @@
 	};
 };
 
-spi2 {
+&spi2 {
 	status = "okay";
 	compatible = "nordic,nrf-spim";
 	pinctrl-0 = <&spi2_default>;
