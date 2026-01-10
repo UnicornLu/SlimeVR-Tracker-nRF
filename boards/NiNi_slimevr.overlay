@@ -26,6 +26,37 @@
 		};
 	};
 
+	flash0 {
+		partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* MCUboot: 0x00000000 - 0x0000FFFF */
+		mcuboot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x00010000>;
+		};
+
+		/* slot0 (primary): 0x00010000 - 0x00073FFF  (到 nvs_storage 前) */
+		slot0_partition: partition@10000 {
+			label = "image-0";
+			reg = <0x00010000 0x00064000>;
+		};
+
+		/* nvs_storage: 0x00074000 - 0x00079FFF */
+		nvs_storage_partition: partition@74000 {
+			label = "nvs_storage";
+			reg = <0x00074000 0x00006000>;
+		};
+
+		/* storage: 0x0007A000 - 0x0007FFFF */
+		storage_partition: partition@7a000 {
+			label = "storage";
+			reg = <0x0007A000 0x00006000>;
+		};
+	};
+
 	aliases {
 		sw0 = &button0;
 		led0 = &user_led0;
