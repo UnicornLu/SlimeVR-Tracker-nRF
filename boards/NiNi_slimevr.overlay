@@ -1,63 +1,102 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+
 / {
-    battery-divider {
-        compatible = "voltage-divider";
-        status = "okay";
-        io-channels = <&adc 3>;
-        output-ohms = <40200>;
-        full-ohms = <140200>;
-    };
+	battery-divider {
+		compatible = "voltage-divider";
+		status = "okay";
+		io-channels = <&adc 3>;
+		output-ohms = <40200>;
+		full-ohms = <140200>;
+	};
 
-    leds {
-        compatible = "gpio-leds";
-        user_led0: led_0 {
-            gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
-        };
-    };
+	leds {
+		compatible = "gpio-leds";
+		user_led0: led_0 {
+			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+		};
+	};
 
-    buttons {
-        compatible = "gpio-keys";
-        button0: button_0 {
-            gpios = <&gpio0 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-            label = "Push button switch 0";
-        };
-    };
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+		};
+	};
 
-    aliases {
-        sw0 = &button0;
-        led0 = &user_led0;
-        imu0 = &imu_spi;
-    };
+	flash0 {
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/* MCUboot: 0x00000000 - 0x0000FFFF */
+			mcuboot_partition: partition@0 {
+				label = "mcuboot";
+				reg = <0x00000000 0x00010000>;
+			};
+
+			/* slot0 (primary): 0x00010000 - 0x00073FFF  (到 nvs_storage 前) */
+			slot0_partition: partition@10000 {
+				label = "image-0";
+				reg = <0x00010000 0x00064000>;
+			};
+
+			/* nvs_storage: 0x00074000 - 0x00079FFF */
+			nvs_storage_partition: partition@74000 {
+				label = "nvs_storage";
+				reg = <0x00074000 0x00006000>;
+			};
+
+			/* storage: 0x0007A000 - 0x0007FFFF */
+			storage_partition: partition@7a000 {
+				label = "storage";
+				reg = <0x0007A000 0x00006000>;
+			};
+		};
+	};
+
+	aliases {
+		sw0 = &button0;
+		led0 = &user_led0;
+		imu0 = &imu_spi;
+	};
 };
 
-/* flash 分区一定要挂在已存在的 &flash0 上 */
-&flash0 {
-    partitions {
-        compatible = "fixed-partitions";
-        #address-cells = <1>;
-        #size-cells = <1>;
+pinctrl {
+	spi2_default: spi2_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MISO, 0, 29)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 28)>,
+				<NRF_PSEL(SPIM_SCK,  0, 2)>;
+			bias-disable;
+		};
+	};
 
-        /* MCUboot: 0x00000000 - 0x0000FFFF */
-        mcuboot_partition: partition@0 {
-            label = "mcuboot";
-            reg = <0x00000000 0x00010000>;
-        };
+	spi2_sleep: spi2_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MISO, 0, 29)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 28)>,
+				<NRF_PSEL(SPIM_SCK,  0, 2)>;
+			low-power-enable;
+		};
+	};
+};
 
-        /* slot0 (primary): 0x00010000 - 0x00073FFF */
-        slot0_partition: partition@10000 {
-            label = "image-0";
-            reg = <0x00010000 0x00064000>;
-        };
+spi2 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
 
-        /* nvs_storage: 0x00074000 - 0x00079FFF */
-        nvs_storage_partition: partition@74000 {
-            label = "nvs_storage";
-            reg = <0x00074000 0x00006000>;
-        };
+	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
 
-        /* storage: 0x0007A000 - 0x0007FFFF */
-        storage_partition: partition@7a000 {
-            label = "storage";
-            reg = <0x0007A000 0x00006000>;
-        };
-    };
+	imu_spi: imu@0 {
+		compatible = "vnd,spi-device";
+		reg = <0>;
+		label = "imu-spi";
+		spi-max-frequency = <DT_FREQ_M(24)>;
+	};
 };
