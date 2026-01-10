@@ -1,11 +1,36 @@
 mcuboot:
   address: 0x00000000
-  size:    0x00010000   # 64KB
+  size:    0x00010000
 
+# 保持 pad 不变（非常重要）
+mcuboot_pad:
+  address: 0x00010000
+  size:    0x00000200
+
+# primary 变大：0x32000 -> 0x3D000
+mcuboot_primary:
+  address: 0x00010000
+  size:    0x0003D000
+
+# app 跟着 primary 变大（起点必须在 pad 后）
+app:
+  address: 0x00010200
+  size:    0x0003CE00
+
+mcuboot_primary_app:
+  address: 0x00010200
+  size:    0x0003CE00
+
+# secondary 变小：0x32000 -> 0x27000
+mcuboot_secondary:
+  address: 0x0004D000
+  size:    0x00027000
+
+# 下面两块保持原样、地址后移
 nvs_storage:
   address: 0x00074000
-  size:    0x00006000   # 24KB
+  size:    0x00006000
 
 storage:
   address: 0x0007A000
-  size:    0x00006000   # 24KB
+  size:    0x00006000
