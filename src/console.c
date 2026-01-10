@@ -5,11 +5,27 @@
 #include "sensor/calibration.h"
 #include "connection/esb.h"
 #include "build_defines.h"
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <math.h>
+
+#include "commands.h"
+#include "globals.h"
+#include "system/system.h"
+#include "system/battery_tracker.h"
+#include "sensor/sensor.h"
+#include "sensor/calibration.h"
+#include "connection/esb.h"
+
+
 
 #if CONFIG_USB_DEVICE_STACK
 #define USB DT_NODELABEL(usbd)
 #define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
+#else
+#define USB_EXISTS 0
 #endif
+
 
 #if (USB_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
 

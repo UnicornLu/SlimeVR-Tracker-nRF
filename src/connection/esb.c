@@ -20,6 +20,7 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 */
+#include "commands.h"
 #include "globals.h"
 #include "sensor/calibration.h"
 #include "sensor/sensor.h"
