@@ -30,7 +30,7 @@
 };
 
 /* flash 分区一定要挂在已存在的 &flash0 上 */
-flash0 {
+&flash0 {
     partitions {
         compatible = "fixed-partitions";
         #address-cells = <1>;
