@@ -7,7 +7,7 @@
 		status = "okay";
 		io-channels = <&adc 3>;
 		output-ohms = <40200>;
-		full-ohms = <(100000 + 40200)>;
+		full-ohms = <140200>;
 	};
 
 	leds {
@@ -62,6 +62,7 @@
 		led0 = &user_led0;
 		imu0 = &imu_spi;
 	};  
+}
 };
  
 pinctrl {
