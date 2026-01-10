@@ -5,11 +5,122 @@
 #include "sensor/calibration.h"
 #include "connection/esb.h"
 #include "build_defines.h"
+#include <zephyr/sys/printk.h>
+#include <math.h>
 
 #if CONFIG_USB_DEVICE_STACK
 #define USB DT_NODELABEL(usbd)
 #define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
+#else
+#define USB_EXISTS 0
 #endif
+
+// --- Command Implementations (always available for ESB remote commands) ---
+
+void cmd_sens_set(float x, float y, float z)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (retained) {
+		float deg_x = x;
+		float deg_y = y;
+		float deg_z = z;
+
+		float den_x = 1.0f - (deg_x / (360.0f * CONFIG_SENSOR_SENS_REV));
+		float den_y = 1.0f - (deg_y / (360.0f * CONFIG_SENSOR_SENS_REV));
+		float den_z = 1.0f - (deg_z / (360.0f * CONFIG_SENSOR_SENS_REV));
+
+		// Prevent division by zero or near-zero
+		if (fabsf(den_x) < 1e-6f || fabsf(den_y) < 1e-6f || fabsf(den_z) < 1e-6f) {
+			printk("Error: Invalid input degrees leading to division by zero. Calibration not applied.\n");
+		} else {
+			retained->gyroSensScale[0] = 1.0f / den_x;
+			retained->gyroSensScale[1] = 1.0f / den_y;
+			retained->gyroSensScale[2] = 1.0f / den_z;
+			retained_update();
+			sys_write(
+				MAIN_GYRO_SENS_ID,
+				&retained->gyroSensScale,
+				retained->gyroSensScale,
+				sizeof(retained->gyroSensScale)
+			);
+			printk(
+				"Gyro sensitivity difference set to: %.3f, %.3f, %.3f\n",
+				(double)deg_x,
+				(double)deg_y,
+				(double)deg_z
+			);
+		}
+	} else {
+		printk("Error: Retained data not available.\n");
+	}
+#else
+	(void)x; (void)y; (void)z;
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_sens_reset(void)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (retained) {
+		printk("Resetting gyro sensitivity calibration.\n");
+		retained->gyroSensScale[0] = 1.0f;
+		retained->gyroSensScale[1] = 1.0f;
+		retained->gyroSensScale[2] = 1.0f;
+		retained_update(); // Save changes
+		sys_write(
+			MAIN_GYRO_SENS_ID,
+			&retained->gyroSensScale,
+			retained->gyroSensScale,
+			sizeof(retained->gyroSensScale)
+		);
+		printk("Gyro sensitivity reset.\n");
+	} else {
+		printk("Error: Retained data not available.\n");
+	}
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_reset_zro(void)
+{
+	sensor_calibration_clear(NULL, NULL, true);
+}
+
+void cmd_reset_acc(void)
+{
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+	sensor_calibration_clear_6_side(NULL, true);
+#else
+	printk("Error: 6-side calibration not enabled.\n");
+#endif
+}
+
+void cmd_reset_tcal(void)
+{
+#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+	sensor_tcal_clear_poly();
+#else
+	printk("Error: Temperature calibration not enabled.\n");
+#endif
+}
+
+void cmd_reset_bat(void)
+{
+	sys_reset_battery_tracker();
+}
+
+void cmd_bat_debug(void)
+{
+	sys_print_battery_tracker_debug();
+}
+
+void cmd_ping_start(void)
+{
+	printk("Ping received! Flashing LED.\n");
+	set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
+}
 
 #if (USB_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
 
@@ -507,112 +618,6 @@ static void print_help(void)
 	printk("  reset bat                  Reset battery tracker\n");
 	printk("  reset all                  Clear all settings\n");
 	printk("\n");
-}
-
-// --- Command Implementations ---
-
-void cmd_sens_set(float x, float y, float z)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		float deg_x = x;
-		float deg_y = y;
-		float deg_z = z;
-
-		float den_x = 1.0f - (deg_x / (360.0f * CONFIG_SENSOR_SENS_REV));
-		float den_y = 1.0f - (deg_y / (360.0f * CONFIG_SENSOR_SENS_REV));
-		float den_z = 1.0f - (deg_z / (360.0f * CONFIG_SENSOR_SENS_REV));
-
-		// Prevent division by zero or near-zero
-		if (fabsf(den_x) < 1e-6f || fabsf(den_y) < 1e-6f || fabsf(den_z) < 1e-6f) {
-			printk("Error: Invalid input degrees leading to division by zero. Calibration not applied.\n");
-		} else {
-			retained->gyroSensScale[0] = 1.0f / den_x;
-			retained->gyroSensScale[1] = 1.0f / den_y;
-			retained->gyroSensScale[2] = 1.0f / den_z;
-			retained_update();
-			sys_write(
-				MAIN_GYRO_SENS_ID,
-				&retained->gyroSensScale,
-				retained->gyroSensScale,
-				sizeof(retained->gyroSensScale)
-			);
-			printk(
-				"Gyro sensitivity difference set to: %.3f, %.3f, %.3f\n",
-				(double)deg_x,
-				(double)deg_y,
-				(double)deg_z
-			);
-		}
-	} else {
-		printk("Error: Retained data not available.\n");
-	}
-#else
-	printk("Error: Sensitivity calibration not enabled.\n");
-#endif
-}
-
-void cmd_sens_reset(void)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		printk("Resetting gyro sensitivity calibration.\n");
-		retained->gyroSensScale[0] = 1.0f;
-		retained->gyroSensScale[1] = 1.0f;
-		retained->gyroSensScale[2] = 1.0f;
-		retained_update(); // Save changes
-		sys_write(
-			MAIN_GYRO_SENS_ID,
-			&retained->gyroSensScale,
-			retained->gyroSensScale,
-			sizeof(retained->gyroSensScale)
-		);
-		printk("Gyro sensitivity reset.\n");
-	} else {
-		printk("Error: Retained data not available.\n");
-	}
-#else
-	printk("Error: Sensitivity calibration not enabled.\n");
-#endif
-}
-
-void cmd_reset_zro(void)
-{
-	sensor_calibration_clear(NULL, NULL, true);
-}
-
-void cmd_reset_acc(void)
-{
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	sensor_calibration_clear_6_side(NULL, true);
-#else
-	printk("Error: 6-side calibration not enabled.\n");
-#endif
-}
-
-void cmd_reset_tcal(void)
-{
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
-	sensor_tcal_clear_poly();
-#else
-	printk("Error: Temperature calibration not enabled.\n");
-#endif
-}
-
-void cmd_reset_bat(void)
-{
-	sys_reset_battery_tracker();
-}
-
-void cmd_bat_debug(void)
-{
-	sys_print_battery_tracker_debug();
-}
-
-void cmd_ping_start(void)
-{
-	printk("Ping received! Flashing LED.\n");
-	set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
 }
 
 static void console_thread(void)
