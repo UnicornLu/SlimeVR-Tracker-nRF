@@ -4,6 +4,8 @@
 CONFIG_ARM_MPU=y
 CONFIG_HW_STACK_PROTECTION=y
 
+# USB configuration - only for application, not for MCUboot bootloader
+# MCUboot bootloader should have USB disabled (configured in child_image/mcuboot/prj.conf)
 CONFIG_USB_DEVICE_STACK=y
 CONFIG_USB_DEVICE_MANUFACTURER="SlimeVR"
 CONFIG_USB_DEVICE_PRODUCT="NiNi_Unicorn & MINGYUE Smol SlimeVR"
