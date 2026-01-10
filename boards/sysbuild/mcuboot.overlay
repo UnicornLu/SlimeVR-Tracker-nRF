@@ -1,6 +1,16 @@
 / {
 };
 
+/* CRITICAL: Disable USB in MCUboot - this prevents USB drivers from being linked */
+/* This must be done in device tree to override board defaults */
+&usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "disabled";
+};
+
+/* Also disable any USB CDC ACM nodes that might exist */
+/delete-node/ &cdc_acm_uart0;
+
 /* Configure UART0 for MCUboot serial recovery */
 &uart0 {
 	compatible = "nordic,nrf-uarte";
