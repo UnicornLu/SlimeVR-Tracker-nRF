@@ -8,14 +8,61 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <math.h>
-
 #include "commands.h"
-#include "globals.h"
-#include "system/system.h"
-#include "system/battery_tracker.h"
-#include "sensor/sensor.h"
-#include "sensor/calibration.h"
-#include "connection/esb.h"
+
+
+
+
+/* 这些函数：永远提供符号。功能按 Kconfig 决定启不启 */
+void cmd_sens_set(float x, float y, float z)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+    /* 你原本的实现搬过来 */
+    (void)x; (void)y; (void)z;
+#else
+    (void)x; (void)y; (void)z;
+#endif
+}
+
+void cmd_sens_reset(void)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+    /* 你的实现 */
+#endif
+}
+
+void cmd_reset_zro(void)
+{
+    sensor_calibration_clear(NULL, NULL, true);
+}
+
+void cmd_reset_acc(void)
+{
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+    sensor_calibration_clear_6_side(NULL, true);
+#else
+    /* 不做事也行，但符号要存在 */
+#endif
+}
+
+void cmd_reset_bat(void)
+{
+    sys_reset_battery_tracker();
+}
+
+void cmd_reset_tcal(void)
+{
+#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+    sensor_tcal_clear_poly();
+#endif
+}
+
+void cmd_ping_start(void)
+{
+    /* 不依赖 console 也能存在 */
+    set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
+}
+
 
 
 
