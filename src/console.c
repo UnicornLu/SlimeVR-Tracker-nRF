@@ -5,74 +5,11 @@
 #include "sensor/calibration.h"
 #include "connection/esb.h"
 #include "build_defines.h"
-#include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
-#include <math.h>
-#include "commands.h"
-
-
-
-
-/* 这些函数：永远提供符号。功能按 Kconfig 决定启不启 */
-void cmd_sens_set(float x, float y, float z)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-    /* 你原本的实现搬过来 */
-    (void)x; (void)y; (void)z;
-#else
-    (void)x; (void)y; (void)z;
-#endif
-}
-
-void cmd_sens_reset(void)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-    /* 你的实现 */
-#endif
-}
-
-void cmd_reset_zro(void)
-{
-    sensor_calibration_clear(NULL, NULL, true);
-}
-
-void cmd_reset_acc(void)
-{
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-    sensor_calibration_clear_6_side(NULL, true);
-#else
-    /* 不做事也行，但符号要存在 */
-#endif
-}
-
-void cmd_reset_bat(void)
-{
-    sys_reset_battery_tracker();
-}
-
-void cmd_reset_tcal(void)
-{
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
-    sensor_tcal_clear_poly();
-#endif
-}
-
-void cmd_ping_start(void)
-{
-    /* 不依赖 console 也能存在 */
-    set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
-}
-
-
-
 
 #if CONFIG_USB_DEVICE_STACK
 #define USB DT_NODELABEL(usbd)
 #define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
-#else
-#define USB_EXISTS 0
 #endif
-
 
 #if (USB_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
 
