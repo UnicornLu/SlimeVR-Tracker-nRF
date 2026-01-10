@@ -1,0 +1,11 @@
+mcuboot:
+  address: 0x00000000
+  size:    0x00010000
+
+mcuboot_primary:
+  address: 0x00010000
+  size:    0x00043000
+
+mcuboot_secondary:
+  address: 0x00053000
+  size:    0x0002D000
