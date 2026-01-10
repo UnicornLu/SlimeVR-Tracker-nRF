@@ -2,20 +2,6 @@ mcuboot:
   address: 0x00000000
   size:    0x00010000   # 64KB
 
-# MCUboot image header 预留（常见 0x200）
-mcuboot_pad:
-  address: 0x00010000
-  size:    0x00000200
-
-# 应用从 0x10200 开始，一直到 nvs_storage 之前 0x74000
-app:
-  address: 0x00010200
-  size:    0x00063E00   # 0x74000 - 0x10200
-
-# primary slot 是一个“跨度/容器”，不额外占空间
-mcuboot_primary:
-  span: [mcuboot_pad, app]
-
 nvs_storage:
   address: 0x00074000
   size:    0x00006000   # 24KB
