@@ -1,8 +1,23 @@
 / {
 };
 
-&zephyr_udc0 {
-	cdc_acm_uart0: cdc_acm_uart0 {
-		compatible = "zephyr,cdc-acm-uart";
-	};
+/* Configure UART0 for MCUboot serial recovery */
+&uart0 {
+	compatible = "nordic,nrf-uarte";
+	status = "okay";
+	current-speed = <115200>;
+	/* 
+	 * Pin configuration - adjust these based on your hardware:
+	 * For nRF52833, common UART pins are:
+	 * - TX: P0.6 (default) or P0.20
+	 * - RX: P0.8 (default) or P0.22
+	 * If your board uses different pins, update these values
+	 */
+	tx-pin = <6>;   /* P0.6 */
+	rx-pin = <8>;   /* P0.8 */
+};
+
+/* Set UART0 as console for MCUboot */
+&chosen {
+	zephyr,console = &uart0;
 };
