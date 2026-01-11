@@ -1,4 +1,7 @@
 / {
+	chosen {
+		zephyr,code-partition = &slot0_partition;
+	};
 };
 
 /* CRITICAL: Disable USB in MCUboot - this prevents USB drivers from being linked */
@@ -30,4 +33,23 @@
 /* Set UART0 as console for MCUboot */
 &chosen {
 	zephyr,console = &uart0;
+};
+
+/* Flash partitions for MCUboot single slot mode */
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		mcuboot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x00010000>;
+		};
+
+		slot0_partition: partition@10000 {
+			label = "image-0";
+			reg = <0x00010000 0x00043000>;
+		};
+	};
 };
