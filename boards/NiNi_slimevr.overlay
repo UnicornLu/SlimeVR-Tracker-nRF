@@ -71,3 +71,18 @@
 		spi-max-frequency = <DT_FREQ_M(24)>;
 	};
 };
+&flash0 {
+  partitions {
+    mcuboot_partition: partition@0 {
+      reg = <0x00000000 0x00010000>;
+    };
+
+    slot0_partition: partition@10000 {
+      reg = <0x00010000 0x00043000>;
+    };
+
+    slot1_partition: partition@53000 {
+      reg = <0x00053000 0x0002D000>;
+    };
+  };
+};
