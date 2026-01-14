@@ -1,0 +1,20 @@
+mcuboot:
+  address: 0x00000000
+  size:    0x00010000
+
+mcuboot_pad:
+  address: 0x00010000
+  size:    0x00000200
+
+mcuboot_primary:
+  address: 0x00010000
+  size:    0x00064000   # 0x10000 -> 0x74000，约400KB
+
+
+nvs_storage:
+  address: 0x00074000
+  size:    0x00006000
+
+storage:
+  address: 0x0007A000
+  size:    0x00006000
