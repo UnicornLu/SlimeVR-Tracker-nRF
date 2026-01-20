@@ -1,5 +1,6 @@
 #include "globals.h"
 #include "sensor/sensor.h"
+#include "sensor/calibration.h"
 #include "battery.h"
 #include "battery_tracker.h"
 #include "connection/connection.h"
@@ -46,6 +47,7 @@ static bool battery_low = false;
 static bool plugged = false;
 static bool power_init = false;
 static bool device_plugged = false;
+static bool device_charged = false;
 
 LOG_MODULE_REGISTER(power, LOG_LEVEL_INF);
 
@@ -415,6 +417,10 @@ static void sys_system_off(void) // TODO: add timeout
 	// Clear sensor addresses
 	sensor_scan_clear();
 	LOG_INF("Requested sensor scan on next boot");
+#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+	// Reset boot calibration state so it will recalibrate on next boot
+	sensor_boot_cal_reset();
+#endif
 	// sensor_retained_write();
 	set_regulator(SYS_REGULATOR_LDO); // Switch to LDO
 	// Set system off
@@ -444,6 +450,10 @@ static void sys_system_reboot(void) // TODO: add timeout
 {
 	LOG_INF("System reboot requested");
 	configure_system_off(); // Common subsystem shutdown and prepare sense pins
+#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+	// Reset boot calibration state so it will recalibrate on next boot
+	sensor_boot_cal_reset();
+#endif
 	sensor_retained_write();
 	// Set system reboot
 	LOG_INF("Rebooting nRF");
@@ -616,6 +626,8 @@ static void power_thread(void)
 			set_status(SYS_STATUS_PLUGGED, false);
 		}
 
+		device_charged = charged; // TODO: timer on device_plugged could be used to infer charged state
+
 		if (!power_init)
 		{
 			// log battery state once
@@ -655,7 +667,7 @@ static void power_thread(void)
 			sys_update_battery_tracker(current_battery_pptt, device_plugged);
 		calibrated_battery_pptt = sys_get_calibrated_battery_pptt(current_battery_pptt);
 
-		connection_update_battery(battery_available, device_plugged, calibrated_battery_pptt, battery_mV);
+		connection_update_battery(battery_available, device_plugged, device_charged, calibrated_battery_pptt, battery_mV);
 
 		if (charging)
 			set_led(SYS_LED_PATTERN_PULSE_PERSIST, SYS_LED_PRIORITY_SYSTEM);

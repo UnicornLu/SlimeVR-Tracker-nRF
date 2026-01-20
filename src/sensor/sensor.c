@@ -36,6 +36,21 @@
 
 #define SPI_OP SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_WORD_SET(8)
 
+// Debug mode state
+typedef struct {
+	bool enabled;
+	int64_t start_time;
+	int64_t duration_ms;
+	int64_t last_output_time;
+	uint32_t output_interval_ms;
+	uint32_t sample_count;
+} sensor_debug_state_t;
+
+static sensor_debug_state_t debug_state = {
+	.enabled = false,
+	.output_interval_ms = 100  // Default 100ms
+};
+
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(imu_spi), okay)
 #define SENSOR_IMU_SPI_EXISTS true
 #define SENSOR_IMU_SPI_NODE DT_NODELABEL(imu_spi)
@@ -79,6 +94,9 @@ static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // vector to hold quaternion
 static float q3[4] = {SENSOR_QUATERNION_CORRECTION}; // correction quaternion
 
 static float last_lin_a[3] = {0}; // vector to hold last linear accelerometer
+
+static float temp; // sensor temperature
+static int64_t last_temp_time = -1000;
 
 static int64_t last_suspend_attempt_time = 0;
 static int64_t last_data_time;
@@ -179,6 +197,19 @@ const char *sensor_get_sensor_fusion_name(void)
 	if (fusion_id < 0)
 		return "None";
 	return fusion_names[fusion_id];
+}
+
+int sensor_get_sensor_temperature(float *ptr)
+{
+	if (sensor_imu == &sensor_imu_none || (k_uptime_get() - last_temp_time > 1000))
+	{
+		if (get_status(SYS_STATUS_SENSOR_ERROR))
+			return -2; // no imu!
+		else
+			return -1; // imu probably not scanned yet or temp not read yet or last valid temp is old
+	}
+	*ptr = temp;
+	return 0;
 }
 
 void sensor_scan_thread(void)
@@ -814,23 +845,19 @@ void sensor_loop(void)
 				sensor_mag->mag_oneshot();
 
 #if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
-			static int64_t last_temp_read_ms = 0;
-			if (k_uptime_get() - last_temp_read_ms >= 1000) // Update every 1 second
+			// Read IMU temperature
+			temp = sensor_imu->temp_read();
+			// Only update if the value looks like a valid temperature (-10 to 60).
+			if (temp != 0.0f && temp > -10.0f && temp < 60.0f)
 			{
-				last_temp_read_ms = k_uptime_get();
-				float temp = sensor_imu->temp_read();
-
-				// Only update if the value looks like a valid temperature (-10 to 60).
-				if (temp != 0.0f && temp > -10.0f && temp < 60.0f)
-				{
-					sensor_tcal_temp = temp; // Update the static cache
-				}
-
-				connection_update_sensor_temp(sensor_tcal_temp);
+				last_temp_time = k_uptime_get();
+				sensor_tcal_temp = temp; // Update the static cache
+				connection_update_sensor_temp(temp);
 			}
 #else
 			// Read IMU temperature
-			float temp = sensor_imu->temp_read(); // TODO: use as calibration data
+			temp = sensor_imu->temp_read(); // TODO: use as calibration data
+			last_temp_time = k_uptime_get();
 			connection_update_sensor_temp(temp);
 #endif
 
@@ -902,6 +929,13 @@ void sensor_loop(void)
 			int a_count = 0;
 			max_gyro_speed_square = 0;
 			int processed_packets = 0;
+
+			// For debug: accumulate raw and calibrated data
+			float debug_raw_g_sum[3] = {0};
+			float debug_raw_a_sum[3] = {0};
+			float debug_cal_g_sum[3] = {0};
+			int debug_g_samples = 0;
+			int debug_a_samples = 0;
 			for (uint16_t i = 0; i < packets; i++)
 			{
 				float raw_a[3] = {0};
@@ -924,6 +958,13 @@ void sensor_loop(void)
 					if (valid_acquisition)
 						total_gyro_samples++;
 #endif
+					// Accumulate raw gyro for debug
+					if (sensor_debug_is_active()) {
+						for (int i = 0; i < 3; i++)
+							debug_raw_g_sum[i] += raw_g[i];
+						debug_g_samples++;
+					}
+
 					sensor_calibration_process_gyro(raw_g);
 					float gx = raw_g[0];
 					float gy = raw_g[1];
@@ -938,6 +979,12 @@ void sensor_loop(void)
 						g[2] *= retained->gyroSensScale[2];
 					}
 #endif
+
+					// Accumulate calibrated gyro for debug (after zero bias and sensitivity calibration)
+					if (sensor_debug_is_active()) {
+						for (int i = 0; i < 3; i++)
+							debug_cal_g_sum[i] += g[i];
+					}
 
 					// Process fusion
 					sensor_fusion->update_gyro(g, gyro_actual_time);
@@ -965,7 +1012,17 @@ void sensor_loop(void)
 					if (valid_acquisition)
 						total_accel_samples++;
 #endif
+					// Accumulate raw accel for debug
+					if (sensor_debug_is_active()) {
+						for (int i = 0; i < 3; i++)
+							debug_raw_a_sum[i] += raw_a[i];
+						debug_a_samples++;
+					}
+
+					// Always call sensor_calibration_process_accel to update sample buffers
+					// This is needed for calibration routines (e.g., wait_for_motion) even without 6-side calibration
 					sensor_calibration_process_accel(raw_a);
+
 					float ax = raw_a[0];
 					float ay = raw_a[1];
 					float az = raw_a[2];
@@ -1074,9 +1131,9 @@ void sensor_loop(void)
 				float gyro_speed = sqrtf(max_gyro_speed_square);
 				float mag_target_time = 1.0f / (4 * gyro_speed); // target mag ODR for ~0.25 deg error
 				if (mag_target_time < 0.005f && mag_skip_oneshot) // only use continuous modes if oneshot is not available
-					mag_target_time = 0.005;
+					mag_target_time = 0.005f;
 				if (mag_target_time > 0.1f) // limit to 0.1 (minimum 10Hz)
-					mag_target_time = 0.1;
+					mag_target_time = 0.1f;
 				sys_interface_resume();
 				if (mag_target_time < 0.005f) // cap at 0.005 (200Hz), above this the sensor will use oneshot mode instead
 				{
@@ -1091,7 +1148,7 @@ void sensor_loop(void)
 					{
 						if (!err)
 							mag_skip_oneshot = true;
-						mag_target_time = 0.005;
+						mag_target_time = 0.005f;
 					}
 				}
 				if (mag_target_time >= 0.005f || mag_actual_time != INFINITY) // under 200Hz or magnetometer did not have a oneshot mode
@@ -1104,14 +1161,69 @@ void sensor_loop(void)
 				sys_interface_suspend();
 			}
 
+			// Debug mode output - after all fusion processing is complete
+			if (sensor_debug_is_active()) {
+				int64_t current_time = k_uptime_get();
+				if (current_time - debug_state.last_output_time >= debug_state.output_interval_ms) {
+					debug_state.last_output_time = current_time;
+					debug_state.sample_count++;
+
+					float elapsed_sec = (float)(current_time - debug_state.start_time) / 1000.0f;
+
+					// Calculate average raw and calibrated data
+					float avg_raw_g[3] = {0};
+					float avg_raw_a[3] = {0};
+					float avg_cal_g[3] = {0};
+					if (debug_g_samples > 0) {
+						for (int i = 0; i < 3; i++) {
+							avg_raw_g[i] = debug_raw_g_sum[i] / debug_g_samples;
+							avg_cal_g[i] = debug_cal_g_sum[i] / debug_g_samples;
+						}
+					}
+					if (debug_a_samples > 0) {
+						for (int i = 0; i < 3; i++)
+							avg_raw_a[i] = debug_raw_a_sum[i] / debug_a_samples;
+					}
+
+					// Get VQF debug info
+#if CONFIG_SENSOR_USE_VQF
+					vqf_debug_info_t vqf_info;
+					vqf_get_debug_info(&vqf_info);
+#endif
+
+					// Compact output format with raw, calibrated, and fused data
+					printk("[%.1fs] RAW: A[%.2f,%.2f,%.2f] G[%.1f,%.1f,%.1f] T:%.1fC | ",
+						(double)elapsed_sec,
+						(double)avg_raw_a[0], (double)avg_raw_a[1], (double)avg_raw_a[2],
+						(double)avg_raw_g[0], (double)avg_raw_g[1], (double)avg_raw_g[2],
+						(double)temp);
+
+					printk("CAL: A[%.2f,%.2f,%.2f] G[%.1f,%.1f,%.1f] | ",
+						(double)a[0], (double)a[1], (double)a[2],
+						(double)avg_cal_g[0], (double)avg_cal_g[1], (double)avg_cal_g[2]);
+
+#if CONFIG_SENSOR_USE_VQF
+					printk("VQF: Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f] Rest:%c Bias[%.2f,%.2f,%.2f]°/s\n",
+						(double)q[0], (double)q[1], (double)q[2], (double)q[3],
+						(double)lin_a[0], (double)lin_a[1], (double)lin_a[2],
+						vqf_info.rest_detected ? 'Y' : 'N',
+						(double)vqf_info.bias[0], (double)vqf_info.bias[1], (double)vqf_info.bias[2]);
+#else
+					printk("Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f]\n",
+						(double)q[0], (double)q[1], (double)q[2], (double)q[3],
+						(double)lin_a[0], (double)lin_a[1], (double)lin_a[2]);
+#endif
+				}
+			}
+
 			// Update orientation
-			bool send_quat_data = !q_epsilon(q, last_q, 0.001);
-			bool send_lin_accel_data = !v_epsilon(lin_a, last_lin_a, 0.05);
+			bool send_quat_data = !q_epsilon(q, last_q, 0.001f);
+			bool send_lin_accel_data = !v_epsilon(lin_a, last_lin_a, 0.05f);
 
 			// Check if we need to force send based on time to maintain minimum packet rate
 			int64_t now = k_uptime_get();
-			bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.005) : q_epsilon(q, last_q, 0.05);
-			int64_t min_interval = resting ? 100 : 33; // 10Hz when resting, 30Hz when moving
+			bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.005f) : q_epsilon(q, last_q, 0.05f);
+			int64_t min_interval = 2000;
 			bool force_send_by_time = (now - last_sensor_send_time) >= min_interval;
 
 			if (send_quat_data || send_lin_accel_data || force_send_by_time)
@@ -1121,18 +1233,26 @@ void sensor_loop(void)
 				float q_offset[4];
 				q_multiply(q, q3, q_offset); // quaternion in device orientation, connection will change format from wxyz to xyzw
 				v_rotate(lin_a, q3, lin_a); // linear acceleration in local device frame, no other transformation will be done
+
+				if (!send_quat_data && !send_lin_accel_data) {
+					memset(lin_a, 0, sizeof(lin_a)); // zero out linear acceleration when no motion detected
+				}
+
 				connection_update_sensor_data(q_offset, lin_a, sensor_data_time);
 				last_sensor_send_time = now;
-				// Update last_data_time on every send to improve state transition responsiveness
+
 				if (!resting) {
 					last_data_time = now;
 				}
 			}
 
 #if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+			// Check for boot calibration (higher priority than auto calibration)
+			sensor_tcal_boot_calibration_check();
+
 			// Check for automatic temperature calibration (only when device is resting)
 			if (resting) {
-				float current_temp = sensor_get_current_imu_temperature();
+				float current_temp = temp;
 				if (!isnan(current_temp)) {
 					sensor_tcal_check_auto_calibration(current_temp);
 					// If auto-calibration is enabled, reset last_data_time to prevent sleep
@@ -1145,6 +1265,7 @@ void sensor_loop(void)
 			// Handle magnetometer calibration
 			if (mag_available && mag_enabled && last_sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER && sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER)
 				sensor_request_calibration_mag();
+
 
 #if DEBUG
 			if (valid_acquisition)
@@ -1253,6 +1374,61 @@ void main_imu_restart(void)
 // Public function to get the current IMU temperature
 float sensor_get_current_imu_temperature(void)
 {
-    return sensor_tcal_temp;
+	return sensor_tcal_temp;
 }
 #endif
+
+// Get actual accelerometer ODR in Hz
+float sensor_get_accel_odr(void)
+{
+	if (accel_actual_time > 0.0f) {
+		return 1.0f / accel_actual_time;
+	}
+	return (float)CONFIG_SENSOR_ACCEL_ODR; // Fallback to config value
+}
+
+// Get actual gyroscope ODR in Hz
+float sensor_get_gyro_odr(void)
+{
+	if (gyro_actual_time > 0.0f) {
+		return 1.0f / gyro_actual_time;
+	}
+	return (float)CONFIG_SENSOR_GYRO_ODR; // Fallback to config value
+}
+
+// Debug mode control functions
+void sensor_debug_start(uint32_t duration_sec)
+{
+	if (duration_sec == 0 || duration_sec > 30) {
+		duration_sec = 10; // Default to 10 seconds
+	}
+
+	debug_state.enabled = true;
+	debug_state.start_time = k_uptime_get();
+	debug_state.duration_ms = duration_sec * 1000;
+	debug_state.last_output_time = 0;
+	debug_state.sample_count = 0;
+
+	LOG_INF("Debug mode started for %u seconds", duration_sec);
+}
+
+void sensor_debug_stop(void)
+{
+	if (debug_state.enabled) {
+		debug_state.enabled = false;
+		LOG_INF("Debug mode stopped. %u samples captured", debug_state.sample_count);
+	}
+}
+
+bool sensor_debug_is_active(void)
+{
+	if (debug_state.enabled) {
+		int64_t elapsed = k_uptime_get() - debug_state.start_time;
+		if (elapsed >= debug_state.duration_ms) {
+			sensor_debug_stop();
+			return false;
+		}
+		return true;
+	}
+	return false;
+}

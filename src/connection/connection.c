@@ -122,7 +122,7 @@ void connection_update_sensor_data(float *q, float *a, int64_t data_time)
 {
 	// data_time is in system ticks, nonzero means valid measurement
 	// TODO: use data_time to measure latency! the latency should be calculated up to before radio sent data
-	send_precise_quat = q_epsilon(q, sensor_q, 0.005);
+	send_precise_quat = q_epsilon(q, sensor_q, 0.005f);
 	memcpy(sensor_q, q, sizeof(sensor_q));
 	memcpy(sensor_a, a, sizeof(sensor_a));
 	quat_update_time = k_uptime_get();
@@ -152,7 +152,7 @@ void connection_update_sensor_temp(float temp)
 }
 
 // format for packet send
-void connection_update_battery(bool battery_available, bool plugged, uint32_t battery_pptt, int battery_mV)
+void connection_update_battery(bool battery_available, bool plugged, bool charged, uint32_t battery_pptt, int battery_mV)
 {
 	if (!battery_available) // No battery, and voltage is <=1500mV
 	{
@@ -164,6 +164,10 @@ void connection_update_battery(bool battery_available, bool plugged, uint32_t ba
 	battery_pptt /= 100;
 	batt = battery_pptt;
 	batt |= 0x80; // battery_available, server will show a battery indicator
+
+	if (charged) { // 255, server will show fully charged indicator (not yet)
+		batt = 255;
+	}
 
 	if (plugged) {                          // Charging
 		battery_mV = MAX(battery_mV, 4310); // server will show a charging indicator

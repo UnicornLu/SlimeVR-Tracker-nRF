@@ -29,6 +29,8 @@ const char* sensor_get_sensor_imu_name(void);
 const char* sensor_get_sensor_mag_name(void);
 const char* sensor_get_sensor_fusion_name(void);
 
+int sensor_get_sensor_temperature(float *);
+
 int sensor_request_scan(bool force);
 
 void sensor_scan_read(void);
@@ -52,6 +54,15 @@ void main_imu_restart(void);
 #if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
 float sensor_get_current_imu_temperature(void);
 #endif
+
+// Get actual sensor ODR (Output Data Rate) in Hz
+float sensor_get_accel_odr(void);
+float sensor_get_gyro_odr(void);
+
+// Debug mode functions
+void sensor_debug_start(uint32_t duration_sec);
+void sensor_debug_stop(void);
+bool sensor_debug_is_active(void);
 
 typedef struct sensor_fusion {
 	void (*init)(float, float, float);  // gyro_time, accel_time, mag_time
