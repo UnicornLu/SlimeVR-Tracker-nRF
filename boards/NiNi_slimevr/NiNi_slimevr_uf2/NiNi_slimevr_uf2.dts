@@ -51,10 +51,15 @@
 			gpios = <&gpio0 11 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 			label = "Push button switch 0";
 		};
+		button1: button_1 {
+			gpios = <&gpio0 18 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+		};
 	};
 
 	aliases {
 		sw0 = &button0;
+		sw1 = &button1;
 		led0 = &led0;
 	};
 
