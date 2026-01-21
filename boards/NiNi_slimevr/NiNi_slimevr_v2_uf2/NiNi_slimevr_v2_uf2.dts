@@ -9,17 +9,30 @@
 &pinctrl {
 	spi2_default: spi2_default {
 		group1 {
-			psels = <NRF_PSEL(SPIM_MISO, 0, 29)>,
-					<NRF_PSEL(SPIM_MOSI, 0, 28)>,
-					<NRF_PSEL(SPIM_SCK, 0, 2)>;
+			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
+					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+					<NRF_PSEL(SPIM_SCK, 0, 29)>;
 		};
 	};
 
 	spi2_sleep: spi2_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIM_MISO, 0, 29)>,
-					<NRF_PSEL(SPIM_MOSI, 0, 28)>,
-					<NRF_PSEL(SPIM_SCK, 0, 2)>;
+			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
+					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+					<NRF_PSEL(SPIM_SCK, 0, 29)>;
+			low-power-enable;
+		};
+	};
+
+	pwm1_default: pwm1_default {
+		group1 {
+			psels = <NRF_PIN_DISCONNECTED>;
+		};
+	};
+
+	pwm1_sleep: pwm1_sleep {
+		group1 {
+			psels = <NRF_PIN_DISCONNECTED>;
 			low-power-enable;
 		};
 	};
@@ -27,8 +40,8 @@
 //end
 
 / {
-	model = "NiNi_slimevr_uf2";
-	compatible = "NiNi_slimevr_uf2";
+	model = "NiNi_slimevr_v2_uf2";
+	compatible = "NiNi_slimevr_v2_uf2";
 
 	chosen {
 		zephyr,sram = &sram0;
@@ -63,6 +76,12 @@
 		led0 = &led0;
 	};
 
+	pwmclock: pwmclock {
+		compatible = "pwm-clock";
+		#clock-cells = <1>;
+		pwms = <&pwm1 0 PWM_HZ(32768) PWM_POLARITY_NORMAL>;
+	};
+
 	battery-divider {
 		compatible = "voltage-divider";
 		status = "okay";
@@ -75,6 +94,7 @@
 		int0-gpios = <&gpio0 30 0>;
 		led0-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
 		chg-gpios = <&gpio1 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		clk-gpios = <&gpio0 22 GPIO_OPEN_DRAIN>; // Uncomment and set to correct pin if using an external clock (crystal oscillator)
 	};
 };
 
@@ -111,13 +131,20 @@ zephyr_udc0: &usbd {
 	status = "disabled";
 };
 
+&pwm1 {
+	status = "okay";
+	pinctrl-0 = <&pwm1_default>;
+	pinctrl-1 = <&pwm1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
 &spi2 {
-	status = "enable";
+	status = "okay";
 	compatible = "nordic,nrf-spim";
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
 	pinctrl-names = "default", "sleep";
-	cs-gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu@0 {
 		compatible = "vnd,spi-device";
