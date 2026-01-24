@@ -336,6 +336,23 @@ static void print_sensor(void)
 #endif
 
 	printk("\nFusion: %s\n", sensor_get_sensor_fusion_name());
+
+	// Display runtime range statistics summary
+	const sensor_range_stats_t *stats = sensor_get_range_stats();
+	if (stats->initialized) {
+		float gyro_peak = 0;
+		float accel_peak = 0;
+		for (int i = 0; i < 3; i++) {
+			float g_peak = fmaxf(fabsf(stats->gyro_min[i]), fabsf(stats->gyro_max[i]));
+			float a_peak = fmaxf(fabsf(stats->accel_min[i]), fabsf(stats->accel_max[i]));
+			if (g_peak > gyro_peak) gyro_peak = g_peak;
+			if (a_peak > accel_peak) accel_peak = a_peak;
+		}
+		printk("\nRuntime range peaks (this session):\n");
+		printk("  Gyro: %.2f deg/s\n", (double)gyro_peak);
+		printk("  Accel: %.3f g\n", (double)accel_peak);
+		printk("  Samples: %llu (use 'range' for details)\n", stats->sample_count);
+	}
 }
 
 static void print_sens_calibration_info(void)
@@ -600,7 +617,9 @@ static void print_help(void)
 	printk("Other:\n");
 	printk("  meow                       Meow!\n");
 	printk("  help                       Show this help message\n");
-	printk("  debug [duration]           Start sensor debug mode (default 10s)\n");
+	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 10s)\n");
+	printk("  range                      Show sensor range statistics (min/max values)\n");
+	printk("  range reset                Reset sensor range statistics\n");
 	printk("\n");
 	printk("Debug Commands:\n");
 	printk("  reset zro                  Reset ZRO calibration\n");
@@ -675,6 +694,7 @@ static void console_thread(void)
 	uint8_t command_calibrate[] = "calibrate";
 	uint8_t command_help[] = "help";
 	uint8_t command_debug[] = "debug";
+	uint8_t command_range[] = "range";
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	uint8_t command_6_side[] = "6-side";
@@ -1012,18 +1032,24 @@ static void console_thread(void)
 		else if (memcmp(line, command_meow, sizeof(command_meow)) == 0) {
 			print_meow();
 		} else if (memcmp(line, command_debug, sizeof(command_debug)) == 0) {
-			uint32_t duration = 3; // Default 3 seconds
+			uint32_t duration = 1; // Default 1 second
 			if (arg) {
 				char *endptr;
 				long dur = strtol((char *)arg, &endptr, 10);
-				if (endptr != arg && *endptr == '\0' && dur >= 1 && dur <= 30) {
+				if (endptr != arg && *endptr == '\0' && dur >= 1 && dur <= 60) {
 					duration = (uint32_t)dur;
 				} else {
-					printk("Invalid duration. Using default 3 seconds.\n");
+					printk("Invalid duration (1-60s). Using default 1 seconds.\n");
 				}
 			}
 			sensor_debug_start(duration);
-			printk("Sensor debug started for %u seconds.\n", duration);
+		} else if (memcmp(line, command_range, sizeof(command_range)) == 0) {
+			if (arg && strcmp((char *)arg, "reset") == 0) {
+				sensor_reset_range_stats();
+				printk("Sensor range statistics have been reset.\n");
+			} else {
+				sensor_print_range_stats();
+			}
 		} else if (memcmp(line, command_reset, sizeof(command_reset)) == 0) {
 			if (arg && memcmp(arg, command_reset_arg_zro, sizeof(command_reset_arg_zro)) == 0) {
 				cmd_reset_zro();
