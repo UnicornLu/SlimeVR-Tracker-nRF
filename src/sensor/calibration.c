@@ -21,11 +21,17 @@
 	THE SOFTWARE.
 */
 #include "globals.h"
+#include "sensor.h"
 #include "system/system.h"
+#include "system/watchdog.h"
 #include "util.h"
 
 #include <math.h>
 #include <stdlib.h>
+
+#if CONFIG_CMSIS_DSP
+#include <arm_math.h>
+#endif
 
 #include "sensors_enum.h"
 #include "magneto/magneto1_4.h"
@@ -44,6 +50,37 @@ static float magBAinv[4][3];
 static uint8_t magneto_progress;
 static uint8_t last_magneto_progress;
 static int64_t magneto_progress_time;
+// 12 reference directions for orientation tracking (icosahedron vertices, normalized)
+// Using accelerometer (gravity) avoids magnetometer hard iron offset issues
+#define MAG_CAL_NUM_REGIONS 12
+static const float orientation_refs[MAG_CAL_NUM_REGIONS][3] = {
+	// (0, ±1, ±φ) / √(1+φ²)  where φ = golden ratio
+	{ 0.0000f,  0.5257f,  0.8507f},
+	{ 0.0000f,  0.5257f, -0.8507f},
+	{ 0.0000f, -0.5257f,  0.8507f},
+	{ 0.0000f, -0.5257f, -0.8507f},
+	// (±1, ±φ, 0) / √(1+φ²)
+	{ 0.5257f,  0.8507f,  0.0000f},
+	{ 0.5257f, -0.8507f,  0.0000f},
+	{-0.5257f,  0.8507f,  0.0000f},
+	{-0.5257f, -0.8507f,  0.0000f},
+	// (±φ, 0, ±1) / √(1+φ²)
+	{ 0.8507f,  0.0000f,  0.5257f},
+	{ 0.8507f,  0.0000f, -0.5257f},
+	{-0.8507f,  0.0000f,  0.5257f},
+	{-0.8507f,  0.0000f, -0.5257f},
+};
+static uint16_t mag_region_samples[MAG_CAL_NUM_REGIONS];
+static uint16_t mag_region_coverage;  // Bitfield for covered regions
+static int64_t magneto_last_saturated_warning;
+static int64_t mag_cal_last_status_log;
+
+// Calibration thresholds
+#define MAG_CAL_MIN_SAMPLES 1000
+#define MAG_CAL_MIN_REGIONS MAG_CAL_NUM_REGIONS
+#define MAG_CAL_MIN_PER_REGION 90
+#define MAG_CAL_MAX_PER_REGION 120
+#define MAG_CAL_SATURATED_WARNING_INTERVAL_MS 2000
 
 static double ata[100]; // init calibration
 static double norm_sum;
@@ -72,7 +109,34 @@ static void sensor_calibrate_6_side(void);
 #endif
 static int sensor_calibrate_mag(void);
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+// =============================================================================
+// Offset-bias collection constants
+// =============================================================================
+#ifndef BIAS_COLLECT_TEMP_RANGE_THRESHOLD
+#define BIAS_COLLECT_TEMP_RANGE_THRESHOLD 1.0f // °C - stop early if temp changes this much
+#endif
+
+#ifndef BIAS_COLLECT_MAX_SAMPLE_TIME_MS
+#define BIAS_COLLECT_MAX_SAMPLE_TIME_MS 6000 // 6 seconds max
+#endif
+
+#ifndef BIAS_COLLECT_MIN_SAMPLE_TIME_MS
+#define BIAS_COLLECT_MIN_SAMPLE_TIME_MS 4000 // 4 seconds min
+#endif
+
+#ifndef BIAS_COLLECT_TEMP_CHECK_TIME_MS
+#define BIAS_COLLECT_TEMP_CHECK_TIME_MS 4000 // 4 seconds - prioritize sampling time over temp stability
+#endif
+
+#ifndef BIAS_COLLECT_GYRO_MOTION_THRESHOLD
+#define BIAS_COLLECT_GYRO_MOTION_THRESHOLD 2.0f // dps (range method)
+#endif
+
+#ifndef BIAS_COLLECT_ACCEL_MOTION_THRESHOLD
+#define BIAS_COLLECT_ACCEL_MOTION_THRESHOLD 0.12f // G (range method)
+#endif
+
+#if CONFIG_SENSOR_USE_TCAL
 
 #define TEMP_TO_IDX(temp) (int)((((float)temp) - CONFIG_SENSOR_POLY_TEMP_MIN) * CONFIG_SENSOR_POLY_STEPS_PER_DEGREE)
 #define IDX_TO_TEMP(idx) (float)(((float)(idx) / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE) + CONFIG_SENSOR_POLY_TEMP_MIN)
@@ -82,10 +146,10 @@ static int sensor_calibrate_mag(void);
 // =============================================================================
 
 // Boot calibration constants
-#define BOOT_CAL_TIME_WINDOW_START_MS 5000 // 5 seconds after boot
-#define BOOT_CAL_TIME_WINDOW_END_MS 30000  // 30 seconds after boot
+#define BOOT_CAL_TIME_WINDOW_START_MS 15000 // 15 seconds after boot
+#define BOOT_CAL_TIME_WINDOW_END_MS 50000  // 50 seconds after boot
 #define BOOT_CAL_MAX_ATTEMPTS 3            // Maximum retry attempts
-#define BOOT_CAL_MIN_CURVE_POINTS 2        // Minimum calibration points (MLS needs at least 2)
+#define BOOT_CAL_MIN_CURVE_POINTS 4        // Minimum calibration points
 
 // =============================================================================
 // Runtime Periodic Zero Bias Calibration
@@ -95,14 +159,15 @@ static int sensor_calibrate_mag(void);
 // sessions when temperature curves may differ or fixed zero bias changes.
 
 // Runtime calibration constants
-#define RUNTIME_CAL_REST_TIME_MS 5000         // 5 seconds of rest before triggering
+#define RUNTIME_CAL_REST_TIME_MS 8000         // 8 seconds of rest before triggering
 #define RUNTIME_CAL_COOLDOWN_MS 60000         // 1 minute cooldown between runtime calibrations
 #define RUNTIME_CAL_MIN_UPTIME_MS 60000       // Wait at least 60s after boot before runtime cal
 #define RUNTIME_CAL_TEMP_CHANGE_MIN 1.0f      // Minimum temperature change (°C) to trigger recalibration
 #define RUNTIME_CAL_SAMPLE_TIME_MS 3000       // 3 seconds sampling time for runtime calibration
-#define RUNTIME_CAL_FAILURE_COOLDOWN_MS 15000 // 15 seconds cooldown after calibration failure
+#define RUNTIME_CAL_FAILURE_COOLDOWN_MS 30000 // 30 seconds cooldown after calibration failure
 
 // Runtime calibration state (not persisted)
+static bool runtime_cal_enabled = false;       // Runtime calibration enabled (default: disabled)
 static int64_t runtime_cal_last_time = 0;      // Last time runtime calibration was performed
 static int64_t runtime_cal_rest_start = 0;     // When rest period started
 static bool runtime_cal_rest_tracking = false; // Currently tracking rest period
@@ -115,37 +180,13 @@ static int sensor_tcal_calculate_doffset(const float measured_bias[3], float tem
 static int sensor_perform_boot_calibration(void);
 static int sensor_perform_runtime_calibration(void);
 
-// =============================================================================
-// T-Cal Constants for sensor_offsetBias
-// =============================================================================
-
-// Temperature range threshold - stop collecting when exceeded
-#define TCAL_TEMP_RANGE_THRESHOLD 1.0f // °C - stop early if temp changes this much
-
-// Maximum sampling time before forcing finalization (ms)
-#define TCAL_MAX_SAMPLE_TIME_MS 6000 // 6 seconds max
-
-// Minimum sampling time before allowing finalization (ms)
-#define TCAL_MIN_SAMPLE_TIME_MS 4000 // 4 seconds min
-
-// Temperature check time - only check temp threshold after this time (ms)
-#define TCAL_TEMP_CHECK_TIME_MS 4000 // 4 seconds - prioritize sampling time over temp stability
-
-// Gyro motion threshold during collection (dps) - using range
-#define TCAL_GYRO_MOTION_THRESHOLD 2.0f
-
-// Accel motion threshold during collection (G) - using range
-#define TCAL_ACCEL_MOTION_THRESHOLD 0.12f
 
 // Auto-calibration control
 static bool tcal_auto_calibration_enabled = false;
 
 static float last_gyro_tcal_offset[3] = {0.0f, 0.0f, 0.0f};
 
-static int solve_linear_system(double *A, double *B, int n, double *x);
-static int polyfit(int degree, float coeffs_out[3][CONFIG_SENSOR_POLY_DEGREE + 1]);
-static void update_poly_tcal(void); // Function to calculate the curve
-static void recalculate_tcal_correction_offset(void);
+static void update_tcal_state(void); // Function to refresh T-Cal state
 
 // =============================================================================
 // T-Cal Moving Least Squares (MLS) Implementation
@@ -155,10 +196,11 @@ static void recalculate_tcal_correction_offset(void);
 // linear fitting for optimal balance of smoothness and responsiveness.
 
 // MLS Configuration
-#define MLS_BANDWIDTH 3.0f       // Temperature bandwidth (°C) - controls locality
-#define MLS_MIN_WEIGHT 0.01f     // Minimum weight threshold to consider a point
-#define MLS_MAX_POINTS 8         // Maximum points to consider for efficiency
-#define MLS_MIN_POINTS_FOR_FIT 2 // Minimum points with significant weight for MLS to be valid
+#define MLS_BANDWIDTH 2.5f       // Temperature bandwidth (°C) - controls locality
+#define MLS_MIN_WEIGHT 0.03f     // Minimum weight threshold (~6.5°C distance cutoff)
+#define MLS_MAX_POINTS 10        // Maximum points to consider for efficiency
+#define MLS_MIN_POINTS_FOR_FIT 4 // Minimum points with significant weight for MLS to be valid
+#define MLS_EXTRAP_POINTS 4      // Number of edge points for linear extrapolation (matches LUT)
 
 /**
  * Moving Least Squares (MLS) lookup function
@@ -189,42 +231,156 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3]);
 // We use multiple cache slots to cover a larger temperature range, which helps
 // when temperature oscillates slightly within a small range.
 
+// =============================================================================
+// LUT (Look-Up Table) + Linear Interpolation - O(1) Runtime Lookup
+// =============================================================================
+// When calibration points change, pre-compute MLS output at fixed temperature
+// grid points. Runtime lookup simply does linear interpolation between two
+// adjacent grid points, achieving O(1) complexity without expensive MLS
+// computation per query.
+//
+// LUT Configuration:
+// - Step size: 0.5°C (2 steps per degree) - good balance of precision vs RAM
+// - Temperature range: CONFIG_SENSOR_POLY_TEMP_MIN to CONFIG_SENSOR_POLY_TEMP_MAX
+// - RAM usage: ~0.9KB for standard 10-45°C range
+//
+// Incremental Build Strategy:
+// - At boot, first build entries within ±3°C of current temperature (priority zone)
+// - Return quickly to allow other threads to run
+// - Continue building remaining entries in small batches during idle time
+// - LUT lookup falls back to MLS for entries not yet computed
+
+#define MLS_LUT_STEP_PER_DEGREE 2   // Steps per degree (0.5°C per step)
+#define MLS_LUT_STEP_SIZE (1.0f / MLS_LUT_STEP_PER_DEGREE)  // 0.5°C
+#define MLS_LUT_TEMP_MIN ((float)CONFIG_SENSOR_POLY_TEMP_MIN)
+#define MLS_LUT_TEMP_MAX ((float)CONFIG_SENSOR_POLY_TEMP_MAX)
+#define MLS_LUT_SIZE ((int)((CONFIG_SENSOR_POLY_TEMP_MAX - CONFIG_SENSOR_POLY_TEMP_MIN) * MLS_LUT_STEP_PER_DEGREE) + 1)
+
+// Incremental build configuration
+#define MLS_LUT_PRIORITY_RANGE 3.0f  // ±3°C around current temp is priority zone
+#define MLS_LUT_BATCH_SIZE 10        // Entries to compute per incremental batch
+#define MLS_LUT_BATCH_YIELD_MS 10     // Sleep between batches to yield CPU
+
+// Convert temperature to LUT index (continuous, for interpolation)
+#define MLS_LUT_TEMP_TO_IDX(temp) (((temp) - MLS_LUT_TEMP_MIN) * MLS_LUT_STEP_PER_DEGREE)
+// Convert LUT index to temperature
+#define MLS_LUT_IDX_TO_TEMP(idx) (MLS_LUT_TEMP_MIN + (float)(idx) * MLS_LUT_STEP_SIZE)
+
+typedef struct {
+	float bias[3];  // Pre-computed MLS bias at this temperature
+	bool computed;  // Whether this entry has been computed
+} MlsLutEntry;
+
+// LUT build state
+typedef enum {
+	MLS_LUT_BUILD_IDLE,         // No build in progress, LUT may be invalid or complete
+	MLS_LUT_BUILD_PRIORITY,     // Building priority zone (±3°C around current temp)
+	MLS_LUT_BUILD_BACKGROUND,   // Building remaining entries in background
+	MLS_LUT_BUILD_COMPLETE      // All entries computed
+} MlsLutBuildState;
+
+static struct {
+	MlsLutEntry entries[MLS_LUT_SIZE]; // Pre-computed bias values
+	uint32_t version;                   // Point count when LUT was built (for invalidation)
+	bool valid;                         // LUT has at least priority zone computed
+	MlsLutBuildState build_state;       // Current build state
+	int build_next_idx;                 // Next index to compute in background build
+	int priority_idx_min;               // Priority zone minimum index
+	int priority_idx_max;               // Priority zone maximum index
+	int computed_count;                 // Number of entries computed so far
+} mls_lut = {
+	.entries = {{{0}}},
+	.version = 0,
+	.valid = false,
+	.build_state = MLS_LUT_BUILD_IDLE,
+	.build_next_idx = 0,
+	.priority_idx_min = 0,
+	.priority_idx_max = 0,
+	.computed_count = 0
+};
+
+// Forward declarations for LUT functions
+static void sensor_tcal_build_lut_priority(float current_temp);
+static bool sensor_tcal_build_lut_continue(void);
+static int sensor_tcal_lut_lookup(float temp, float bias_out[3]);
+
+// =============================================================================
+// Legacy MLS Cache (kept for fallback and LUT building)
+// =============================================================================
+
 #define MLS_CACHE_SLOTS 5            // Number of cache slots
-#define MLS_CACHE_SLOT_TEMP_STEP 0.5f // Temperature step between slots (0.5°C)
 #define MLS_CACHE_TEMP_THRESHOLD 0.5f // Match within this threshold of cached temp
 
 typedef struct {
-	float temp;       // Temperature at which cache was computed
-	float bias[3];    // Cached bias values
-	bool valid;       // Cache validity flag
+	float temp;        // Temperature at which cache was computed
+	float bias[3];     // Cached bias values at temp
+	float slope[3];    // Local d(bias)/d(temp) slope used for smooth cached interpolation
+	bool valid;        // Cache validity flag
 } MlsCacheSlot;
 
 static struct {
 	MlsCacheSlot slots[MLS_CACHE_SLOTS]; // Cache slots covering temperature range
 	uint32_t count;                       // Point count when cached (invalidate all if points change)
-	uint8_t next_slot;                    // Next slot to use for replacement (round-robin)
 } mls_cache = {
 	.slots = {{0}},
-	.count = 0,
-	.next_slot = 0
+	.count = 0
 };
 
+/**
+ * Select the best cache slot to use for a new entry at the given temperature.
+ * Strategy:
+ * 1. If an invalid slot exists, use it
+ * 2. Find the slot with the largest distance from the query temperature
+ *    (this preserves nearby cached values for interpolation)
+ * @param temp Query temperature for the new cache entry
+ * @return Best slot index to use
+ */
+static int sensor_tcal_cache_select_slot(float temp)
+{
+	int best_slot = 0;
+	float best_distance = -1.0f;
+
+	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
+		// Prefer invalid slots first
+		if (!mls_cache.slots[i].valid) {
+			return i;
+		}
+		// Find slot with largest distance from query temperature
+		float distance = fabsf(mls_cache.slots[i].temp - temp);
+		if (distance > best_distance) {
+			best_distance = distance;
+			best_slot = i;
+		}
+	}
+	return best_slot;
+}
+
 // =============================================================================
-// T-Cal Cache Invalidation (called when calibration points change)
+// T-Cal Cache/LUT Invalidation (called when calibration points change)
 // =============================================================================
 static void sensor_tcal_cache_invalidate(void)
 {
+	// Invalidate legacy cache slots
 	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
 		mls_cache.slots[i].valid = false;
 	}
-	LOG_DBG("T-Cal cache invalidated");
+	// Invalidate LUT and stop any incremental build in progress
+	mls_lut.valid = false;
+	mls_lut.build_state = MLS_LUT_BUILD_IDLE;
+	mls_lut.computed_count = 0;
+	// Mark all entries as not computed
+	for (int i = 0; i < MLS_LUT_SIZE; i++) {
+		mls_lut.entries[i].computed = false;
+	}
+	LOG_DBG("T-Cal cache/LUT invalidated, incremental build stopped");
 }
 
 #endif
 
 // helpers
 static bool wait_for_motion(bool motion, int samples);
-static int check_sides(const float *);
+static int check_orientation_region(const float *a);
+static int popcount16(uint16_t x);
 static void magneto_reset(void);
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 static int isAccRest(float *, float *, float, int *, int);
@@ -241,7 +397,7 @@ static int sensor_offsetBias_internal(
 );
 static int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_range);
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-static int sensor_6_sideBias(float a_inv[][3]);
+static int sensor_6_sideBias(float a_inv[][3], int *captured_count_out);
 #endif
 static void sensor_sample_mag_magneto_sample(const float a[3], const float m[3]);
 
@@ -267,38 +423,30 @@ void sensor_calibration_process_accel(float a[3])
 void sensor_calibration_process_gyro(float g[3])
 {
 	sensor_sample_gyro(g);
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	float calculated_offset[3] = {0.0f, 0.0f, 0.0f};
 	float temp = sensor_get_current_imu_temperature();
 	bool offset_calculated = false;
 
 	// ==========================================================================
-	// Unified T-Cal Strategy: MLS -> Polynomial -> Static Bias
-	// D_offset is always applied when valid, regardless of which method is used
+	// Unified T-Cal Strategy: LUT -> MLS -> Static Bias
+	// D_offset is always applied when valid
 	// ==========================================================================
 
 	if (!isnan(temp) && retained->tempCalState.count >= 1) {
-		// Strategy 1: Try MLS (preferred - smooth, no discontinuities)
+		// Strategy 1: Try LUT lookup (preferred - O(1) linear interpolation)
 		if (retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
-			if (sensor_tcal_mls_lookup(temp, calculated_offset) == 0) {
+			if (sensor_tcal_lut_lookup(temp, calculated_offset) == 0) {
+				offset_calculated = true;
+			}
+			// Strategy 2: Fallback to MLS if LUT not available
+			else if (sensor_tcal_mls_lookup(temp, calculated_offset) == 0) {
 				offset_calculated = true;
 			}
 		}
-
-		// Strategy 2: Fallback to Polynomial if MLS didn't work
-		if (!offset_calculated && retained->tempCalState.valid) {
-			for (int axis = 0; axis < 3; axis++) {
-				float offset = retained->tempCalCoeffs[axis][retained->tempCalState.degree];
-				for (int i = retained->tempCalState.degree - 1; i >= 0; i--) {
-					offset = offset * temp + retained->tempCalCoeffs[axis][i];
-				}
-				calculated_offset[axis] = offset;
-			}
-			offset_calculated = true;
-		}
 	}
 
-	// Strategy 3: Final fallback to static bias (when no T-Cal data available)
+	// Strategy 2: Final fallback to static bias (when no T-Cal data available)
 	if (!offset_calculated) {
 		for (int i = 0; i < 3; i++) {
 			calculated_offset[i] = gyroBias[i];
@@ -306,30 +454,37 @@ void sensor_calibration_process_gyro(float g[3])
 		// Note: offset_calculated remains false but we still apply D_offset below
 	}
 
-	// Apply correction offset (from manual calibration with T-Cal coverage)
-	for (int axis = 0; axis < 3; axis++) {
-		calculated_offset[axis] += retained->tempCalCorrectionOffset[axis];
-	}
-
 	// Apply boot/runtime calibration D_offset
 	// D_offset is now applied regardless of whether T-Cal is used or not
 	// This allows runtime bias tracking even without temperature calibration
 	if (retained->bootCalState.doffset_valid) {
+#if CONFIG_CMSIS_DSP
+		arm_add_f32(calculated_offset, retained->bootCalState.doffset, calculated_offset, 3);
+#else
 		for (int axis = 0; axis < 3; axis++) {
 			calculated_offset[axis] += retained->bootCalState.doffset[axis];
 		}
+#endif
 	}
 
 	// Apply the calculated offset to gyro data
+#if CONFIG_CMSIS_DSP
+	arm_sub_f32(g, calculated_offset, g, 3);
+#else
 	for (int i = 0; i < 3; i++) {
 		g[i] -= calculated_offset[i];
 	}
+#endif
 
 	memcpy(last_gyro_tcal_offset, calculated_offset, sizeof(last_gyro_tcal_offset));
+#else
+#if CONFIG_CMSIS_DSP
+	arm_sub_f32(g, gyroBias, g, 3);
 #else
 	for (int i = 0; i < 3; i++) {
 		g[i] -= gyroBias[i];
 	}
+#endif
 #endif
 }
 
@@ -373,6 +528,8 @@ int sensor_calibration_validate(float *a_bias, float *g_bias, bool write)
 	if (!v_epsilon(a_bias, zero, 0.5) || !v_epsilon(g_bias, zero, 50.0)) // check accel is <0.5G and gyro <50dps
 	{
 		sensor_calibration_clear(a_bias, g_bias, write);
+		// Validation failure: do NOT call any fusion function
+		// Let fusion keep its current bias estimate to avoid residual drift
 		LOG_WRN("Invalidated calibration");
 		LOG_WRN("The IMU may be damaged or calibration was not completed properly");
 		return -1;
@@ -446,10 +603,18 @@ void sensor_calibration_clear(float *a_bias, float *g_bias, bool write)
 		LOG_INF("Clearing stored calibration data");
 		sys_write(MAIN_ACCEL_BIAS_ID, &retained->accelBias, a_bias, sizeof(accelBias));
 		sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, g_bias, sizeof(gyroBias));
-		// Only update fusion bias when actually persisting changes
-		// Avoid calling this when calibration was interrupted (write=false)
-		// as it would cause fusion to lose its bias estimate
-		sensor_fusion_update_bias(NULL);
+#if CONFIG_SENSOR_USE_TCAL
+		// Also clear boot/runtime calibration D_offset since ZRO is being reset
+		retained->bootCalState.doffset_valid = false;
+		retained->bootCalState.doffset[0] = 0.0f;
+		retained->bootCalState.doffset[1] = 0.0f;
+		retained->bootCalState.doffset[2] = 0.0f;
+		LOG_INF("Clearing D_offset along with ZRO calibration");
+#endif
+		// Note: Caller is responsible for calling sensor_fusion_update_bias() or
+		// sensor_fusion_invalidate() as appropriate:
+		// - sensor_fusion_update_bias(): for internal/automatic calibration (preserves quaternion)
+		// - sensor_fusion_invalidate(): for manual reset commands (resets quaternion)
 	}
 }
 
@@ -479,6 +644,7 @@ void sensor_calibration_clear_mag(float m_inv[][3], bool write)
 	if (write) {
 		LOG_INF("Clearing stored calibration data");
 		sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, m_inv, sizeof(magBAinv));
+		sensor_refresh_sensor_ids(); // Refresh reported mag status after clear
 	}
 }
 
@@ -496,10 +662,24 @@ void sensor_request_calibration_6_side(void)
 
 void sensor_request_calibration_mag(void)
 {
-	magneto_progress |= 1 << 7;
-	if (magneto_progress == 0b10111111) {
-		magneto_progress |= 1 << 6;
+	// If already collecting or complete, just mark as ready if coverage is met
+	if (magneto_progress & 0x80) {
+		// Already started, check if ready to apply
+		if (magneto_progress == 0b10111111) {
+			magneto_progress |= 1 << 6;
+		}
+		return;
 	}
+
+	// Start fresh calibration
+	magneto_progress = 0;
+	last_magneto_progress = 0;
+	magneto_progress_time = 0;
+	mag_region_coverage = 0;
+	mag_cal_last_status_log = 0;
+	magneto_reset();  // Clear ata buffer and sample count
+	magneto_progress |= 1 << 7;  // Set collection active flag
+	LOG_INF("Magnetometer calibration started (rotate tracker in figure-8 pattern)");
 }
 
 static float aBuf[3] = {0};
@@ -605,7 +785,7 @@ static void sensor_calibrate_imu()
 	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_SENSOR);
 	k_msleep(500); // Delay before beginning acquisition
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	// Variables to store average temperature and temperature range from calibration
 	float avg_temp = NAN;
 	float temp_range = NAN;
@@ -632,7 +812,7 @@ static void sensor_calibrate_imu()
 
 	LOG_INF("Reading data");
 	sensor_calibration_clear(a_bias, g_bias, false);
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	int err = sensor_offsetBias(a_bias, g_bias, &avg_temp, &temp_range);
 #else
 	int err = sensor_offsetBias(a_bias, g_bias, NULL, NULL);
@@ -664,14 +844,14 @@ static void sensor_calibrate_imu()
 	// In 6-side calibration mode, save accelerometer bias (full calibration matrix used elsewhere)
 	sys_write(MAIN_ACCEL_BIAS_ID, &retained->accelBias, accelBias, sizeof(accelBias));
 #endif
-	// Always save gyroscope bias (ZRO is orientation-independent)
-	sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
-	// 2. Check if T-Cal coverage is good - if so, only calculate D_offset instead of saving point
-	sys_write(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, &avg_temp, sizeof(avg_temp));
-	if (!isnan(avg_temp)) {
-		// Check if current temperature has good T-Cal coverage
+#if CONFIG_SENSOR_USE_TCAL
+	if (tcal_auto_calibration_enabled && !isnan(avg_temp)) {
+		// Auto temperature calibration enabled: save to tcal data points only, don't change gyro bias
+		sys_write(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, &avg_temp, sizeof(avg_temp));
+		LOG_INF("T-Cal auto-calibration enabled: saving to tcal data only, not updating gyro bias");
+
+		// Check if T-Cal coverage is good - if so, skip saving a redundant point
 		tcal_quality_t quality;
 		bool has_good_coverage = false;
 
@@ -711,7 +891,7 @@ static void sensor_calibrate_imu()
 			// Coverage is good if:
 			// 1. Closest point is within sampling interval (very close match)
 			// OR
-			// 2. Has both upper and lower bounds AND closest is within 2x sampling interval
+			// 2. Has both upper and lower bounds AND closest is within 1x sampling interval
 			if (closest_distance <= sampling_interval) {
 				// Very close to existing point - definitely good coverage
 				has_good_coverage = true;
@@ -720,7 +900,7 @@ static void sensor_calibrate_imu()
 					(double)avg_temp,
 					(double)closest_distance
 				);
-			} else if (has_lower_bound && has_upper_bound && closest_distance <= sampling_interval * 2.0f) {
+			} else if (has_lower_bound && has_upper_bound && closest_distance <= sampling_interval * 1.0f) {
 				// Bounded interpolation with reasonable distance
 				has_good_coverage = true;
 				LOG_INF(
@@ -743,70 +923,21 @@ static void sensor_calibrate_imu()
 						"T-Cal: Coverage insufficient at %.2fC (closest: %.2fC > threshold: %.2fC)",
 						(double)avg_temp,
 						(double)closest_distance,
-						(double)(sampling_interval * 2.0f)
+						(double)(sampling_interval * 1.0f)
 					);
 				}
 			}
 		}
 
 		if (has_good_coverage) {
-			// Calculate and apply D_offset instead of saving new point
-			LOG_INF("T-Cal: Calculating D_offset instead of saving new point (preserving curve)");
-
-			// Calculate curve value at current temperature using unified strategy
-			float curve_bias[3];
-			bool offset_calculated = false;
-
-			// Try MLS first
-			if (retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
-				if (sensor_tcal_mls_lookup(avg_temp, curve_bias) == 0) {
-					offset_calculated = true;
-				}
-			}
-
-			// Fallback to polynomial if needed
-			if (!offset_calculated && retained->tempCalState.valid) {
-				for (int axis = 0; axis < 3; axis++) {
-					float offset = retained->tempCalCoeffs[axis][retained->tempCalState.degree];
-					for (int i = retained->tempCalState.degree - 1; i >= 0; i--) {
-						offset = offset * avg_temp + retained->tempCalCoeffs[axis][i];
-					}
-					curve_bias[axis] = offset;
-				}
-				offset_calculated = true;
-			}
-
-			if (offset_calculated) {
-				// Calculate D_offset = measured - curve
-				for (int axis = 0; axis < 3; axis++) {
-					retained->tempCalCorrectionOffset[axis] = g_bias[axis] - curve_bias[axis];
-				}
-
-				LOG_INF(
-					"T-Cal: Updated D_offset [%.5f, %.5f, %.5f]",
-					(double)retained->tempCalCorrectionOffset[0],
-					(double)retained->tempCalCorrectionOffset[1],
-					(double)retained->tempCalCorrectionOffset[2]
-				);
-
-				// Save correction offset to NVS
-				sys_write(
-					MAIN_GYRO_TCAL_CORRECTION_ID,
-					retained->tempCalCorrectionOffset,
-					retained->tempCalCorrectionOffset,
-					sizeof(retained->tempCalCorrectionOffset)
-				);
-
-				// Update fusion bias while preserving orientation
-				sensor_fusion_update_bias(NULL);
-			} else {
-				LOG_WRN("T-Cal: Failed to calculate D_offset, falling back to point save");
-				has_good_coverage = false; // Fall through to save point
-			}
+			LOG_INF(
+				"T-Cal: Coverage sufficient at %.2fC, skipping point save",
+				(double)avg_temp
+			);
 		}
 
 		if (!has_good_coverage) {
-			// Normal path: save as new calibration point
+			// Save as new calibration point
 			LOG_INF(
 				"T-Cal: Saving calibration point at average temp %.2fC (range: %.2fC)",
 				(double)avg_temp,
@@ -855,7 +986,7 @@ static void sensor_calibrate_imu()
 				retained->tempCalPoints[idx].temp = avg_temp;
 				memcpy(retained->tempCalPoints[idx].bias, g_bias, sizeof(g_bias));
 				retained->tempCalState.valid = false; // Invalidate old curve
-				update_poly_tcal();
+				update_tcal_state();
 
 			} else {
 				LOG_WRN(
@@ -864,7 +995,14 @@ static void sensor_calibrate_imu()
 				);
 			}
 		}
+	} else {
+		// Auto tcal not enabled or no valid temperature: save gyro bias to NVS only
+		sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
+		LOG_INF("Saving gyro bias to NVS (auto tcal not enabled)");
 	}
+#else
+	// No tcal support: always save gyro bias to NVS
+	sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
 #endif
 
 	LOG_INF("Finished calibration");
@@ -872,21 +1010,47 @@ static void sensor_calibrate_imu()
 }
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+// Minimum poses required for partial calibration save (must be before sensor_calibrate_6_side)
+#define CALIB_MIN_POSES_FOR_PARTIAL 6
+
 static void sensor_calibrate_6_side(void)
 {
 	float a_inv[4][3];
+	int captured_count = 0;
 	LOG_INF("Calibrating main accelerometer 6-side offset");
 	LOG_INF("Rest the device on a stable surface");
 
 	sensor_calibration_clear_6_side(a_inv, false);
-	int err = sensor_6_sideBias(a_inv);
+	int err = sensor_6_sideBias(a_inv, &captured_count);
 	if (err) {
-		magneto_reset();
-		if (err == -1) {
-			LOG_INF("Motion detected");
+		if (err == -3) {
+			// Timeout occurred - check if we have enough samples for partial calibration
+			LOG_WRN("Calibration timeout after %d poses (minimum: %d)", captured_count, CALIB_MIN_POSES_FOR_PARTIAL);
+			if (captured_count >= CALIB_MIN_POSES_FOR_PARTIAL) {
+				// We have enough samples, try to calculate calibration from partial data
+				LOG_INF("Attempting partial calibration with %d poses...", captured_count);
+				wait_for_threads();
+				magneto_current_calibration(a_inv, ata, norm_sum, sample_count);
+				magneto_reset();
+				// Continue to validation below - err will be handled by validate function
+				err = 0; // Clear error to allow validation
+			} else {
+				// Not enough samples - discard and restore previous calibration
+				LOG_ERR("Insufficient poses for calibration, discarding data");
+				magneto_reset();
+				set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+				return; // Existing calibration is preserved in accBAinv
+			}
+		} else {
+			magneto_reset();
+			if (err == -1) {
+				LOG_INF("Motion detected");
+			}
+			a_inv[0][0] = NAN; // invalidate calibration
 		}
-		a_inv[0][0] = NAN; // invalidate calibration
-	} else {
+	}
+
+	if (!err) {
 		LOG_INF("Accelerometer matrix:");
 		for (int i = 0; i < 3; i++) {
 			LOG_INF(
@@ -937,8 +1101,30 @@ static int sensor_calibrate_mag(void)
 		return -1; // Timeout
 	}
 	sensor_sample_mag_magneto_sample(aBuf, m); // 400us
+
+	// Periodic status log every 1 second
+	int64_t now = k_uptime_get();
+	if (now - mag_cal_last_status_log >= 1000) {
+		mag_cal_last_status_log = now;
+		int region = check_orientation_region(aBuf);
+		int covered = popcount16(mag_region_coverage);
+		int min_samples = MAG_CAL_MAX_PER_REGION;
+		int needing_more = 0;
+		for (int i = 0; i < MAG_CAL_NUM_REGIONS; i++) {
+			if (mag_region_samples[i] < MAG_CAL_MIN_PER_REGION) {
+				needing_more++;
+				if (mag_region_samples[i] < min_samples) {
+					min_samples = mag_region_samples[i];
+				}
+			}
+		}
+		LOG_INF("Mag cal: region=%d | %d/%d covered | %d total | %d regions need data (min=%d/%d)",
+		        region, covered, MAG_CAL_NUM_REGIONS, (int)sample_count,
+		        needing_more, min_samples, MAG_CAL_MIN_PER_REGION);
+	}
+
 	if (magneto_progress != 0b11111111) {
-		return 0;
+		return 1;  // Still collecting - signal caller to use short sleep
 	}
 
 	float m_inv[4][3];
@@ -994,6 +1180,7 @@ static int sensor_calibrate_mag(void)
 
 	LOG_INF("Finished calibration");
 	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);
+	sensor_refresh_sensor_ids(); // Refresh reported mag status after calibration
 	return 0;
 }
 
@@ -1008,6 +1195,8 @@ static bool wait_for_motion(bool motion, int samples)
 	LOG_INF("Accelerometer: %.5f %.5f %.5f", (double)last_a[0], (double)last_a[1], (double)last_a[2]);
 	for (int i = 0; i < samples + counts; i++) {
 		k_msleep(500);
+		/* Feed watchdog during long wait periods */
+		watchdog_feed(WDT_CHANNEL_CALIBRATION);
 		if (sensor_wait_accel(a, K_MSEC(1000))) {
 			return false;
 		}
@@ -1027,19 +1216,68 @@ static bool wait_for_motion(bool motion, int samples)
 	return false;
 }
 
-static int check_sides(const float *a)
+/**
+ * Determine which orientation region the device is in based on accelerometer.
+ * Uses 12 icosahedron vertices as reference directions for optimal sphere coverage.
+ * Returns region index (0-11), or -1 for invalid readings.
+ *
+ * Using gravity direction avoids the magnetometer hard iron offset problem
+ * that made some regions unreachable with the previous approach.
+ */
+static int check_orientation_region(const float *a)
 {
-	return (-1.2f < a[0] && a[0] < -0.8f ? 1 << 0 : 0) | (1.2f > a[0] && a[0] > 0.8f ? 1 << 1 : 0)
-		 | // dumb check if all accel axes were reached for calibration, assume the user is intentionally doing this
-		   (-1.2f < a[1] && a[1] < -0.8f ? 1 << 2 : 0) | (1.2f > a[1] && a[1] > 0.8f ? 1 << 3 : 0)
-		 | (-1.2f < a[2] && a[2] < -0.8f ? 1 << 4 : 0) | (1.2f > a[2] && a[2] > 0.8f ? 1 << 5 : 0);
+	float mag_sq = a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
+	if (mag_sq < 0.25f) {
+		return -1;  // Less than 0.5g - free fall or invalid
+	}
+
+	// Normalize accel vector
+	float inv_mag;
+#if CONFIG_CMSIS_DSP
+	arm_sqrt_f32(mag_sq, &inv_mag);
+	inv_mag = 1.0f / inv_mag;
+#else
+	inv_mag = 1.0f / sqrtf(mag_sq);
+#endif
+	float norm[3] = { a[0] * inv_mag, a[1] * inv_mag, a[2] * inv_mag };
+
+	// Find nearest reference direction by maximum dot product
+	int best = 0;
+	float best_dot = -2.0f;
+	for (int i = 0; i < MAG_CAL_NUM_REGIONS; i++) {
+		float dot = norm[0] * orientation_refs[i][0]
+		          + norm[1] * orientation_refs[i][1]
+		          + norm[2] * orientation_refs[i][2];
+		if (dot > best_dot) {
+			best_dot = dot;
+			best = i;
+		}
+	}
+
+	return best;
+}
+
+/**
+ * Count number of bits set in a 16-bit value (population count)
+ */
+static int popcount16(uint16_t x)
+{
+	int count = 0;
+	while (x) {
+		count += x & 1;
+		x >>= 1;
+	}
+	return count;
 }
 
 static void magneto_reset(void)
 {
-	magneto_progress = 0; // reusing ata, so guarantee cleared mag progress
+	magneto_progress = 0;
 	last_magneto_progress = 0;
 	magneto_progress_time = 0;
+	mag_region_coverage = 0;
+	memset(mag_region_samples, 0, sizeof(mag_region_samples));
+	magneto_last_saturated_warning = 0;
 	memset(ata, 0, sizeof(ata));
 	norm_sum = 0;
 	sample_count = 0;
@@ -1048,11 +1286,19 @@ static void magneto_reset(void)
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 static int isAccRest(float *acc, float *pre_acc, float threshold, int *t, int restdelta)
 {
-	float delta_x = acc[0] - pre_acc[0];
-	float delta_y = acc[1] - pre_acc[1];
-	float delta_z = acc[2] - pre_acc[2];
+	float delta[3];
+	delta[0] = acc[0] - pre_acc[0];
+	delta[1] = acc[1] - pre_acc[1];
+	delta[2] = acc[2] - pre_acc[2];
 
-	float norm_diff = sqrt(delta_x * delta_x + delta_y * delta_y + delta_z * delta_z);
+#if CONFIG_CMSIS_DSP
+	float norm_sq;
+	arm_dot_prod_f32(delta, delta, 3, &norm_sq);
+	float norm_diff;
+	arm_sqrt_f32(norm_sq, &norm_diff);
+#else
+	float norm_diff = sqrtf(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+#endif
 
 	if (norm_diff <= threshold) {
 		*t += restdelta;
@@ -1093,7 +1339,7 @@ static int sensor_offsetBias_internal(
 
 	double gyro_sum[3] = {0};
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	double temp_sum = 0;
 	float temp_min = INFINITY, temp_max = -INFINITY;
 	float current_temp;
@@ -1109,7 +1355,9 @@ static int sensor_offsetBias_internal(
 
 	int64_t sampling_start_time = k_uptime_get();
 	int i = 0;
+#if CONFIG_SENSOR_USE_TCAL
 	bool temp_threshold_reached = false;
+#endif
 
 	// Accel motion check counter - check every N gyro samples to avoid blocking
 	float actual_gyro_odr = sensor_get_gyro_odr();
@@ -1159,6 +1407,7 @@ static int sensor_offsetBias_internal(
 
 	// Collect samples with smart stop conditions
 	// Main loop runs at gyro ODR, accel checked periodically
+	int wdt_feed_counter = 0;
 	while (true) {
 		int64_t elapsed = k_uptime_get() - sampling_start_time;
 
@@ -1168,7 +1417,14 @@ static int sensor_offsetBias_internal(
 			break;
 		}
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+		// Feed watchdog periodically during long sampling (~every 1 second based on gyro ODR)
+		wdt_feed_counter++;
+		if (wdt_feed_counter >= (int)effective_gyro_odr) {
+			watchdog_feed(WDT_CHANNEL_CALIBRATION);
+			wdt_feed_counter = 0;
+		}
+
+#if CONFIG_SENSOR_USE_TCAL
 		// Check temperature threshold only after min_sample_time_ms
 		if (elapsed >= min_sample_time_ms && temp_threshold_reached) {
 			LOG_INF("Temperature threshold reached after %lld ms with %d samples", elapsed, i);
@@ -1191,7 +1447,7 @@ static int sensor_offsetBias_internal(
 				if (rawData[j] > max_a[j]) {
 					max_a[j] = rawData[j];
 				}
-				if (max_a[j] - min_a[j] > TCAL_ACCEL_MOTION_THRESHOLD) {
+				if (max_a[j] - min_a[j] > BIAS_COLLECT_ACCEL_MOTION_THRESHOLD) {
 					LOG_INF("Accel motion detected: axis %d range %.4f", j, (double)(max_a[j] - min_a[j]));
 					return -1;
 				}
@@ -1213,7 +1469,7 @@ static int sensor_offsetBias_internal(
 			if (rawData[j] > max_g[j]) {
 				max_g[j] = rawData[j];
 			}
-			if (max_g[j] - min_g[j] > TCAL_GYRO_MOTION_THRESHOLD) {
+			if (max_g[j] - min_g[j] > BIAS_COLLECT_GYRO_MOTION_THRESHOLD) {
 				LOG_INF("Gyro motion detected: axis %d range %.4f", j, (double)(max_g[j] - min_g[j]));
 				return -1;
 			}
@@ -1224,7 +1480,7 @@ static int sensor_offsetBias_internal(
 		gyro_sum[1] += (double)rawData[1];
 		gyro_sum[2] += (double)rawData[2];
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 		// Sample and accumulate temperature
 		current_temp = sensor_get_current_imu_temperature();
 		if (!isnan(current_temp) && current_temp > -10.0f && current_temp < 60.0f) {
@@ -1239,7 +1495,7 @@ static int sensor_offsetBias_internal(
 			}
 
 			// Check if temperature range threshold exceeded
-			if ((temp_max - temp_min) >= TCAL_TEMP_RANGE_THRESHOLD) {
+			if ((temp_max - temp_min) >= BIAS_COLLECT_TEMP_RANGE_THRESHOLD) {
 				temp_threshold_reached = true;
 			}
 		}
@@ -1276,7 +1532,7 @@ static int sensor_offsetBias_internal(
 		return -2;
 	}
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	if (avg_temp != NULL && valid_temp_count > 0) {
 		*avg_temp = (float)(temp_sum / valid_temp_count);
 		LOG_INF("T-Cal: Average temperature: %.2fC (%d samples)", (double)*avg_temp, valid_temp_count);
@@ -1310,7 +1566,7 @@ static int sensor_offsetBias_internal(
 
 /**
  * Standard sensor offset bias collection function
- * Uses default timing: TCAL_MAX_SAMPLE_TIME_MS max, TCAL_MIN_SAMPLE_TIME_MS min
+ * Uses default timing: BIAS_COLLECT_MAX_SAMPLE_TIME_MS max, BIAS_COLLECT_MIN_SAMPLE_TIME_MS min
  */
 int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_range)
 {
@@ -1319,8 +1575,8 @@ int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_r
 		dest2,
 		avg_temp,
 		temp_range,
-		TCAL_MAX_SAMPLE_TIME_MS,
-		TCAL_MIN_SAMPLE_TIME_MS
+		BIAS_COLLECT_MAX_SAMPLE_TIME_MS,
+		BIAS_COLLECT_MIN_SAMPLE_TIME_MS
 	);
 }
 
@@ -1335,11 +1591,13 @@ int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_r
 #define THRESHOLD_ACC 0.02f
 // Number of samples to collect for each orientation
 #define SAMPLES_PER_ORIENTATION 500
+// Timeout for waiting for new pose (90 seconds in milliseconds)
+#define CALIB_POSE_TIMEOUT_MS 90000
 typedef struct {
 	float x, y, z;
 } Vector3;
 
-int sensor_6_sideBias(float a_inv[][3])
+int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 {
 	float rawData[3];
 	float pre_acc[3] = {0};
@@ -1347,6 +1605,12 @@ int sensor_6_sideBias(float a_inv[][3])
 
 	Vector3 captured_dirs[CALIB_TARGET_SAMPLES];
 	int captured_count = 0;
+	int64_t last_new_pose_time = k_uptime_get(); // Track time of last new pose
+
+	// Initialize output parameter
+	if (captured_count_out) {
+		*captured_count_out = 0;
+	}
 
 	magneto_reset();
 
@@ -1358,7 +1622,18 @@ int sensor_6_sideBias(float a_inv[][3])
 
 		// 1. Wait for device to be stationary
 		set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR); // Indicate searching for stationary state
+		bool pose_timeout = false;
 		while (1) {
+			/* Feed watchdog during user interaction wait */
+			watchdog_feed(WDT_CHANNEL_CALIBRATION);
+
+			/* Check for timeout - no new pose in CALIB_POSE_TIMEOUT_MS */
+			if ((k_uptime_get() - last_new_pose_time) > CALIB_POSE_TIMEOUT_MS) {
+				LOG_WRN("Timeout: No new pose detected for %d seconds", CALIB_POSE_TIMEOUT_MS / 1000);
+				pose_timeout = true;
+				break;
+			}
+
 			if (sensor_wait_accel(rawData, K_MSEC(1000))) {
 				return -2; // Timeout, magneto state not handled here
 			}
@@ -1369,7 +1644,14 @@ int sensor_6_sideBias(float a_inv[][3])
 			if (rest == 1) {
 				// Device is stationary, now check if this pose is new
 				// Calculate current vector magnitude
+#if CONFIG_CMSIS_DSP
+				float norm_sq;
+				arm_dot_prod_f32(rawData, rawData, 3, &norm_sq);
+				float norm;
+				arm_sqrt_f32(norm_sq, &norm);
+#else
 				float norm = sqrtf(rawData[0] * rawData[0] + rawData[1] * rawData[1] + rawData[2] * rawData[2]);
+#endif
 				if (norm < 0.1f) {
 					continue; // Prevent division by zero (unlikely under gravity)
 				}
@@ -1410,6 +1692,18 @@ int sensor_6_sideBias(float a_inv[][3])
 			k_msleep(20);
 		}
 
+		// Check if we timed out waiting for a new pose
+		if (pose_timeout) {
+			if (captured_count_out) {
+				*captured_count_out = captured_count;
+			}
+			// Return -3 for timeout with captured_count available for partial save decision
+			return -3;
+		}
+
+		// Reset timeout counter when a new valid pose is found
+		last_new_pose_time = k_uptime_get();
+
 		LOG_INF("Capturing pose %d/%d...", captured_count + 1, CALIB_TARGET_SAMPLES);
 		set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_SENSOR);
 
@@ -1432,6 +1726,8 @@ int sensor_6_sideBias(float a_inv[][3])
 
 			if (sample_idx % 50 == 0) {
 				printk(".");
+				/* Feed watchdog periodically during sampling */
+				watchdog_feed(WDT_CHANNEL_CALIBRATION);
 			}
 		}
 
@@ -1446,6 +1742,10 @@ int sensor_6_sideBias(float a_inv[][3])
 		k_msleep(500);
 	}
 
+	if (captured_count_out) {
+		*captured_count_out = captured_count;
+	}
+
 	LOG_INF("Calculating calibration matrix...");
 
 	wait_for_threads();
@@ -1458,32 +1758,67 @@ int sensor_6_sideBias(float a_inv[][3])
 }
 #endif
 
-// TODO: terrible name
+// Collect magnetometer sample for calibration using orientation-based coverage detection
+// Uses accelerometer (gravity) to track device orientation for uniform directional coverage
 static void sensor_sample_mag_magneto_sample(const float a[3], const float m[3])
 {
+	// Determine orientation region from accelerometer (gravity direction)
+	// This avoids the hard iron offset problem of using magnetometer for coverage
+	int region = check_orientation_region(a);
+
+	// Check if this region is already saturated
+	if (region >= 0 && mag_region_samples[region] >= MAG_CAL_MAX_PER_REGION) {
+		int64_t now = k_uptime_get();
+		if (now - magneto_last_saturated_warning > MAG_CAL_SATURATED_WARNING_INTERVAL_MS) {
+			magneto_last_saturated_warning = now;
+			int regions_need_more = 0;
+			for (int i = 0; i < MAG_CAL_NUM_REGIONS; i++) {
+				if (mag_region_samples[i] < MAG_CAL_MIN_PER_REGION) {
+					regions_need_more++;
+				}
+			}
+			LOG_INF("Mag cal: region %d full (%d samples), rotate device! "
+			        "(%d regions need more data)",
+			        region, MAG_CAL_MAX_PER_REGION, regions_need_more);
+			set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR);
+		}
+		return;  // Reject to enforce uniform distribution
+	}
+
+	// Accept sample - add to Magneto accumulator
 	magneto_sample(m[0], m[1], m[2], ata, &norm_sum, &sample_count); // 400us
-	uint8_t new_magneto_progress = magneto_progress;
-	new_magneto_progress |= check_sides(a);
-	if (new_magneto_progress > magneto_progress && new_magneto_progress == last_magneto_progress) {
-		if (k_uptime_get() > magneto_progress_time) {
-			magneto_progress = new_magneto_progress;
-			LOG_INF(
-				"Magnetometer calibration progress: %s %s %s %s %s %s",
-				(new_magneto_progress & 0x01) ? "-X" : "--",
-				(new_magneto_progress & 0x02) ? "+X" : "--",
-				(new_magneto_progress & 0x04) ? "-Y" : "--",
-				(new_magneto_progress & 0x08) ? "+Y" : "--",
-				(new_magneto_progress & 0x10) ? "-Z" : "--",
-				(new_magneto_progress & 0x20) ? "+Z" : "--"
-			);
+
+	// Update orientation coverage
+	if (region >= 0) {
+		mag_region_samples[region]++;
+		uint16_t region_bit = 1 << region;
+		if (!(mag_region_coverage & region_bit)) {
+			mag_region_coverage |= region_bit;
+			int covered = popcount16(mag_region_coverage);
+			LOG_INF("Mag cal coverage: %d/%d regions, %d samples",
+			        covered, MAG_CAL_NUM_REGIONS, (int)sample_count);
 			set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
 		}
-	} else {
-		magneto_progress_time = k_uptime_get() + 1000;
-		last_magneto_progress = new_magneto_progress;
 	}
-	if (magneto_progress == 0b10111111) {
-		set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR); // Magnetometer calibration is ready to apply
+
+	// Check if calibration is ready
+	int region_count = popcount16(mag_region_coverage);
+	if (sample_count >= MAG_CAL_MIN_SAMPLES && region_count >= MAG_CAL_MIN_REGIONS) {
+		bool balanced = true;
+		for (int i = 0; i < MAG_CAL_NUM_REGIONS; i++) {
+			if ((mag_region_coverage & (1 << i)) &&
+			    mag_region_samples[i] < MAG_CAL_MIN_PER_REGION) {
+				balanced = false;
+				break;
+			}
+		}
+
+		if (balanced) {
+			magneto_progress |= 0b01111111;
+			LOG_INF("Mag cal ready: %d samples, %d/%d regions covered",
+			        (int)sample_count, region_count, MAG_CAL_NUM_REGIONS);
+			set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR);
+		}
 	}
 }
 
@@ -1508,7 +1843,48 @@ static int sensor_calibration_request(int id)
 
 static void calibration_thread(void)
 {
+	/* Register calibration thread with watchdog - use long timeout for lengthy operations */
+	watchdog_register_thread(WDT_CHANNEL_CALIBRATION, 0);
+
 	sensor_calibration_read();
+
+#if CONFIG_SENSOR_USE_TCAL
+	// Wait for sensor to be initialized before building LUT
+	// This prevents issues when sensor fails to initialize
+	int init_wait_count = 0;
+	while (!sensor_is_initialized()) {
+		watchdog_feed(WDT_CHANNEL_CALIBRATION);
+		k_msleep(100);
+		init_wait_count++;
+		// Timeout after 10 seconds to avoid infinite loop if sensor never initializes
+		if (init_wait_count >= 100) {
+			LOG_WRN("T-Cal: Timeout waiting for sensor initialization, skipping LUT build");
+			break;
+		}
+	}
+
+	// Build LUT at startup if T-Cal data is available and sensor is initialized
+	// LUT is only in RAM and needs to be rebuilt after every boot
+	// Use incremental build: priority zone first, then background completion
+	if (sensor_is_initialized() && retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
+		// Validate tempCalState.count to prevent issues with corrupted retained data
+		if (retained->tempCalState.count > TCAL_BUFFER_SIZE) {
+			LOG_ERR("T-Cal: Invalid point count %u (max %d), resetting",
+			        retained->tempCalState.count, TCAL_BUFFER_SIZE);
+			retained->tempCalState.count = 0;
+			retained->tempCalState.valid = false;
+		} else {
+			float current_temp = sensor_get_current_imu_temperature();
+			if (!isnan(current_temp)) {
+				LOG_INF("T-Cal: Starting incremental LUT build at startup (current temp: %.1f°C)", (double)current_temp);
+				sensor_tcal_build_lut_priority(current_temp);
+			} else {
+				LOG_WRN("T-Cal: Cannot build LUT - temperature not available");
+			}
+		}
+	}
+#endif
+
 	// TODO: be able to block the sensor while doing certain operations
 	// TODO: reset fusion on calibration finished
 	// TODO: start and run thread from request?
@@ -1539,7 +1915,7 @@ static void calibration_thread(void)
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 			break;
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 		case 3: // Boot calibration
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_perform_boot_calibration();
@@ -1559,26 +1935,62 @@ static void calibration_thread(void)
 			}
 			break;
 		}
+
+#if CONFIG_SENSOR_USE_TCAL
+		// Continue LUT background build if in progress
+		if (mls_lut.build_state == MLS_LUT_BUILD_BACKGROUND) {
+			if (sensor_tcal_build_lut_continue()) {
+				LOG_INF("T-Cal LUT: Background build complete (%d/%d entries)",
+				        mls_lut.computed_count, MLS_LUT_SIZE);
+			}
+		}
+#endif
+
+		/* Feed watchdog at end of each loop iteration */
+		watchdog_feed(WDT_CHANNEL_CALIBRATION);
+
 		if (requested < 0) {
 			k_msleep(5);
+		} else if (requested > 0) {
+			k_msleep(20);  // Mag cal in progress - short sleep for fast sampling
 		} else {
 			k_msleep(100);
 		}
 	}
 }
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 
-void sensor_tcal_status_poly(void)
+void sensor_tcal_status(void)
 {
-	printk("Polynomial Temperature Calibration Status:\n");
-	printk("  - Curve calculated: %s\n", retained->tempCalState.valid ? "Yes" : "No");
-	printk(
-		"  - Polynomial degree: %u (CONFIG_SENSOR_POLY_DEGREE=%d)\n",
-		retained->tempCalState.degree,
-		CONFIG_SENSOR_POLY_DEGREE
-	);
+	printk("Temperature Calibration Status (MLS):\n");
+	printk("  - MLS available: %s\n", retained->tempCalState.valid ? "Yes" : "No");
 	printk("  - Points collected: %u / %d\n", retained->tempCalState.count, TCAL_BUFFER_SIZE);
+
+	// Display LUT status
+	const char *lut_state_str;
+	switch (mls_lut.build_state) {
+	case MLS_LUT_BUILD_IDLE:
+		lut_state_str = "Idle";
+		break;
+	case MLS_LUT_BUILD_PRIORITY:
+		lut_state_str = "Building priority zone";
+		break;
+	case MLS_LUT_BUILD_BACKGROUND:
+		lut_state_str = "Background build";
+		break;
+	case MLS_LUT_BUILD_COMPLETE:
+		lut_state_str = "Complete";
+		break;
+	default:
+		lut_state_str = "Unknown";
+		break;
+	}
+	printk("  - LUT valid: %s, state: %s, entries: %d/%d\n",
+	       mls_lut.valid ? "Yes" : "No",
+	       lut_state_str,
+	       mls_lut.computed_count,
+	       MLS_LUT_SIZE);
 
 	// Use quality assessment to get calibrated temperature range and error
 	float current_temp = sensor_get_current_imu_temperature();
@@ -1661,184 +2073,32 @@ void sensor_tcal_status_poly(void)
 	}
 }
 
-// Solves a system of linear equations A*x = b using Gaussian elimination with partial pivoting.
-
-// A: Pointer to the start of an n x n matrix (row-major order). Modified in place.
-// b: Pointer to the start of a vector of size n. Modified in place.
-// n: The dimension of the system.
-// x: Pointer to a vector of size n where the solution will be stored.
-
-static int solve_linear_system(double *A, double *b, int n, double *x)
-{
-	for (int i = 0; i < n; i++) {
-		// --- Partial Pivoting ---
-		// Find the row with the largest value in the current column i to use as the pivot.
-		int max_row = i;
-		for (int k = i + 1; k < n; k++) {
-			if (fabs(A[k * n + i]) > fabs(A[max_row * n + i])) {
-				max_row = k;
-			}
-		}
-
-		// Swap the entire max_row with the current row i in both matrix A and vector b.
-		for (int k = i; k < n; k++) {
-			double temp = A[i * n + k];
-			A[i * n + k] = A[max_row * n + k];
-			A[max_row * n + k] = temp;
-		}
-		double temp = b[i];
-		b[i] = b[max_row];
-		b[max_row] = temp;
-
-		// Check if the matrix is singular. A pivot element close to zero means no unique solution exists.
-		if (fabs(A[i * n + i]) < 1e-12) {
-			LOG_ERR("Matrix is singular. Cannot solve. Pivot at [%d,%d] is near zero.", i, i);
-			return -1;
-		}
-
-		// --- Forward Elimination ---
-		// For every row below the pivot row...
-		for (int k = i + 1; k < n; k++) {
-			// Calculate the factor to multiply the pivot row by.
-			double factor = A[k * n + i] / A[i * n + i];
-
-			// Subtract this multiple of the pivot row from the current row.
-			// This creates a zero in the current column for this row.
-			for (int j = i; j < n; j++) {
-				A[k * n + j] -= factor * A[i * n + j];
-			}
-			// Do the same for the result vector b.
-			b[k] -= factor * b[i];
-		}
-	}
-
-	// --- Back Substitution ---
-	// At this point, A is an upper-triangular matrix. We can solve for x from bottom to top.
-	for (int i = n - 1; i >= 0; i--) {
-		// Start with the known result for this row.
-		x[i] = b[i];
-
-		// Subtract the effect of the variables we've already solved for.
-		for (int j = i + 1; j < n; j++) {
-			x[i] -= A[i * n + j] * x[j];
-		}
-
-		// Divide by the diagonal element to get the final value for x[i].
-		x[i] = x[i] / A[i * n + i];
-	}
-
-	return 0; // Success
-}
-
-// Performs a polynomial least-squares fit.
-static int polyfit(int degree, float coeffs_out[3][CONFIG_SENSOR_POLY_DEGREE + 1])
-{
-	if (retained->tempCalState.count < degree + 1) {
-		LOG_WRN("T-Cal: Not enough points (%u) to fit a degree %d polynomial.", retained->tempCalState.count, degree);
-		return -1;
-	}
-
-	int n_coeffs = degree + 1;
-
-	// The Normal Equation for least squares is (X^T * X) * a = (X^T * y)
-	// Let A = (X^T * X) and b = (X^T * y). We solve A*a = b for the coefficients 'a'.
-
-	// Matrix A is a square matrix of size n_coeffs x n_coeffs.
-	// A[i][j] = sum of (t ^ (i+j)) over all data points.
-	double A[n_coeffs * n_coeffs];
-
-	// Vector b contains the results for each axis (X, Y, Z).
-	// b[i] = sum of (bias * (t ^ i)) over all data points.
-	double b_vectors[3][n_coeffs];
-
-	memset(A, 0, sizeof(A));
-	memset(b_vectors, 0, sizeof(b_vectors));
-
-	LOG_DBG("Polyfit: Using %u points to calculate degree %d curve.", retained->tempCalState.count, degree);
-
-	// 1. Build the A matrix and b vectors from the scattered data points.
-	for (int p_idx = 0; p_idx < TCAL_BUFFER_SIZE; ++p_idx) {
-		// Skip empty slots in the buffer
-		if (retained->tempCalPoints[p_idx].temp == 0.0f) {
-			continue;
-		}
-
-		double temp = retained->tempCalPoints[p_idx].temp;
-
-		// Pre-calculate powers of the current temperature 't' up to t^(2*degree).
-		double t_powers[2 * degree + 1];
-		t_powers[0] = 1.0; // t^0
-		for (int j = 1; j <= 2 * degree; j++) {
-			t_powers[j] = t_powers[j - 1] * temp;
-		}
-
-		// Sum the powers into the matrix A
-		for (int i = 0; i < n_coeffs; i++) {
-			for (int j = 0; j < n_coeffs; j++) {
-				A[i * n_coeffs + j] += t_powers[i + j];
-			}
-		}
-
-		// Sum the bias * powers into the vectors b
-		for (int i = 0; i < n_coeffs; i++) {
-			b_vectors[0][i] += (double)retained->tempCalPoints[p_idx].bias[0] * t_powers[i];
-			b_vectors[1][i] += (double)retained->tempCalPoints[p_idx].bias[1] * t_powers[i];
-			b_vectors[2][i] += (double)retained->tempCalPoints[p_idx].bias[2] * t_powers[i];
-		}
-	}
-
-	// 2. Solve the system A*x=b for each axis.
-	for (int axis = 0; axis < 3; axis++) {
-		// Create copies because the solver modifies the inputs in place.
-		double A_copy[n_coeffs * n_coeffs];
-		memcpy(A_copy, A, sizeof(A));
-		double b_copy[n_coeffs];
-		memcpy(b_copy, b_vectors[axis], sizeof(b_copy));
-
-		double solution[n_coeffs]; // The calculated coefficients will be stored here.
-
-		if (solve_linear_system(A_copy, b_copy, n_coeffs, solution) != 0) {
-			LOG_ERR("T-Cal: Failed to solve for polynomial coefficients. Matrix may be singular.");
-			return -1;
-		}
-
-		// Copy the double-precision solution to the float output array.
-		for (int i = 0; i < n_coeffs; i++) {
-			coeffs_out[axis][i] = (float)solution[i];
-		}
-	}
-
-	LOG_INF("Polynomial coefficients calculated successfully for degree %d.", degree);
-	return 0;
-}
-
-// Function to handle recalculating the curve after a point is added/removed
-static void update_poly_tcal(void)
+static void update_tcal_state(void)
 {
 	// Invalidate lookup cache since calibration data changed
 	sensor_tcal_cache_invalidate();
 
+	// Polynomial coefficients are no longer used; keep persisted storage zeroed
 	memset(retained->tempCalCoeffs, 0, sizeof(retained->tempCalCoeffs));
 	retained->tempCalState.degree = 0;
-	retained->tempCalState.valid = false;
 
-	if (retained->tempCalState.count < 2) {
-		LOG_INF("T-Cal: Not enough points (%u)...", retained->tempCalState.count);
+	// Mark MLS availability based on point count
+	retained->tempCalState.valid = (retained->tempCalState.count >= 1);
+
+	if (retained->tempCalState.valid) {
+		LOG_INF("T-Cal: MLS state refreshed with %u points", retained->tempCalState.count);
+		printk("T-Cal: MLS data refreshed successfully.\n");
+
+		// Start incremental LUT build for O(1) runtime lookup
+		// Priority zone (current temp ±3°C) is built immediately
+		// Remaining entries are built in background by calibration_thread
+		float current_temp = sensor_get_current_imu_temperature();
+		if (!isnan(current_temp)) {
+			sensor_tcal_build_lut_priority(current_temp);
+		}
 	} else {
-		int degree = retained->tempCalState.count - 1;
-		if (degree > CONFIG_SENSOR_POLY_DEGREE) {
-			degree = CONFIG_SENSOR_POLY_DEGREE;
-		}
-
-		LOG_INF("T-Cal: Recalculating curve with %u points", retained->tempCalState.count);
-
-		if (polyfit(degree, retained->tempCalCoeffs) == 0) {
-			retained->tempCalState.valid = true;
-			retained->tempCalState.degree = degree;
-			printk("T-Cal: New curve calculated successfully.\n");
-		} else {
-			printk("T-Cal: Failed to calculate new curve.\n");
-		}
+		LOG_INF("T-Cal: No points available");
+		printk("T-Cal: No points available.\n");
 	}
 
 	// Save updated state to NVS
@@ -1861,14 +2121,12 @@ static void update_poly_tcal(void)
 		sizeof(retained->tempCalCoeffs)
 	);
 
-	recalculate_tcal_correction_offset();
-
 	// Update fusion bias while preserving orientation
 	sensor_fusion_update_bias(NULL);
 }
 
 // Public function for 'tcal clear' and 'reset tcal'
-void sensor_tcal_clear_poly(void)
+void sensor_tcal_clear(void)
 {
 	if (sensor_calibration_request(0) != 0) {
 		LOG_ERR("Another calibration is running. Cannot clear T-Cal data.");
@@ -1879,13 +2137,12 @@ void sensor_tcal_clear_poly(void)
 	// Invalidate lookup cache since calibration data will be cleared
 	sensor_tcal_cache_invalidate();
 
-	LOG_INF("Clearing all manual polynomial T-Cal data.");
+	LOG_INF("Clearing all manual T-Cal data.");
 	memset(retained->tempCalPoints, 0, sizeof(retained->tempCalPoints));
 	memset(retained->tempCalCoeffs, 0, sizeof(retained->tempCalCoeffs));
 	memset(&retained->tempCalState, 0, sizeof(retained->tempCalState)); // Clear the whole state struct
-	memset(retained->tempCalCorrectionOffset, 0, sizeof(retained->tempCalCorrectionOffset));
 
-	// Save cleared state to NVS directly (don't call update_poly_tcal which recalculates the curve)
+	// Save cleared state to NVS directly (don't call update_tcal_state which refreshes runtime state)
 	sys_write(
 		MAIN_GYRO_TCAL_STATE_ID,
 		&retained->tempCalState,
@@ -1904,17 +2161,18 @@ void sensor_tcal_clear_poly(void)
 		retained->tempCalCoeffs,
 		sizeof(retained->tempCalCoeffs)
 	);
-	sys_write(
-		MAIN_GYRO_TCAL_CORRECTION_ID,
-		retained->tempCalCorrectionOffset,
-		retained->tempCalCorrectionOffset,
-		sizeof(retained->tempCalCorrectionOffset)
-	);
 
-	// Update fusion bias while preserving orientation
-	sensor_fusion_update_bias(NULL);
+	// Also clear boot/runtime calibration D_offset since T-Cal is being reset
+	retained->bootCalState.doffset_valid = false;
+	retained->bootCalState.doffset[0] = 0.0f;
+	retained->bootCalState.doffset[1] = 0.0f;
+	retained->bootCalState.doffset[2] = 0.0f;
+	LOG_INF("Clearing D_offset along with T-Cal data");
 
-	printk("All polynomial temperature calibration data has been cleared.\n");
+	// Manual command: invalidate fusion to force quaternion recalculation
+	sensor_fusion_invalidate();
+
+	printk("All temperature calibration data and D_offset have been cleared.\n");
 }
 
 // Public function for 'tcal remove <index>'
@@ -1952,8 +2210,8 @@ void sensor_tcal_remove_point(int index_to_remove)
 		retained->tempCalState.count = new_count;
 		retained->tempCalState.valid = false;
 
-		printk("Point at index %d removed. Recalculating curve...\n", index_to_remove);
-		update_poly_tcal(); // Recalculate and save
+		printk("Point at index %d removed. Recalculating MLS state...\n", index_to_remove);
+		update_tcal_state(); // Refresh and save
 	} else {
 		printk("No data found at index %d. Nothing to remove.\n", index_to_remove);
 	}
@@ -2032,8 +2290,8 @@ void sensor_tcal_check_auto_calibration(float current_temp)
 	}
 
 	// Prevent starting new calibration while previous one is still running
-	// Use calibration cooldown time (TCAL_MAX_SAMPLE_TIME_MS + margin)
-	const int64_t calibration_cooldown_ms = TCAL_MAX_SAMPLE_TIME_MS + 10000; // 5s sampling + 10s margin = 15s
+	// Use calibration cooldown time (BIAS_COLLECT_MAX_SAMPLE_TIME_MS + margin)
+	const int64_t calibration_cooldown_ms = BIAS_COLLECT_MAX_SAMPLE_TIME_MS + 10000; // 5s sampling + 10s margin = 15s
 	if ((now - last_calibration_time) < calibration_cooldown_ms) {
 		return;
 	}
@@ -2156,66 +2414,6 @@ void sensor_tcal_check_auto_calibration(float current_temp)
 	}
 }
 
-// Recalculates the T-Cal correction offset based on the current curve and anchor point.
-static void recalculate_tcal_correction_offset(void)
-{
-	float anchor_temp;
-	const float *anchor_bias;
-	bool anchor_found = false;
-
-	// Select the anchor point
-	if (!anchor_found && !isnan(retained->gyroTemp)) {
-		anchor_temp = retained->gyroTemp;
-		anchor_bias = retained->gyroBias;
-		anchor_found = true;
-	}
-
-	// Calculate the offset using the selected anchor
-	if (anchor_found && retained->tempCalState.valid) {
-		LOG_INF("Recalculating T-Cal correction offset using anchor temp %.2fC", (double)anchor_temp);
-
-		// 1. Evaluate the polynomial at the anchor temperature
-		float poly_bias_at_anchor[3];
-		for (int axis = 0; axis < 3; axis++) {
-			float offset = retained->tempCalCoeffs[axis][retained->tempCalState.degree];
-			for (int i = retained->tempCalState.degree - 1; i >= 0; i--) {
-				offset = offset * anchor_temp + retained->tempCalCoeffs[axis][i];
-			}
-			poly_bias_at_anchor[axis] = offset;
-		}
-
-		// 2. Calculate the new correction vector: Correction = RealAnchorBias - CurveBiasAtAnchor
-		for (int i = 0; i < 3; i++) {
-			retained->tempCalCorrectionOffset[i] = anchor_bias[i] - poly_bias_at_anchor[i];
-		}
-
-		LOG_INF(
-			"New T-Cal correction offset: [%.5f, %.5f, %.5f]",
-			(double)retained->tempCalCorrectionOffset[0],
-			(double)retained->tempCalCorrectionOffset[1],
-			(double)retained->tempCalCorrectionOffset[2]
-		);
-
-	} else {
-		// If no valid anchor or curve exists, the offset must be zero.
-		if (!retained->tempCalState.valid) {
-			LOG_WRN("T-Cal curve not valid. Cannot calculate offset.");
-		}
-		if (!anchor_found) {
-			LOG_WRN("No valid anchor point found. Cannot calculate offset.");
-		}
-		memset(retained->tempCalCorrectionOffset, 0, sizeof(retained->tempCalCorrectionOffset));
-	}
-
-	// Always save the resulting correction offset (either new or zeroed out) to NVS
-	sys_write(
-		MAIN_GYRO_TCAL_CORRECTION_ID,
-		retained->tempCalCorrectionOffset,
-		retained->tempCalCorrectionOffset,
-		sizeof(retained->tempCalCorrectionOffset)
-	);
-}
-
 void sensor_calibration_get_last_gyro_offset(float offset[3])
 {
 	memcpy(offset, last_gyro_tcal_offset, sizeof(last_gyro_tcal_offset));
@@ -2245,7 +2443,7 @@ bool sensor_tcal_assess_quality(float current_temp, tcal_quality_t *quality)
 
 	// Check minimum global point count
 	if (quality->point_count < BOOT_CAL_MIN_CURVE_POINTS) {
-		LOG_WRN("Boot Cal: Insufficient points (%u < %d)", quality->point_count, BOOT_CAL_MIN_CURVE_POINTS);
+		LOG_DBG("T-Cal: Insufficient points (%u < %d)", quality->point_count, BOOT_CAL_MIN_CURVE_POINTS);
 		return false;
 	}
 
@@ -2285,8 +2483,8 @@ bool sensor_tcal_assess_quality(float current_temp, tcal_quality_t *quality)
 
 	// MLS needs at least 2 points with significant weight for linear fit
 	if (points_with_weight < MLS_MIN_POINTS_FOR_FIT) {
-		LOG_WRN(
-			"Boot Cal: Only %d point(s) with significant weight at %.2fC (need %d within %.1fC bandwidth)",
+		LOG_DBG(
+			"T-Cal: Only %d point(s) with significant weight at %.2fC (need %d within %.1fC bandwidth)",
 			points_with_weight,
 			(double)current_temp,
 			MLS_MIN_POINTS_FOR_FIT,
@@ -2299,7 +2497,7 @@ bool sensor_tcal_assess_quality(float current_temp, tcal_quality_t *quality)
 	static bool logged_quality = false;
 	if (!logged_quality) {
 		LOG_INF(
-			"Boot Cal: Quality check passed - %d points with weight at %.2fC (range: [%.2fC, %.2fC])",
+			"T-Cal: Quality check passed - %d points with weight at %.2fC (range: [%.2fC, %.2fC])",
 			points_with_weight,
 			(double)current_temp,
 			(double)quality->temp_min,
@@ -2351,7 +2549,7 @@ static int sensor_boot_bias_collect(float *dest_bias, float *avg_temp)
 
 /**
  * Collect bias for runtime calibration with shorter sampling time
- * Uses RUNTIME_CAL_SAMPLE_TIME_MS instead of TCAL_MAX_SAMPLE_TIME_MS
+ * Uses RUNTIME_CAL_SAMPLE_TIME_MS instead of BIAS_COLLECT_MAX_SAMPLE_TIME_MS
  * Does NOT save the point to calibration data
  */
 static int sensor_runtime_bias_collect(float *dest_bias, float *avg_temp)
@@ -2398,52 +2596,66 @@ static int sensor_runtime_bias_collect(float *dest_bias, float *avg_temp)
 
 /**
  * Calculate D_offset and store in runtime state (not persisted)
- * Uses unified strategy: MLS -> Polynomial -> Direct (no tcal)
+ * Uses unified strategy: MLS -> Skip if insufficient quality
  *
- * When no T-Cal data is available, D_offset is calculated as the difference
- * between measured bias and the static gyroBias. This allows runtime bias
- * tracking even without temperature calibration.
+ * Skip D_offset calculation if:
+ * 1. No valid temperature calibration (< 5 points or current temp not covered)
+ * 2. Only basic single-point zero bias calibration exists
+ *
+ * This prevents using unreliable bias estimates from incomplete calibration.
+ * Requires more than 4 sampling points to ensure proper temperature coverage.
  */
 static int sensor_tcal_calculate_doffset(const float measured_bias[3], float temp)
 {
-	// Calculate curve value at current temperature using unified strategy
+	// Check temperature calibration quality first
+	tcal_quality_t quality;
+	bool has_valid_tcal = sensor_tcal_assess_quality(temp, &quality);
+
+	// Skip D_offset calculation if:
+	// 1. No T-Cal data at all (count == 0)
+	// 2. Not enough points (need > 4 points, i.e., at least 5 points)
+	// 3. Current temperature is not covered by calibration points
+	if (!has_valid_tcal || quality.point_count <= 4 || !quality.temp_in_range) {
+		LOG_INF("Boot Cal: Skipping D_offset calculation - insufficient T-Cal quality");
+		if (quality.point_count <= 4) {
+			LOG_INF("Boot Cal: Only %u calibration point(s), need more than 4 for reliable offset", quality.point_count);
+		}
+		if (!quality.temp_in_range && quality.point_count > 0) {
+			LOG_INF(
+				"Boot Cal: Current temp %.2fC outside calibrated range [%.2fC, %.2fC]",
+				(double)temp,
+				(double)quality.temp_min,
+				(double)quality.temp_max
+			);
+		}
+
+		// Mark D_offset as invalid - use existing ZRO calibration only
+		retained->bootCalState.doffset_valid = false;
+		retained->bootCalState.doffset[0] = 0.0f;
+		retained->bootCalState.doffset[1] = 0.0f;
+		retained->bootCalState.doffset[2] = 0.0f;
+		return 0; // Not an error, just skipped
+	}
+
+	// Calculate curve value at current temperature using MLS
 	float curve_bias[3];
 	bool offset_calculated = false;
-	const char *method_name = "unknown";
+	const char *method_name = "MLS";
 
-	// Strategy 1: Try MLS (preferred - smooth, no discontinuities)
-	if (retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
-		if (sensor_tcal_mls_lookup(temp, curve_bias) == 0) {
-			offset_calculated = true;
-			method_name = "MLS";
-			LOG_INF("D_offset: Using MLS method");
-		}
-	}
-
-	// Strategy 2: Fallback to Polynomial if MLS didn't work
-	if (!offset_calculated && retained->tempCalState.valid) {
-		for (int axis = 0; axis < 3; axis++) {
-			float offset = retained->tempCalCoeffs[axis][retained->tempCalState.degree];
-			for (int i = retained->tempCalState.degree - 1; i >= 0; i--) {
-				offset = offset * temp + retained->tempCalCoeffs[axis][i];
-			}
-			curve_bias[axis] = offset;
-		}
+	if (sensor_tcal_mls_lookup(temp, curve_bias) == 0) {
 		offset_calculated = true;
-		method_name = "Polynomial";
-		LOG_INF("D_offset: Using polynomial method");
+		LOG_INF("D_offset: Using MLS method");
 	}
 
-	// Strategy 3: No T-Cal available - use static gyroBias as baseline
-	// In this case, D_offset represents the runtime bias drift from the
-	// originally calibrated static bias. This allows runtime correction
-	// even without temperature calibration data.
+	// If method failed, this should not happen since we checked quality
+	// but handle it gracefully
 	if (!offset_calculated) {
-		// Use static gyroBias as the baseline curve
-		memcpy(curve_bias, retained->gyroBias, sizeof(curve_bias));
-		offset_calculated = true;
-		method_name = "Static bias";
-		LOG_INF("D_offset: No T-Cal data - using static gyroBias as baseline");
+		LOG_ERR("D_offset: Failed to calculate curve bias despite passing quality check");
+		retained->bootCalState.doffset_valid = false;
+		retained->bootCalState.doffset[0] = 0.0f;
+		retained->bootCalState.doffset[1] = 0.0f;
+		retained->bootCalState.doffset[2] = 0.0f;
+		return -1;
 	}
 
 	LOG_INF(
@@ -2455,14 +2667,12 @@ static int sensor_tcal_calculate_doffset(const float measured_bias[3], float tem
 		(double)temp
 	);
 
-// Calculate D_offset = measured - (curve + existing correction offset)
-// Must account for Correction offset to avoid double-compensation
+// Calculate D_offset = measured - curve
 // Apply a minimum threshold to filter out noise - values below threshold are set to 0
-#define BOOT_CAL_DOFFSET_MIN_THRESHOLD 0.01f // dps - ignore tiny corrections
+#define BOOT_CAL_DOFFSET_MIN_THRESHOLD 0.001f // dps - ignore tiny corrections
 
 	for (int axis = 0; axis < 3; axis++) {
-		float effective_curve = curve_bias[axis] + retained->tempCalCorrectionOffset[axis];
-		float doffset = measured_bias[axis] - effective_curve;
+		float doffset = measured_bias[axis] - curve_bias[axis];
 
 		// Apply threshold: if D_offset is too small, it's likely noise - don't correct
 		if (fabsf(doffset) < BOOT_CAL_DOFFSET_MIN_THRESHOLD) {
@@ -2474,12 +2684,6 @@ static int sensor_tcal_calculate_doffset(const float measured_bias[3], float tem
 
 	retained->bootCalState.doffset_valid = true;
 
-	LOG_INF(
-		"D_offset: Effective baseline (with correction): [%.5f, %.5f, %.5f]",
-		(double)(curve_bias[0] + retained->tempCalCorrectionOffset[0]),
-		(double)(curve_bias[1] + retained->tempCalCorrectionOffset[1]),
-		(double)(curve_bias[2] + retained->tempCalCorrectionOffset[2])
-	);
 	LOG_INF(
 		"D_offset: Calculated [%.5f, %.5f, %.5f] (stored in retained memory)",
 		(double)retained->bootCalState.doffset[0],
@@ -2541,23 +2745,36 @@ void sensor_tcal_boot_calibration_check(void)
 		return; // Invalid temperature
 	}
 
-	// Note: We no longer require T-Cal quality check here
-	// Boot calibration can now work with or without T-Cal data
-	// - With T-Cal: D_offset = measured - T-Cal(temp)
-	// - Without T-Cal: D_offset = measured - static gyroBias
-	// This allows runtime bias tracking even before any T-Cal data is collected
+	// Check T-Cal quality before proceeding
+	// Boot calibration is only useful with sufficient T-Cal data
+	// Skip if we have insufficient calibration points (<=4)
+	tcal_quality_t quality;
+	bool has_tcal = sensor_tcal_assess_quality(current_temp, &quality);
 
 	// Log entry info (only once)
 	static bool logged_entry = false;
 	if (!logged_entry) {
-		tcal_quality_t quality;
-		bool has_tcal = sensor_tcal_assess_quality(current_temp, &quality);
-		if (has_tcal) {
+		if (has_tcal && quality.point_count > BOOT_CAL_MIN_CURVE_POINTS) {
 			LOG_INF("Boot Cal: Will use T-Cal data (%u points) for D_offset calculation", quality.point_count);
+		} else if (quality.point_count > 0 && quality.point_count <= BOOT_CAL_MIN_CURVE_POINTS) {
+			LOG_INF("Boot Cal: Insufficient T-Cal points (%u <= %d), skipping boot calibration", quality.point_count, BOOT_CAL_MIN_CURVE_POINTS);
+			retained->bootCalState.completed = true; // Mark as completed to avoid repeated checks
+			return; // Skip boot calibration
 		} else {
-			LOG_INF("Boot Cal: No T-Cal data, will use static gyroBias as baseline");
+			LOG_INF("Boot Cal: No T-Cal data, skipping boot calibration");
+			retained->bootCalState.completed = true; // Mark as completed to avoid repeated checks
+			return; // Skip boot calibration
 		}
 		logged_entry = true;
+	} else {
+		// Check already logged, but still need to verify quality for this iteration
+		if (!has_tcal || quality.point_count <= BOOT_CAL_MIN_CURVE_POINTS) {
+			// Skip silently - already logged on first check
+			if (!retained->bootCalState.completed) {
+				retained->bootCalState.completed = true;
+			}
+			return;
+		}
 	}
 
 	// Log entry into time window (only once)
@@ -2578,24 +2795,25 @@ void sensor_tcal_boot_calibration_check(void)
 /**
  * Perform boot calibration (called by calibration thread)
  * Returns 0 on success, non-zero on failure
+ *
+ * Note: This is an automatic calibration - no LED changes to keep it
+ * transparent to the user. LED state is preserved throughout.
  */
 static int sensor_perform_boot_calibration(void)
 {
 	LOG_INF("Boot Cal: Starting boot calibration");
-	set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR);
+	// Note: No LED changes for automatic boot calibration - keep it transparent
 
 	// Get current temperature
 	float current_temp = sensor_get_current_imu_temperature();
 	if (isnan(current_temp) || current_temp < -10.0f || current_temp > 60.0f) {
 		LOG_ERR("Boot Cal: Invalid temperature");
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
 		return -1;
 	}
 
 	// Wait for device to be stationary
 	if (!wait_for_motion(false, 6)) {
 		LOG_WRN("Boot Cal: Device not stationary");
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
 		retained->bootCalState.attempt_count++;
 
 		if (retained->bootCalState.attempt_count >= BOOT_CAL_MAX_ATTEMPTS) {
@@ -2605,7 +2823,6 @@ static int sensor_perform_boot_calibration(void)
 		return -1;
 	}
 
-	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_SENSOR);
 	k_msleep(500); // Delay before beginning acquisition
 
 	// Attempt to collect bias
@@ -2617,7 +2834,6 @@ static int sensor_perform_boot_calibration(void)
 	if (err) {
 		// Collection failed - check if we should trigger a full calibration
 		retained->bootCalState.attempt_count++;
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
 
 		if (retained->bootCalState.attempt_count >= BOOT_CAL_MAX_ATTEMPTS) {
 			LOG_WRN("Boot Cal: Maximum attempts (%d) reached", BOOT_CAL_MAX_ATTEMPTS);
@@ -2642,7 +2858,6 @@ static int sensor_perform_boot_calibration(void)
 	err = sensor_tcal_calculate_doffset(measured_bias, avg_temp);
 	if (err) {
 		LOG_ERR("Boot Cal: Failed to calculate D_offset");
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
 		retained->bootCalState.completed = true;
 		return err;
 	}
@@ -2657,7 +2872,7 @@ static int sensor_perform_boot_calibration(void)
 	LOG_INF("Boot Cal: Completed successfully at %.2fC (uptime: %lld ms)", (double)avg_temp, runtime_cal_last_time);
 	sensor_fusion_update_bias(NULL);
 
-	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);
+	// Note: No LED flash for automatic boot calibration - keep it transparent
 	return 0;
 }
 
@@ -2687,7 +2902,6 @@ void sensor_boot_cal_get_doffset(float offset[3])
 // Reset boot calibration state (call before reboot/shutdown, not before WoM)
 void sensor_boot_cal_reset(void)
 {
-	retained->bootCalState.enabled = true;
 	retained->bootCalState.completed = false;
 	retained->bootCalState.attempt_count = 0;
 	retained->bootCalState.doffset_valid = false;
@@ -2708,10 +2922,14 @@ void sensor_boot_cal_reset(void)
  *
  * Uses shorter sampling time (3 seconds) compared to normal calibration (4-6 seconds)
  * for quicker response while maintaining reasonable accuracy
+ *
+ * Note: This is an automatic calibration - no LED changes to keep it
+ * transparent to the user. LED state is preserved throughout.
  */
 static int sensor_perform_runtime_calibration(void)
 {
 	LOG_INF("Runtime Cal: Starting quick zero bias calibration (~3 seconds)");
+	// Note: No LED changes for automatic runtime calibration - keep it transparent
 
 	// Get current temperature
 	float current_temp = sensor_get_current_imu_temperature();
@@ -2763,6 +2981,11 @@ static int sensor_perform_runtime_calibration(void)
  */
 void sensor_runtime_calibration_check(bool is_resting)
 {
+	// Skip if runtime calibration is disabled
+	if (!runtime_cal_enabled) {
+		return;
+	}
+
 	// Skip if boot calibration hasn't completed yet
 	if (!retained->bootCalState.completed) {
 		return;
@@ -2921,109 +3144,33 @@ void sensor_tcal_test_methods(float temp)
 		printk("MLS Method: Not enough points (need >= %d)\n\n", MLS_MIN_POINTS_FOR_FIT);
 	}
 
-	// Method 2: Polynomial (fallback method)
-	if (retained->tempCalState.valid) {
-		float poly_bias[3];
-		for (int axis = 0; axis < 3; axis++) {
-			float offset = retained->tempCalCoeffs[axis][retained->tempCalState.degree];
-			for (int i = retained->tempCalState.degree - 1; i >= 0; i--) {
-				offset = offset * temp + retained->tempCalCoeffs[axis][i];
-			}
-			poly_bias[axis] = offset;
-		}
-
-		printk("Polynomial Method (degree %u):\n", retained->tempCalState.degree);
-		printk("  Bias: [%.5f, %.5f, %.5f] dps\n", (double)poly_bias[0], (double)poly_bias[1], (double)poly_bias[2]);
-		printk("\n");
-
-		// Compare methods if both available
-		if (retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
-			float mls_bias[3];
-			if (sensor_tcal_mls_lookup(temp, mls_bias) == 0) {
-				float diff[3];
-				float max_diff = 0.0f;
-				for (int i = 0; i < 3; i++) {
-					diff[i] = poly_bias[i] - mls_bias[i];
-					if (fabsf(diff[i]) > max_diff) {
-						max_diff = fabsf(diff[i]);
-					}
-				}
-				printk("Method Difference (Polynomial - MLS):\n");
-				printk("  Delta: [%.5f, %.5f, %.5f] dps\n", (double)diff[0], (double)diff[1], (double)diff[2]);
-				printk("  Max difference: %.5f dps\n", (double)max_diff);
-				printk("\n");
-			}
-		}
-	} else {
-		printk("Polynomial Method: Not available (curve not calculated)\n\n");
-	}
-
-	// Show correction offset and boot cal D_offset if active
-	bool has_corrections = false;
-	for (int i = 0; i < 3; i++) {
-		if (retained->tempCalCorrectionOffset[i] != 0.0f
-			|| (retained->bootCalState.doffset_valid && retained->bootCalState.doffset[i] != 0.0f)) {
-			has_corrections = true;
-			break;
-		}
-	}
-
-	if (has_corrections) {
+	// Show boot cal D_offset if active
+	if (retained->bootCalState.doffset_valid) {
 		printk("Additional Offsets:\n");
-		if (retained->tempCalCorrectionOffset[0] != 0.0f || retained->tempCalCorrectionOffset[1] != 0.0f
-			|| retained->tempCalCorrectionOffset[2] != 0.0f) {
-			printk(
-				"  Correction offset: [%.5f, %.5f, %.5f] dps\n",
-				(double)retained->tempCalCorrectionOffset[0],
-				(double)retained->tempCalCorrectionOffset[1],
-				(double)retained->tempCalCorrectionOffset[2]
-			);
-		}
-		if (retained->bootCalState.doffset_valid) {
-			printk(
-				"  Boot cal D_offset: [%.5f, %.5f, %.5f] dps\n",
-				(double)retained->bootCalState.doffset[0],
-				(double)retained->bootCalState.doffset[1],
-				(double)retained->bootCalState.doffset[2]
-			);
-		}
+		printk(
+			"  Boot cal D_offset: [%.5f, %.5f, %.5f] dps\n",
+			(double)retained->bootCalState.doffset[0],
+			(double)retained->bootCalState.doffset[1],
+			(double)retained->bootCalState.doffset[2]
+		);
 		printk("\n");
 	}
 
 	// Show final effective bias that would be applied
 	printk("Final Effective Bias (as applied to gyro data):\n");
 
-	// Calculate what would actually be used using unified strategy: MLS -> Polynomial -> Static
+	// Calculate what would actually be used using unified strategy: MLS -> Static
 	float final_bias[3] = {0.0f, 0.0f, 0.0f};
 	bool calculated = false;
 	const char *method_used = "static";
 
-	// Strategy 1: Try MLS (preferred)
-	if (retained->tempCalState.count >= MLS_MIN_POINTS_FOR_FIT) {
-		if (sensor_tcal_mls_lookup(temp, final_bias) == 0) {
-			calculated = true;
-			method_used = "MLS";
-		}
-	}
-
-	// Strategy 2: Fallback to polynomial
-	if (!calculated && retained->tempCalState.valid) {
-		for (int axis = 0; axis < 3; axis++) {
-			float offset = retained->tempCalCoeffs[axis][retained->tempCalState.degree];
-			for (int i = retained->tempCalState.degree - 1; i >= 0; i--) {
-				offset = offset * temp + retained->tempCalCoeffs[axis][i];
-			}
-			final_bias[axis] = offset;
-		}
+	if (sensor_tcal_mls_lookup(temp, final_bias) == 0) {
 		calculated = true;
-		method_used = "Polynomial";
+		method_used = "MLS";
 	}
 
 	if (calculated) {
-		// Add correction offset
-		for (int i = 0; i < 3; i++) {
-			final_bias[i] += retained->tempCalCorrectionOffset[i];
-		}
+		// tempCalCorrectionOffset is retained for compatibility only; no longer used.
 
 		// Add boot cal D_offset if valid
 		if (retained->bootCalState.doffset_valid) {
@@ -3038,7 +3185,7 @@ void sensor_tcal_test_methods(float temp)
 			(double)final_bias[1],
 			(double)final_bias[2]
 		);
-		printk("  Method: %s (Unified Strategy: MLS -> Polynomial -> Static)\n", method_used);
+		printk("  Method: %s (Unified Strategy: MLS -> Static)\n", method_used);
 	} else {
 		printk(
 			"  Fallback to static bias: [%.5f, %.5f, %.5f] dps\n",
@@ -3089,8 +3236,13 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
 		if (mls_cache.slots[i].valid &&
 		    fabsf(mls_cache.slots[i].temp - temp) < MLS_CACHE_TEMP_THRESHOLD) {
-			// Cache hit - return cached values
-			memcpy(bias_out, mls_cache.slots[i].bias, sizeof(float) * 3);
+			// Cache hit - return smoothly interpolated value using cached local slope.
+			// This prevents the output from becoming piecewise-constant within the
+			// cache threshold window (e.g. 36.10C vs 36.20C).
+			float dt = temp - mls_cache.slots[i].temp;
+			for (int axis = 0; axis < 3; axis++) {
+				bias_out[axis] = mls_cache.slots[i].bias[axis] + mls_cache.slots[i].slope[axis] * dt;
+			}
 			return 0;
 		}
 	}
@@ -3101,12 +3253,12 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 		for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
 			if (retained->tempCalPoints[i].temp != 0.0f) {
 				memcpy(bias_out, retained->tempCalPoints[i].bias, sizeof(float) * 3);
-				// Update cache (use next slot, round-robin)
-				int slot = mls_cache.next_slot;
+				// Update cache (select best slot based on distance)
+				int slot = sensor_tcal_cache_select_slot(temp);
 				mls_cache.slots[slot].temp = temp;
 				memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
+				memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
 				mls_cache.slots[slot].valid = true;
-				mls_cache.next_slot = (slot + 1) % MLS_CACHE_SLOTS;
 				LOG_DBG("T-Cal MLS: Single point at %.2fC (cached in slot %d)", (double)retained->tempCalPoints[i].temp, slot);
 				return 0;
 			}
@@ -3122,13 +3274,14 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 		float weight;
 	} WeightedPoint;
 
-	WeightedPoint points[MLS_MAX_POINTS];
-	int point_count = 0;
+	// First pass: collect all points with sufficient weight
+	// With MLS_MIN_WEIGHT=0.05, points beyond ~6.5°C are filtered out early
+	WeightedPoint all_points[MLS_MAX_POINTS * 2];  // Temporary buffer
+	int all_count = 0;
 
-	// Calculate weight for each point and keep the most relevant ones
 	float bandwidth_sq = MLS_BANDWIDTH * MLS_BANDWIDTH;
 
-	for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+	for (int i = 0; i < TCAL_BUFFER_SIZE && all_count < MLS_MAX_POINTS * 2; i++) {
 		if (retained->tempCalPoints[i].temp == 0.0f) {
 			continue; // Skip empty slots
 		}
@@ -3146,44 +3299,218 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 			continue;
 		}
 
-		// Insert in sorted order by weight (highest first) for efficiency
-		int insert_pos = point_count;
-		for (int j = 0; j < point_count; j++) {
-			if (weight > points[j].weight) {
-				insert_pos = j;
-				break;
-			}
-		}
+		all_points[all_count].temp = point_temp;
+		all_points[all_count].weight = weight;
+		memcpy(all_points[all_count].bias, retained->tempCalPoints[i].bias, sizeof(float) * 3);
+		all_count++;
+	}
 
-		// Shift lower-weight points down
-		if (point_count < MLS_MAX_POINTS) {
-			for (int j = point_count; j > insert_pos; j--) {
-				points[j] = points[j - 1];
-			}
-			point_count++;
-		} else if (insert_pos < MLS_MAX_POINTS) {
-			// Replace lowest weight point if new one is better
-			for (int j = MLS_MAX_POINTS - 1; j > insert_pos; j--) {
-				points[j] = points[j - 1];
-			}
-		} else {
-			continue; // This point has lower weight than all stored points
-		}
+	// Second pass: if we have more than MLS_MAX_POINTS, select top-k by weight
+	// Uses partial selection sort - O(k*n) which is efficient for small k
+	WeightedPoint points[MLS_MAX_POINTS];
+	int point_count = (all_count <= MLS_MAX_POINTS) ? all_count : MLS_MAX_POINTS;
 
-		// Store the point
-		points[insert_pos].temp = point_temp;
-		points[insert_pos].weight = weight;
-		memcpy(points[insert_pos].bias, retained->tempCalPoints[i].bias, sizeof(float) * 3);
+	if (all_count <= MLS_MAX_POINTS) {
+		// Just copy all points
+		memcpy(points, all_points, all_count * sizeof(WeightedPoint));
+	} else {
+		// Partial selection: pick top MLS_MAX_POINTS by weight
+		for (int k = 0; k < MLS_MAX_POINTS; k++) {
+			int max_idx = k;
+			float max_weight = all_points[k].weight;
+			for (int j = k + 1; j < all_count; j++) {
+				if (all_points[j].weight > max_weight) {
+					max_weight = all_points[j].weight;
+					max_idx = j;
+				}
+			}
+			// Swap to position k
+			if (max_idx != k) {
+				WeightedPoint tmp = all_points[k];
+				all_points[k] = all_points[max_idx];
+				all_points[max_idx] = tmp;
+			}
+			points[k] = all_points[k];
+		}
 	}
 
 	if (point_count == 0) {
-		LOG_ERR("T-Cal MLS: No points with sufficient weight");
-		return -1;
+		// No points with sufficient weight - temperature is far outside calibrated range
+		// Use linear extrapolation from edge points (similar to LUT extrapolation logic)
+
+		// Collect all valid points with their temperatures
+		typedef struct {
+			float temp;
+			float bias[3];
+		} TempPoint;
+		TempPoint edge_points[MLS_EXTRAP_POINTS];
+		int edge_count = 0;
+
+		// Determine if we're extrapolating low or high
+		// First scan to find data range
+		float data_min_temp = 1000.0f;
+		float data_max_temp = -1000.0f;
+
+		for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+			if (retained->tempCalPoints[i].temp == 0.0f) {
+				continue;
+			}
+			float pt = retained->tempCalPoints[i].temp;
+			if (pt < data_min_temp) data_min_temp = pt;
+			if (pt > data_max_temp) data_max_temp = pt;
+		}
+
+		if (data_min_temp > 999.0f) {
+			// No calibration data at all
+			LOG_ERR("T-Cal MLS: No calibration data available");
+			return -1;
+		}
+
+		bool extrapolate_low = (temp < data_min_temp);
+
+		if (extrapolate_low) {
+			// Collect lowest temperature points for low extrapolation
+			// Sort by temperature ascending, take first MLS_EXTRAP_POINTS
+			for (int k = 0; k < MLS_EXTRAP_POINTS && k < retained->tempCalState.count; k++) {
+				float lowest_temp = 1000.0f;
+				int lowest_idx = -1;
+
+				for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+					if (retained->tempCalPoints[i].temp == 0.0f) continue;
+					float pt = retained->tempCalPoints[i].temp;
+
+					// Check if already selected
+					bool already_selected = false;
+					for (int j = 0; j < edge_count; j++) {
+						if (fabsf(edge_points[j].temp - pt) < 0.01f) {
+							already_selected = true;
+							break;
+						}
+					}
+					if (already_selected) continue;
+
+					if (pt < lowest_temp) {
+						lowest_temp = pt;
+						lowest_idx = i;
+					}
+				}
+
+				if (lowest_idx >= 0) {
+					edge_points[edge_count].temp = retained->tempCalPoints[lowest_idx].temp;
+					memcpy(edge_points[edge_count].bias, retained->tempCalPoints[lowest_idx].bias, sizeof(float) * 3);
+					edge_count++;
+				}
+			}
+		} else {
+			// Collect highest temperature points for high extrapolation
+			// Sort by temperature descending, take first MLS_EXTRAP_POINTS
+			for (int k = 0; k < MLS_EXTRAP_POINTS && k < retained->tempCalState.count; k++) {
+				float highest_temp = -1000.0f;
+				int highest_idx = -1;
+
+				for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+					if (retained->tempCalPoints[i].temp == 0.0f) continue;
+					float pt = retained->tempCalPoints[i].temp;
+
+					// Check if already selected
+					bool already_selected = false;
+					for (int j = 0; j < edge_count; j++) {
+						if (fabsf(edge_points[j].temp - pt) < 0.01f) {
+							already_selected = true;
+							break;
+						}
+					}
+					if (already_selected) continue;
+
+					if (pt > highest_temp) {
+						highest_temp = pt;
+						highest_idx = i;
+					}
+				}
+
+				if (highest_idx >= 0) {
+					edge_points[edge_count].temp = retained->tempCalPoints[highest_idx].temp;
+					memcpy(edge_points[edge_count].bias, retained->tempCalPoints[highest_idx].bias, sizeof(float) * 3);
+					edge_count++;
+				}
+			}
+		}
+
+		if (edge_count == 0) {
+			LOG_ERR("T-Cal MLS: No edge points found for extrapolation");
+			return -1;
+		}
+
+		// Single point: constant extrapolation
+		if (edge_count == 1) {
+			memcpy(bias_out, edge_points[0].bias, sizeof(float) * 3);
+
+			int slot = sensor_tcal_cache_select_slot(temp);
+			mls_cache.slots[slot].temp = temp;
+			memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
+			memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
+			mls_cache.slots[slot].valid = true;
+
+			LOG_DBG("T-Cal MLS: Single-point extrapolation at %.2fC", (double)temp);
+			return 0;
+		}
+
+		// Multiple points: linear least squares fit (same as LUT extrapolation)
+		float t_mean = 0.0f;
+		for (int i = 0; i < edge_count; i++) {
+			t_mean += edge_points[i].temp;
+		}
+		t_mean /= edge_count;
+
+		float sum_dt_sq = 0.0f;
+		for (int i = 0; i < edge_count; i++) {
+			float dt = edge_points[i].temp - t_mean;
+			sum_dt_sq += dt * dt;
+		}
+
+		float slope[3] = {0.0f, 0.0f, 0.0f};
+
+		for (int axis = 0; axis < 3; axis++) {
+			float b_mean = 0.0f;
+			for (int i = 0; i < edge_count; i++) {
+				b_mean += edge_points[i].bias[axis];
+			}
+			b_mean /= edge_count;
+
+			float sum_dt_db = 0.0f;
+			for (int i = 0; i < edge_count; i++) {
+				float dt = edge_points[i].temp - t_mean;
+				float db = edge_points[i].bias[axis] - b_mean;
+				sum_dt_db += dt * db;
+			}
+
+			slope[axis] = (sum_dt_sq > 0.001f) ? sum_dt_db / sum_dt_sq : 0.0f;
+			bias_out[axis] = b_mean + slope[axis] * (temp - t_mean);
+		}
+
+		// Cache the extrapolated result with slope for smooth interpolation
+		int slot = sensor_tcal_cache_select_slot(temp);
+		mls_cache.slots[slot].temp = temp;
+		memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
+		memcpy(mls_cache.slots[slot].slope, slope, sizeof(float) * 3);
+		mls_cache.slots[slot].valid = true;
+
+		LOG_DBG("T-Cal MLS: Linear extrapolation %s range (%.2fC, %d pts)",
+			extrapolate_low ? "below" : "above", (double)temp, edge_count);
+		return 0;
 	}
 
 	// If only one point has significant weight, just return it
 	if (point_count == 1) {
 		memcpy(bias_out, points[0].bias, sizeof(float) * 3);
+
+		// Cache as a locally constant model (slope = 0)
+		int slot = sensor_tcal_cache_select_slot(temp);
+		mls_cache.slots[slot].temp = temp;
+		memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
+		memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
+		mls_cache.slots[slot].valid = true;
+
 		LOG_DBG(
 			"T-Cal MLS: Single significant point at %.2fC (w=%.3f)",
 			(double)points[0].temp,
@@ -3243,29 +3570,33 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 		for (int axis = 0; axis < 3; axis++) {
 			bias_out[axis] = (float)(sum_wb[axis] / sum_w);
 		}
-		// Update cache (use next slot, round-robin)
-		int slot = mls_cache.next_slot;
+		// Update cache (select best slot based on distance)
+		int slot = sensor_tcal_cache_select_slot(temp);
 		mls_cache.slots[slot].temp = temp;
 		memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
+		memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
 		mls_cache.slots[slot].valid = true;
-		mls_cache.next_slot = (slot + 1) % MLS_CACHE_SLOTS;
 		LOG_DBG("T-Cal MLS: Degenerate case, using weighted average at %.2fC (cached in slot %d)", (double)temp, slot);
 		return 0;
 	}
 
-	// Solve for 'a' (the bias at query temperature)
+	// Solve for 'a' (the bias at query temperature) and local slope 'c'
 	// a = (sum_wb * sum_wdt2 - sum_wdtb * sum_wdt) / det
+	// c = (sum_w * sum_wdtb - sum_wdt * sum_wb) / det
+	float slope_out[3];
 	for (int axis = 0; axis < 3; axis++) {
 		double a = (sum_wb[axis] * sum_wdt2 - sum_wdtb[axis] * sum_wdt) / det;
+		double c = (sum_w * sum_wdtb[axis] - sum_wdt * sum_wb[axis]) / det;
 		bias_out[axis] = (float)a;
+		slope_out[axis] = (float)c;
 	}
 
-	// Update cache with computed result (use next slot, round-robin)
-	int slot = mls_cache.next_slot;
+	// Update cache with computed result (select best slot based on distance)
+	int slot = sensor_tcal_cache_select_slot(temp);
 	mls_cache.slots[slot].temp = temp;
 	memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
+	memcpy(mls_cache.slots[slot].slope, slope_out, sizeof(float) * 3);
 	mls_cache.slots[slot].valid = true;
-	mls_cache.next_slot = (slot + 1) % MLS_CACHE_SLOTS;
 
 	LOG_DBG(
 		"T-Cal MLS: Computed bias [%.4f, %.4f, %.4f] at %.2fC using %d points (cached in slot %d)",
@@ -3276,6 +3607,354 @@ static int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 		point_count,
 		slot
 	);
+
+	return 0;
+}
+
+// =============================================================================
+// LUT Incremental Build Functions
+// =============================================================================
+
+/**
+ * Helper function to compute and store a single LUT entry
+ * @param idx LUT index to compute
+ * @return true if successfully computed, false on error
+ */
+static bool sensor_tcal_lut_compute_entry(int idx)
+{
+	if (idx < 0 || idx >= MLS_LUT_SIZE) {
+		return false;
+	}
+
+	// Skip if already computed
+	if (mls_lut.entries[idx].computed) {
+		return true;
+	}
+
+	float temp = MLS_LUT_IDX_TO_TEMP(idx);
+	float bias[3];
+
+	if (sensor_tcal_mls_lookup(temp, bias) == 0) {
+		memcpy(mls_lut.entries[idx].bias, bias, sizeof(float) * 3);
+		mls_lut.entries[idx].computed = true;
+		mls_lut.computed_count++;
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Build priority zone of LUT (±3°C around current temperature)
+ * This is called at startup and when calibration points change.
+ * Returns quickly after building the priority zone.
+ * Background build continues via sensor_tcal_build_lut_continue().
+ *
+ * @param current_temp Current device temperature
+ */
+static void sensor_tcal_build_lut_priority(float current_temp)
+{
+	// Check if we have enough points for MLS
+	if (retained->tempCalState.count < MLS_MIN_POINTS_FOR_FIT) {
+		LOG_INF("T-Cal LUT: Not enough points (%u < %d), LUT disabled",
+		        retained->tempCalState.count, MLS_MIN_POINTS_FOR_FIT);
+		mls_lut.valid = false;
+		mls_lut.build_state = MLS_LUT_BUILD_IDLE;
+		return;
+	}
+
+	int64_t start_time = k_uptime_get();
+
+	// Reset LUT state for fresh build
+	mls_lut.valid = false;
+	mls_lut.version = retained->tempCalState.count;
+	mls_lut.computed_count = 0;
+
+	// Mark all entries as not computed
+	for (int i = 0; i < MLS_LUT_SIZE; i++) {
+		mls_lut.entries[i].computed = false;
+	}
+
+	// Clear legacy cache to force fresh MLS computation
+	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
+		mls_cache.slots[i].valid = false;
+	}
+	mls_cache.count = 0;
+
+	// Calculate priority zone indices (±3°C around current temp)
+	float priority_temp_min = current_temp - MLS_LUT_PRIORITY_RANGE;
+	float priority_temp_max = current_temp + MLS_LUT_PRIORITY_RANGE;
+
+	// Clamp to LUT range
+	if (priority_temp_min < MLS_LUT_TEMP_MIN) {
+		priority_temp_min = MLS_LUT_TEMP_MIN;
+	}
+	if (priority_temp_max > MLS_LUT_TEMP_MAX) {
+		priority_temp_max = MLS_LUT_TEMP_MAX;
+	}
+
+	mls_lut.priority_idx_min = (int)MLS_LUT_TEMP_TO_IDX(priority_temp_min);
+	mls_lut.priority_idx_max = (int)MLS_LUT_TEMP_TO_IDX(priority_temp_max) + 1;
+
+	// Clamp indices
+	if (mls_lut.priority_idx_min < 0) {
+		mls_lut.priority_idx_min = 0;
+	}
+	if (mls_lut.priority_idx_max >= MLS_LUT_SIZE) {
+		mls_lut.priority_idx_max = MLS_LUT_SIZE - 1;
+	}
+
+	LOG_INF("T-Cal LUT: Building priority zone [%d-%d] (%.1f°C to %.1f°C)",
+	        mls_lut.priority_idx_min, mls_lut.priority_idx_max,
+	        (double)priority_temp_min, (double)priority_temp_max);
+
+	mls_lut.build_state = MLS_LUT_BUILD_PRIORITY;
+
+	// Build priority zone entries
+	int priority_count = 0;
+	for (int idx = mls_lut.priority_idx_min; idx <= mls_lut.priority_idx_max; idx++) {
+		if (sensor_tcal_lut_compute_entry(idx)) {
+			priority_count++;
+		}
+
+		// Feed watchdog periodically
+		if (priority_count % 20 == 0) {
+			watchdog_feed(WDT_CHANNEL_CALIBRATION);
+		}
+	}
+
+	// Mark LUT as valid once priority zone is complete
+	mls_lut.valid = true;
+
+	// Set up for background build of remaining entries
+	mls_lut.build_next_idx = 0;
+	mls_lut.build_state = MLS_LUT_BUILD_BACKGROUND;
+
+	int64_t elapsed = k_uptime_get() - start_time;
+	LOG_INF("T-Cal LUT: Priority zone built (%d entries) in %lld ms, background build started",
+	        priority_count, elapsed);
+}
+
+/**
+ * Continue building LUT entries in background.
+ * Called from calibration_thread main loop.
+ * Processes a small batch of entries per call to avoid blocking.
+ *
+ * @return true if build is complete, false if more work remains
+ */
+static bool sensor_tcal_build_lut_continue(void)
+{
+	// Check if build is needed
+	if (mls_lut.build_state != MLS_LUT_BUILD_BACKGROUND) {
+		return true;  // Not in background build state
+	}
+
+	// Check version match
+	if (mls_lut.version != retained->tempCalState.count) {
+		// Points changed, invalidate and stop
+		mls_lut.build_state = MLS_LUT_BUILD_IDLE;
+		mls_lut.valid = false;
+		return true;
+	}
+
+	// Process a batch of entries
+	int computed_this_batch = 0;
+	while (computed_this_batch < MLS_LUT_BATCH_SIZE && mls_lut.build_next_idx < MLS_LUT_SIZE) {
+		int idx = mls_lut.build_next_idx;
+		mls_lut.build_next_idx++;
+
+		// Skip already computed entries (priority zone)
+		if (mls_lut.entries[idx].computed) {
+			continue;
+		}
+
+		sensor_tcal_lut_compute_entry(idx);
+		computed_this_batch++;
+	}
+
+	// Check if complete
+	if (mls_lut.build_next_idx >= MLS_LUT_SIZE) {
+		mls_lut.build_state = MLS_LUT_BUILD_COMPLETE;
+		return true;
+	}
+
+	// Yield CPU time
+	k_msleep(MLS_LUT_BATCH_YIELD_MS);
+	return false;
+}
+
+// =============================================================================
+// LUT Lookup Function - O(1) Linear Interpolation
+// =============================================================================
+/**
+ * Fast O(1) lookup using pre-computed LUT with linear interpolation.
+ * For entries not yet computed (during incremental build), falls back to -1.
+ *
+ * @param temp Query temperature
+ * @param bias_out Output: interpolated 3-axis bias
+ * @return 0 on success, -1 if required entries not computed
+ */
+static int sensor_tcal_lut_lookup(float temp, float bias_out[3])
+{
+	// Check LUT validity and version
+	if (!mls_lut.valid || mls_lut.version != retained->tempCalState.count) {
+		return -1;  // LUT not available
+	}
+
+	// Track if we need to extrapolate (temp outside LUT range)
+	bool extrapolate_low = (temp < MLS_LUT_TEMP_MIN);
+	bool extrapolate_high = (temp > MLS_LUT_TEMP_MAX);
+	float original_temp = temp;
+
+	// For extrapolation, use 4 points with 1°C spacing for robust slope estimation
+	// With MLS_LUT_STEP_PER_DEGREE = 2, 1°C = 2 LUT indices
+	#define EXTRAP_POINT_SPACING MLS_LUT_STEP_PER_DEGREE  // 1°C spacing
+	#define EXTRAP_NUM_POINTS 4
+
+	if (extrapolate_low) {
+		// Use first 4 points at 1°C intervals: indices 0, 2, 4, 6
+		int indices[EXTRAP_NUM_POINTS];
+		for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+			indices[i] = i * EXTRAP_POINT_SPACING;
+			if (indices[i] >= MLS_LUT_SIZE) {
+				return -1;  // Not enough range for extrapolation
+			}
+			if (!mls_lut.entries[indices[i]].computed) {
+				return -1;  // Required points not computed
+			}
+		}
+
+		// Linear least squares fit using 4 points
+		// slope = Σ(t_i - t_mean)(b_i - b_mean) / Σ(t_i - t_mean)²
+		float temps[EXTRAP_NUM_POINTS];
+		float t_mean = 0.0f;
+		for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+			temps[i] = MLS_LUT_IDX_TO_TEMP(indices[i]);
+			t_mean += temps[i];
+		}
+		t_mean /= EXTRAP_NUM_POINTS;
+
+		// Pre-compute Σ(t_i - t_mean)² (same for all axes)
+		float sum_dt_sq = 0.0f;
+		for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+			float dt = temps[i] - t_mean;
+			sum_dt_sq += dt * dt;
+		}
+
+		for (int axis = 0; axis < 3; axis++) {
+			float b_mean = 0.0f;
+			for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+				b_mean += mls_lut.entries[indices[i]].bias[axis];
+			}
+			b_mean /= EXTRAP_NUM_POINTS;
+
+			float sum_dt_db = 0.0f;
+			for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+				float dt = temps[i] - t_mean;
+				float db = mls_lut.entries[indices[i]].bias[axis] - b_mean;
+				sum_dt_db += dt * db;
+			}
+
+			float slope = (sum_dt_sq > 0.001f) ? sum_dt_db / sum_dt_sq : 0.0f;
+			bias_out[axis] = b_mean + slope * (original_temp - t_mean);
+		}
+		return 0;
+
+	} else if (extrapolate_high) {
+		// Use last 4 points at 1°C intervals: indices n-1, n-3, n-5, n-7
+		int indices[EXTRAP_NUM_POINTS];
+		for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+			indices[i] = (MLS_LUT_SIZE - 1) - i * EXTRAP_POINT_SPACING;
+			if (indices[i] < 0) {
+				return -1;  // Not enough range for extrapolation
+			}
+			if (!mls_lut.entries[indices[i]].computed) {
+				return -1;  // Required points not computed
+			}
+		}
+
+		// Linear least squares fit using 4 points
+		float temps[EXTRAP_NUM_POINTS];
+		float t_mean = 0.0f;
+		for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+			temps[i] = MLS_LUT_IDX_TO_TEMP(indices[i]);
+			t_mean += temps[i];
+		}
+		t_mean /= EXTRAP_NUM_POINTS;
+
+		float sum_dt_sq = 0.0f;
+		for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+			float dt = temps[i] - t_mean;
+			sum_dt_sq += dt * dt;
+		}
+
+		for (int axis = 0; axis < 3; axis++) {
+			float b_mean = 0.0f;
+			for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+				b_mean += mls_lut.entries[indices[i]].bias[axis];
+			}
+			b_mean /= EXTRAP_NUM_POINTS;
+
+			float sum_dt_db = 0.0f;
+			for (int i = 0; i < EXTRAP_NUM_POINTS; i++) {
+				float dt = temps[i] - t_mean;
+				float db = mls_lut.entries[indices[i]].bias[axis] - b_mean;
+				sum_dt_db += dt * db;
+			}
+
+			float slope = (sum_dt_sq > 0.001f) ? sum_dt_db / sum_dt_sq : 0.0f;
+			bias_out[axis] = b_mean + slope * (original_temp - t_mean);
+		}
+		return 0;
+	}
+
+	// Normal interpolation within range
+	float fidx = MLS_LUT_TEMP_TO_IDX(temp);
+
+	// Get integer indices for interpolation
+	int idx_lo = (int)fidx;
+	int idx_hi = idx_lo + 1;
+
+	// Clamp indices to valid range (handle edge cases)
+	if (idx_lo < 0) {
+		idx_lo = 0;
+		idx_hi = 1;
+	}
+	if (idx_hi >= MLS_LUT_SIZE) {
+		idx_hi = MLS_LUT_SIZE - 1;
+		idx_lo = MLS_LUT_SIZE - 2;
+	}
+	if (idx_lo < 0) {
+		idx_lo = 0;
+	}
+
+	// Check if required entries are computed
+	if (!mls_lut.entries[idx_lo].computed || !mls_lut.entries[idx_hi].computed) {
+		return -1;  // Required entries not yet computed, caller should use MLS fallback
+	}
+
+	// Linear interpolation
+	float frac = fidx - (float)idx_lo;
+	if (frac < 0.0f) {
+		frac = 0.0f;
+	} else if (frac > 1.0f) {
+		frac = 1.0f;
+	}
+
+	const float *bias_lo = mls_lut.entries[idx_lo].bias;
+	const float *bias_hi = mls_lut.entries[idx_hi].bias;
+
+#if CONFIG_CMSIS_DSP
+	// bias_out = bias_lo + frac * (bias_hi - bias_lo)
+	float diff[3];
+	arm_sub_f32(bias_hi, bias_lo, diff, 3);
+	arm_scale_f32(diff, frac, diff, 3);
+	arm_add_f32(bias_lo, diff, bias_out, 3);
+#else
+	for (int axis = 0; axis < 3; axis++) {
+		bias_out[axis] = bias_lo[axis] + frac * (bias_hi[axis] - bias_lo[axis]);
+	}
+#endif
 
 	return 0;
 }

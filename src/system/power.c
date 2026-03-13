@@ -7,6 +7,7 @@
 #include "system.h"
 #include "led.h"
 #include "connection/esb.h"
+#include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log_ctrl.h>
@@ -17,10 +18,10 @@
 #include <zephyr/device.h>
 #include <hal/nrf_spim.h>
 #include <hal/nrf_twim.h>
-#include <hal/nrf_power.h>
-
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
 
 #include "power.h"
+#include "clock_control.h"
 
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
@@ -197,6 +198,7 @@ static void configure_system_off(void)
 		LOG_WRN("Entering new power state while sensor error is raised");
 	if (get_status(SYS_STATUS_SYSTEM_ERROR))
 		LOG_WRN("Entering new power state while system error is raised");
+	clock_pre_shutdown();
 	main_imu_suspend();
 	sensor_shutdown();
 	set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
@@ -414,12 +416,10 @@ static void sys_system_off(void) // TODO: add timeout
 {
 	LOG_INF("System off requested");
 	configure_system_off(); // Common subsystem shutdown and prepare sense pins
-	// Clear sensor addresses
-	sensor_scan_clear();
-	LOG_INF("Requested sensor scan on next boot");
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	// Reset boot calibration state so it will recalibrate on next boot
 	sensor_boot_cal_reset();
+	sensor_fusion_invalidate();
 #endif
 	// sensor_fusion_update_bias(NULL);
 	// sensor_retained_write();
@@ -451,7 +451,7 @@ static void sys_system_reboot(void) // TODO: add timeout
 {
 	LOG_INF("System reboot requested");
 	configure_system_off(); // Common subsystem shutdown and prepare sense pins
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	// Reset boot calibration state so it will recalibrate on next boot
 	sensor_boot_cal_reset();
 #endif
@@ -567,8 +567,27 @@ static void update_battery(int16_t battery_pptt)
 // TODO: call into other thread for handling the system state
 static void power_thread(void)
 {
+	static bool boot_success_checked = false;
+	static bool watchdog_registered = false;
+
+	/* Register power thread with watchdog (watchdog is initialized via SYS_INIT) */
+	if (!watchdog_registered) {
+		watchdog_registered = true;
+		watchdog_register_thread(WDT_CHANNEL_POWER, 0);
+	}
+
 	while (1)
 	{
+		/* After 60 seconds of successful operation, mark boot as successful.
+		 * This is long enough to ensure the system is truly stable before
+		 * clearing the WDT reset counter, allowing multiple WDT resets to
+		 * accumulate and eventually trigger DFU mode if there's a persistent issue.
+		 */
+		if (!boot_success_checked && k_uptime_get() > 60000) {
+			boot_success_checked = true;
+			watchdog_mark_boot_success();
+		}
+
 #if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(uart0))
 		const struct device *const uart = DEVICE_DT_GET(DT_NODELABEL(uart0));
 		pm_device_action_run(uart, PM_DEVICE_ACTION_SUSPEND);
@@ -645,7 +664,7 @@ static void power_thread(void)
 			power_init = true;
 		}
 
-		if (battery_discharged || docked)
+		if ((battery_discharged && !device_plugged) || docked) // TODO: docked may or may not also mean device_plugged due to charging
 		{
 			if (battery_discharged)
 			{
@@ -681,6 +700,9 @@ static void power_thread(void)
 		else
 			set_led(SYS_LED_PATTERN_ACTIVE_PERSIST, SYS_LED_PRIORITY_SYSTEM);
 //			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SYSTEM);
+
+		/* Feed watchdog at end of each loop iteration */
+		watchdog_feed(WDT_CHANNEL_POWER);
 
 		k_msleep(100);
 	}

@@ -3,6 +3,7 @@
 #include "sensor/calibration.h"
 #include "connection/connection.h"
 #include "connection/esb.h"
+#include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
@@ -190,18 +191,15 @@ static int sys_retained_init(void)
 			retained->gyroSensScale[1] = 1.0f;
 			retained->gyroSensScale[2] = 1.0f;
 		}
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 		sys_read(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, sizeof(retained->gyroTemp));
 		sys_read(MAIN_GYRO_TCAL_POINTS_ID, &retained->tempCalPoints, sizeof(retained->tempCalPoints));
 		sys_read(MAIN_GYRO_TCAL_COEFFS_ID, &retained->tempCalCoeffs, sizeof(retained->tempCalCoeffs));
-		sys_read(
-			MAIN_GYRO_TCAL_CORRECTION_ID,
-			&retained->tempCalCorrectionOffset,
-			sizeof(retained->tempCalCorrectionOffset)
-		);
+		// tempCalCorrectionOffset is retained for compatibility only; no longer used.
 		sys_read(MAIN_GYRO_TCAL_STATE_ID, &retained->tempCalState, sizeof(retained->tempCalState));
 #endif
 		sys_read(RF_CHANNEL_ID, &retained->rf_channel, sizeof(retained->rf_channel));
+		sys_read(MAG_ENABLED_ID, &retained->mag_enabled, sizeof(retained->mag_enabled));
 		retained_update();
 	} else {
 		LOG_INF("Validated RAM");
@@ -316,23 +314,35 @@ void sys_clear(void)
 // return 0 if clock applied, -1 if failed (because there is no clk_en or clk_out)
 int set_sensor_clock(bool enable, float rate, float *actual_rate)
 {
+	*actual_rate = 0;
 #if CLK_EN_EXISTS
-	int ret = gpio_pin_set_dt(&clk_en, enable); // if enabling some external oscillator is available
-	LOG_INF("CLK_EN GPIO set to %d (ret=%d)", enable, ret);
-	//	*actual_rate = enable ? (float)NSEC_PER_SEC / clk_out.period : 0; // assume pwm period is the same as an
-	//equivalent external oscillator
-	*actual_rate = enable ? 32768 : 0; // default
+	int ret = gpio_pin_set_dt(&clk_en, enable);
+	if (ret) {
+		LOG_ERR("CLK_EN GPIO set to %d failed (ret=%d)", enable, ret);
+		return ret;
+	}
+	LOG_INF("CLK_EN GPIO set to %d", enable);
+	if (enable) {
+		k_msleep(2); // allow external oscillator to stabilize
+		*actual_rate = 32768;
+	}
 	return 0;
 #endif
-	*actual_rate = 0; // rate is 0 if there will be no clock source available
 	if (!device_is_ready(clk_out.dev)) {
+		if (enable) {
+			LOG_WRN("Clock output device not ready");
+		}
 		return -1;
 	}
-	int err = pwm_set_dt(&clk_out, PWM_HZ(rate), enable ? PWM_HZ(rate * 2) : 0); // if clk_out is used
-	if (!err) {
-		*actual_rate = enable ? rate : 0; // the system probably could provide the correct rate
+	int err = pwm_set_dt(&clk_out, PWM_HZ(rate), enable ? PWM_HZ(rate * 2) : 0);
+	if (err) {
+		LOG_ERR("PWM clock output set failed (err=%d)", err);
+		return err;
 	}
-	return err;
+	if (enable) {
+		*actual_rate = rate;
+	}
+	return 0;
 }
 
 #if BUTTON_EXISTS // Alternate button if available to use as "reset key"
@@ -380,6 +390,10 @@ static void button_thread(void)
 {
 	int num_presses = 0;
 	int64_t last_press = 0;
+
+	/* Register button thread with watchdog */
+	watchdog_register_thread(WDT_CHANNEL_BUTTON, 0);
+
 	while (1) {
 		if (press_time && k_uptime_get() - press_time > 50) // debounce
 		{
@@ -426,6 +440,10 @@ static void button_thread(void)
 				k_thread_abort(button_thread_id);
 			}
 		}
+
+		/* Feed watchdog at end of each loop iteration */
+		watchdog_feed(WDT_CHANNEL_BUTTON);
+
 		k_msleep(20);
 	}
 }

@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 // A single point in temperature calibration data
 struct TempCalPoint {
 	float temp;    // The temperature for this point
@@ -80,7 +80,9 @@ struct retained_data {
 
 	uint8_t rf_channel; // RF channel (0-100), 0xFF means use default
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+	bool mag_enabled;
+
+#if CONFIG_SENSOR_USE_TCAL
 	float gyroTemp;
 
 	#define TCAL_BUFFER_SIZE                                                                                               \
@@ -88,6 +90,7 @@ struct retained_data {
 		struct TempCalPoint tempCalPoints[TCAL_BUFFER_SIZE];
 	float tempCalCoeffs[3][CONFIG_SENSOR_POLY_DEGREE + 1];
 	float tempCalCorrectionOffset[3];
+
 	struct {
 		uint16_t count;
 		bool valid;
@@ -109,7 +112,25 @@ struct retained_data {
 	 * including this field.
 	 */
 	uint32_t crc;
+
+	/* ==== FIELDS BELOW ARE NOT INCLUDED IN CRC CALCULATION ==== */
+	/* These fields are intentionally placed after the CRC so they can
+	 * be modified without invalidating the CRC. This is important for
+	 * watchdog state which must persist across unexpected resets.
+	 */
+
+	// Watchdog state (persists across WDT resets, outside CRC validation)
+	struct {
+		uint8_t reset_count;           // WDT consecutive reset count
+		uint8_t last_failed_channel;   // Last channel that failed to feed
+		uint32_t last_reset_uptime;    // System uptime at last WDT reset (ms)
+		uint32_t total_wdt_resets;     // Cumulative WDT reset count (for debugging)
+		uint32_t magic;                // Magic number to validate watchdog state
+	} watchdog_state;
 };
+
+/* Magic number to validate watchdog state */
+#define WATCHDOG_STATE_MAGIC 0x57445447  /* "WDTG" in ASCII */
 
 /* Up to 4 KB of retained data allowed right now.
  */

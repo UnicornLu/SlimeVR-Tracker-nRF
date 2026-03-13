@@ -34,6 +34,17 @@
 #define FW_VERSION_MINOR APP_VERSION_MINOR
 #define FW_VERSION_PATCH APP_PATCHLEVEL
 
+// Build-time VCS metadata (injected by CMake). Keep safe fallbacks for non-git builds.
+#ifndef FW_GIT_REPO_URL
+#define FW_GIT_REPO_URL "unknown"
+#endif
+#ifndef FW_GIT_BRANCH
+#define FW_GIT_BRANCH "unknown"
+#endif
+#ifndef FW_GIT_AUTHOR
+#define FW_GIT_AUTHOR "unknown"
+#endif
+
 static uint8_t get_server_constant_imu_id(int id) __attribute__((unused));
 static uint8_t get_server_constant_mag_id(int id) __attribute__((unused));
 static uint8_t get_server_constant_tracker_status(int status) __attribute__((unused));
@@ -210,17 +221,13 @@ static uint8_t get_server_constant_imu_id(int id)
 }
 
 // does not exist in server enums yet
-#if CONFIG_SENSOR_USE_MAG
-#define SVR_MAG_STATUS SVR_MAG_STATUS_ENABLED
-#else
-#define SVR_MAG_STATUS SVR_MAG_STATUS_DISABLED
-#endif
+extern bool sensor_get_mag_enabled(void);
 static uint8_t get_server_constant_mag_id(int id)
 {
 	if (id < 0)
 		return SVR_MAG_STATUS_NOT_SUPPORTED;
 	else
-		return SVR_MAG_STATUS; // TODO: toggle from server
+		return sensor_get_mag_enabled() ? SVR_MAG_STATUS_ENABLED : SVR_MAG_STATUS_DISABLED;
 //	switch (id)
 //	{
 //	case MAG_HMC5883L:

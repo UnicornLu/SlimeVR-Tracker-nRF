@@ -48,21 +48,23 @@ void vqf_update_sensor_ids(int imu)
 static void set_params()
 {
 	init_params(&params);
-	params.biasClip = 5.0f;
-	params.tauMag = 10.0f; // best result for VQF from paper
-	// best result from optimizer
-	params.biasForgettingTime = 136.579346;
-	params.biasSigmaInit = 3.219453;
-	params.biasSigmaMotion = 0.348501;
-	params.biasSigmaRest = 0.063616;
-	params.biasVerticalForgettingFactor = 0.007056;
+	params.tauAcc = 3.2f;
+	params.biasClip = 2.5f;
+	params.biasForgettingTime = 80.0f;
+	params.biasSigmaInit = 1.5f;
+	params.biasSigmaMotion = 0.20f;
+	params.biasSigmaRest = 0.03f;
+	params.biasVerticalForgettingFactor = 0.00001f;
 	params.motionBiasEstEnabled = true;
 	params.restBiasEstEnabled = true;
-	params.restFilterTau = 1.114532;
-	params.restMinT = 2.586910;
-	params.restThAcc = 1.418598;
-	params.restThGyr = 1.399189;
-	params.tauAcc = 4.337983;
+	params.restFilterTau = 1.45f;
+	params.restMinT = 2.9f;
+	params.restThAcc = 0.25f;
+	params.restThGyr = 0.7f;
+	params.tauMag = 9.0f;
+	params.magCurrentTau = 0.06f;
+	params.magNormTh = 0.1f;
+	params.magDipTh = 10.0f;
 }
 
 void vqf_init(float g_time, float a_time, float m_time)
@@ -86,7 +88,7 @@ void vqf_save(void *data)
 
 void vqf_update_gyro(float *g, float time)
 {
-	// TODO: time unused?
+	ARG_UNUSED(time);
 	float g_rad[3] = {0};
 	// g is in deg/s, convert to rad/s
 	for (int i = 0; i < 3; i++)
@@ -94,10 +96,17 @@ void vqf_update_gyro(float *g, float time)
 	updateGyr(&params, &state, &coeffs, g_rad);
 }
 
+void vqf_update_gyro_ts(float *g, uint64_t timestamp_us)
+{
+	float g_rad[3] = {0};
+	for (int i = 0; i < 3; i++)
+		g_rad[i] = g[i] * DEG_TO_RAD;
+	updateGyrTs(&params, &state, &coeffs, g_rad, timestamp_us);
+}
+
 void vqf_update_accel(float *a, float time)
 {
-	// TODO: time unused?
-	// TODO: how to handle change in sample rate
+	ARG_UNUSED(time);
 	float a_m_s2[3] = {0};
 	// a is in g, convert to m/s^2
 	for (int i = 0; i < 3; i++)
@@ -107,10 +116,25 @@ void vqf_update_accel(float *a, float time)
 	updateAcc(&params, &state, &coeffs, a_m_s2);
 }
 
+void vqf_update_accel_ts(float *a, uint64_t timestamp_us)
+{
+	float a_m_s2[3] = {0};
+	for (int i = 0; i < 3; i++)
+		a_m_s2[i] = a[i] * CONST_EARTH_GRAVITY;
+	if (a_m_s2[0] != 0 || a_m_s2[1] != 0 || a_m_s2[2] != 0)
+		memcpy(last_a, a_m_s2, sizeof(a_m_s2));
+	updateAccTs(&params, &state, &coeffs, a_m_s2, timestamp_us);
+}
+
 void vqf_update_mag(float *m, float time)
 {
-	// TODO: time unused?
+	ARG_UNUSED(time);
 	updateMag(&params, &state, &coeffs, m);
+}
+
+void vqf_update_mag_ts(float *m, uint64_t timestamp_us)
+{
+	updateMagTs(&params, &state, &coeffs, m, timestamp_us);
 }
 
 void vqf_update(float *g, float *a, float *m, float time)
@@ -126,11 +150,18 @@ void vqf_update(float *g, float *a, float *m, float time)
 void vqf_get_gyro_bias(float *g_off)
 {
 	getBiasEstimate(&state, &coeffs, g_off);
+	// VQF internal unit is rad/s, fusion interface expects deg/s
+	for (int i = 0; i < 3; i++)
+		g_off[i] *= 180.0f / M_PI;
 }
 
 void vqf_set_gyro_bias(float *g_off)
 {
-	setBiasEstimate(&state, g_off, -1);
+	float g_off_rad[3];
+	// fusion interface receives values in deg/s, VQF requires rad/s
+	for (int i = 0; i < 3; i++)
+		g_off_rad[i] = g_off[i] * DEG_TO_RAD;
+	setBiasEstimate(&state, g_off_rad, -1);
 }
 
 void vqf_update_gyro_sanity(float *g, float *m)
@@ -183,10 +214,35 @@ void vqf_get_debug_info(vqf_debug_info_t *info)
 	info->rest_detected = getRestDetected(&state);
 	getRelativeRestDeviations(&params, &state, info->rest_deviations);
 	info->bias_sigma = getBiasEstimate(&state, &coeffs, info->bias);
+
+	// Heading correction state
 	info->delta = getDelta(&state);
+
+	// Magnetic disturbance / reference
 	info->mag_dist_detected = getMagDistDetected(&state);
 	info->mag_ref_norm = getMagRefNorm(&state);
 	info->mag_ref_dip = getMagRefDip(&state);
+
+	// Current magnetic field (after optional magCurrentTau LPF)
+	info->mag_norm = state.magNormDip[0];
+	info->mag_dip = state.magNormDip[1];
+
+	// Heading correction diagnostics (from last magnetometer update)
+	info->mag_dis_angle = state.lastMagDisAngle;
+	info->mag_corr_rate = state.lastMagCorrAngularRate;
+
+	// Disturbance rejection timers
+	info->mag_undisturbed_t = state.magUndisturbedT;
+	info->mag_reject_t = state.magRejectT;
+
+	// Candidate field tracking
+	info->mag_candidate_norm = state.magCandidateNorm;
+	info->mag_candidate_dip = state.magCandidateDip;
+	info->mag_candidate_t = state.magCandidateT;
+
+	// Filter gains
+	info->mag_k = coeffs.kMag;
+	info->mag_k_init = state.kMagInit;
 
 	// Convert bias from rad/s to °/s
 	for (int i = 0; i < 3; i++) {
@@ -194,29 +250,35 @@ void vqf_get_debug_info(vqf_debug_info_t *info)
 	}
 	info->bias_sigma *= 180.0f / M_PI;
 
-	// Convert delta from rad to degrees
+	// Convert rad-based angles to degrees
 	info->delta *= 180.0f / M_PI;
-
-	// Convert mag_ref_dip from rad to degrees
 	info->mag_ref_dip *= 180.0f / M_PI;
+	info->mag_dip *= 180.0f / M_PI;
+	info->mag_dis_angle *= 180.0f / M_PI;
+
+	// Convert angular rates from rad/s to °/s
+	info->mag_corr_rate *= 180.0f / M_PI;
+
+	// Convert candidate dip from rad to degrees
+	info->mag_candidate_dip *= 180.0f / M_PI;
 }
 
 const sensor_fusion_t sensor_fusion_vqf = {
-	*vqf_init,
-	*vqf_load,
-	*vqf_save,
+	vqf_init,
+	vqf_load,
+	vqf_save,
 
-	*vqf_update_gyro,
-	*vqf_update_accel,
-	*vqf_update_mag,
-	*vqf_update,
+	vqf_update_gyro,
+	vqf_update_accel,
+	vqf_update_mag,
+	vqf_update,
 
-	*vqf_get_gyro_bias,
-	*vqf_set_gyro_bias,
+	vqf_get_gyro_bias,
+	vqf_set_gyro_bias,
 
-	*vqf_update_gyro_sanity,
-	*vqf_get_gyro_sanity,
+	vqf_update_gyro_sanity,
+	vqf_get_gyro_sanity,
 
-	*vqf_get_lin_a,
-	*vqf_get_quat
+	vqf_get_lin_a,
+	vqf_get_quat
 };

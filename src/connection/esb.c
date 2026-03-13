@@ -24,6 +24,7 @@
 #include "sensor/calibration.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
+#include "system/watchdog.h"
 #include "connection.h"
 #include "zephyr/sys/time_units.h"
 
@@ -38,7 +39,9 @@
 
 #include <stdlib.h>
 #include "esb.h"
+#include "tdma.h"
 #include "console.h"
+#include "system/clock_control.h"
 
 uint8_t last_reset = 0;
 // const nrfx_timer_t m_timer = NRFX_TIMER_INSTANCE(1);
@@ -56,7 +59,6 @@ static struct esb_payload rx_payload;
 // Normal data payload (16+1 bytes when used), length set per write
 static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0);
 static struct esb_payload tx_payload_pair = ESB_CREATE_PAYLOAD(0, 0, 0, 0, 0, 0, 0, 0, 0);
-static struct esb_payload ack_payload = ESB_CREATE_PAYLOAD(0);
 
 static uint8_t paired_addr[8] = {0};
 
@@ -119,15 +121,22 @@ static uint32_t g_last_rx_raw_ticks = 0;
 static uint32_t g_last_sync_local_ticks = 0;
 static bool g_time_initialized = false;
 static int64_t g_last_sync_timestamp = 0;
-static int32_t g_clock_skew_fixed = 0; // Fixed point skew (20 bit fraction)
-static int64_t g_last_skew_update_time = 0;
 #define TIME_SYNC_TIMEOUT_MS 90000
-#define SKEW_SHIFT 20
+
+// Clock skew compensation (tracker vs receiver crystal frequency difference)
+static int32_t g_clock_skew_ppb = 0;         // Estimated clock skew in parts per billion
+static int32_t g_skew_ref_offset = 0;        // Offset at skew reference point
+static uint32_t g_skew_ref_local_ticks = 0;  // Local ticks at skew reference point (updated infrequently)
+#define SKEW_REF_REFRESH_TICKS (60 * 32768)  // Refresh skew reference every ~60s
+
+// Minimum RTT tracking for asymmetric delay compensation
+// In ESB, return path (ACK) has fixed delay ≈ min_rtt/2
+// Forward path absorbs all retransmission overhead
+static uint32_t g_min_rtt_ticks = UINT32_MAX;
 
 // Track last sent packet for TX_FAILED diagnostics
 struct last_tx_info {
 	uint8_t type;        // First byte of payload (packet type)
-	bool is_ack_payload; // Is this the small ack_payload after PING
 	bool noack;          // noack flag
 	uint8_t length;      // Packet length
 	int64_t timestamp;   // When it was sent
@@ -261,7 +270,16 @@ BUILD_ASSERT(false, "No Clock Control driver");
 #endif
 
 static struct k_thread clocks_thread_id;
-static K_THREAD_STACK_DEFINE(clocks_thread_id_stack, 128);
+static K_THREAD_STACK_DEFINE(clocks_thread_id_stack, 512);
+
+// Wrapper function with correct signature for k_thread_entry_t
+static void clocks_start_wrapper(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+	(void)clocks_start();
+}
 
 void clocks_request_start(uint32_t delay_us)
 {
@@ -269,7 +287,7 @@ void clocks_request_start(uint32_t delay_us)
 		&clocks_thread_id,
 		clocks_thread_id_stack,
 		K_THREAD_STACK_SIZEOF(clocks_thread_id_stack),
-		(k_thread_entry_t)clocks_start,
+		clocks_start_wrapper,
 		NULL,
 		NULL,
 		NULL,
@@ -280,15 +298,24 @@ void clocks_request_start(uint32_t delay_us)
 }
 
 static struct k_thread clocks_stop_thread_id;
-static K_THREAD_STACK_DEFINE(clocks_stop_thread_id_stack, 128);
+static K_THREAD_STACK_DEFINE(clocks_stop_thread_id_stack, 512);
+
+// Wrapper function with correct signature for k_thread_entry_t
+static void clocks_stop_wrapper(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+	clocks_stop();
+}
 
 void clocks_request_stop(uint32_t delay_us)
 {
 	k_thread_create(
 		&clocks_stop_thread_id,
 		clocks_stop_thread_id_stack,
-		K_THREAD_STACK_SIZEOF(clocks_stop_thread_id),
-		(k_thread_entry_t)clocks_stop,
+		K_THREAD_STACK_SIZEOF(clocks_stop_thread_id_stack),
+		clocks_stop_wrapper,
 		NULL,
 		NULL,
 		NULL,
@@ -296,49 +323,6 @@ void clocks_request_stop(uint32_t delay_us)
 		0,
 		K_USEC(delay_us)
 	);
-}
-
-void esb_write_ack(uint8_t type)
-{
-	// This small ACK packet is crucial for receiving the PONG ACK payload
-	// ESB requires a transmission to trigger ACK payload reception
-	if (!esb_initialized || !esb_paired) {
-		return;
-	}
-	// Check ESB TX FIFO before adding packet
-	if (esb_tx_full()) {
-		LOG_WRN("TX FIFO full when queuing ACK packet, skipping this ACK");
-		// Don't try to recover here - let the main error handler deal with it
-		// Forcing recovery for every ACK is too aggressive
-		return;
-	}
-
-	// small packet with no data, just to get ack result
-	ack_payload.pipe = 1 + (tracker_id % 7);
-	ack_payload.noack = false;
-	ack_payload.length = 1;
-	ack_payload.data[0] = 0x00; // Empty payload marker
-
-	// Record ack_payload for diagnostics
-	last_tx.type = type; // ack for last sent packet type
-	last_tx.is_ack_payload = true;
-	last_tx.noack = false;
-	last_tx.length = 1;
-	last_tx.timestamp = k_uptime_get();
-
-	int ack_status = esb_write_payload(&ack_payload);
-	if (ack_status != 0) {
-		const char *err_str = "unknown";
-		if (ack_status == -ENOMEM) {
-			err_str = "ENOMEM (ESB not ready)";
-			consecutive_enomem_errors++;
-		} else if (ack_status == -ENOSPC) {
-			err_str = "ENOSPC (FIFO full)";
-		}
-		LOG_ERR("esb_write_ack: failed to queue ACK packet (err=%d %s)", ack_status, err_str);
-	} else {
-		LOG_DBG("ACK packet queued to trigger PONG reception (type=0x%02X)", type);
-	}
 }
 
 void event_handler(struct esb_evt const *event)
@@ -352,7 +336,7 @@ void event_handler(struct esb_evt const *event)
 		tx_success_count++;
 		// Reset ENOMEM error counter on successful transmission
 		consecutive_enomem_errors = 0;
-		if (esb_paired && last_tx.type != ESB_PING_TYPE) {
+		if (esb_paired) {
 			clocks_stop();
 		}
 		break;
@@ -387,13 +371,13 @@ void event_handler(struct esb_evt const *event)
 			event->tx_attempts
 		);
 
-		// Log TX statistics every 20 failures for debugging
+		// Log TX statistics every 100 failures for debugging
 		uint32_t now = k_uptime_get_32();
-		if (tx_failed_count % 20 == 0 || (now - last_log_time > get_ping_interval_ms())) {
+		if (tx_failed_count % 100 == 0 || (now - last_log_time > 5000)) {
 			last_log_time = now;
 			uint32_t total = tx_success_count + tx_failed_count;
 			uint32_t fail_rate = total > 0 ? (tx_failed_count * 100 / total) : 0;
-			LOG_WRN("TX Stats: success=%u failed=%u rate=%u%%", tx_success_count, tx_failed_count, fail_rate);
+			LOG_INF("TX Stats: success=%u failed=%u rate=%u%%", tx_success_count, tx_failed_count, fail_rate);
 		}
 
 		// Only count ping failures for connection timeout
@@ -418,7 +402,7 @@ void event_handler(struct esb_evt const *event)
 			);
 		}
 
-		if (esb_paired && last_tx.type != ESB_PING_TYPE) {
+		if (esb_paired) {
 			clocks_stop();
 		}
 		break;
@@ -575,10 +559,28 @@ void event_handler(struct esb_evt const *event)
 							(double)received_sens_data[2]
 						);
 					} else if (ping_ticks_for_this_ctr != 0) {
-						// Calculate RTT: from PING send to PONG receive
-						// Note: current_rx_ticks - ping_ticks_for_this_ctr is the full RTT
-						uint32_t ticks_diff = current_rx_ticks - ping_ticks_for_this_ctr;
-						rtt_us = k_ticks_to_us_floor32(ticks_diff);
+						// ====================================================================
+						// RTT and Server Time Offset Calculation (ESB Asymmetric Model)
+						// ====================================================================
+						// In ESB, the return path (ACK) has FIXED delay regardless of
+						// retransmissions. All retransmission time is on the forward path.
+						//
+						// No retransmit:    T1 --[air]--> T2,  T4 <--[ACK]-- T3≈T2
+						// With retransmit:  T1 --[fail]--[fail]--[air]--> T2
+						//                   T4 <--[ACK]-- T3≈T2
+						//
+						// return_delay ≈ min_rtt / 2  (constant)
+						// offset = T2 - T4 + return_delay
+						// ====================================================================
+
+						// Calculate full RTT: from PING send (T1) to PONG receive (T4)
+						uint32_t rtt_ticks = current_rx_ticks - ping_ticks_for_this_ctr;
+						rtt_us = k_ticks_to_us_floor32(rtt_ticks);
+
+						// Track minimum RTT (no-retransmission baseline)
+						if (rtt_ticks > 0 && rtt_ticks < g_min_rtt_ticks) {
+							g_min_rtt_ticks = rtt_ticks;
+						}
 
 						// log ping and rtt
 						if (rtt_us > 1000) {
@@ -592,149 +594,80 @@ void event_handler(struct esb_evt const *event)
 							LOG_DBG("PONG ok, ack rtt=%u us (ctr=%u)", (unsigned)rtt_us, rx_ctr);
 						}
 
-						if (rtt_us < 3000) {
-							// Calculate RTT in ticks for one-way delay compensation
-							uint32_t rtt_ticks = current_rx_ticks - ping_ticks_for_this_ctr;
-							// One-way delay is approximately RTT/2
-							int32_t one_way_delay_ticks = rtt_ticks / 2;
-
-							// NTP-style offset calculation: offset = (T2 - T1) - one_way_delay
-							// This removes the transmission delay from the offset
+						if (rtt_us < 5000) {
+							// Asymmetric offset: ACK return path has fixed delay
+							int32_t return_delay_ticks = (int32_t)g_min_rtt_ticks / 2;
 							int32_t server_offset_ticks
-								= (int32_t)(ping_rx_ticks - ping_ticks_for_this_ctr - one_way_delay_ticks);
-
-							// Calculate current skew contribution (drift since last sync)
-							int32_t current_skew = 0;
-							if (g_clock_skew_fixed != 0 && g_last_sync_local_ticks > 0) {
-								uint32_t elapsed = ping_ticks_for_this_ctr - g_last_sync_local_ticks;
-								current_skew = (int32_t)(((int64_t)elapsed * g_clock_skew_fixed) >> SKEW_SHIFT);
-							}
-
-							// Predict where the offset should be now, based on previous offset + drift
-							int32_t predicted_offset = g_server_ticks_offset + current_skew;
-							int32_t offset_diff = server_offset_ticks - predicted_offset;
-
-							int32_t estimated_server_ticks = (int32_t)(server_offset_ticks + sys_clock_tick_get_32());
-
-							LOG_DBG(
-								"update server offset, old: %d, pred: %d, new: %d, diff: %d (rtt=%u, skew=%d)",
-								g_server_ticks_offset,
-								predicted_offset,
-								server_offset_ticks,
-								offset_diff,
-								rtt_ticks,
-								current_skew
-							);
-							// g_last_rx_raw_ticks update moved to after skew calculation
-
-							// Calculate skew BEFORE updating g_last_sync_local_ticks
-							if (pong_flags == ESB_PONG_FLAG_NORMAL && g_time_initialized && g_last_sync_local_ticks > 0
-								&& g_last_rx_raw_ticks > 0) {
-
-								// Calculate intervals based on raw timestamps (independent of offset)
-								uint32_t local_interval = ping_ticks_for_this_ctr - g_last_sync_local_ticks;
-								uint32_t remote_interval = ping_rx_ticks - g_last_rx_raw_ticks;
-
-								// Drift = Remote Interval - Local Interval
-								// If drift < 0, remote is slower (or local is faster)
-								int32_t drift = (int32_t)(remote_interval - local_interval);
-
-								// Calculate expected drift based on current skew compensation
-								// This is what we are already compensating for
-								int32_t expected_drift
-									= (int32_t)(((int64_t)local_interval * g_clock_skew_fixed) >> SKEW_SHIFT);
-
-								// Calculate residual drift (error term)
-								// This is the drift that is NOT yet compensated
-								int32_t residual_drift = drift - expected_drift;
-
-								// Outlier detection: large deviation may indicate restart or clock jump
-								if (abs(drift) > 3000) {
-									// Reset skew on outlier - likely restart event
-									LOG_WRN(
-										"Large drift detected (%d ticks), resetting sync "
-										"(local_int=%u remote_int=%u)",
-										drift,
-										local_interval,
-										remote_interval
-									);
-									g_clock_skew_fixed = 0;
-									g_last_skew_update_time = 0;
-									g_time_initialized = false;
-								} else if (local_interval > 3200) { // Only update if interval is sufficient (> 100ms)
-									// Calculate skew error in fixed point based on RESIDUAL drift
-									int64_t diff_shifted = ((int64_t)residual_drift) << SKEW_SHIFT;
-									int32_t skew_error_fixed = (int32_t)(diff_shifted / local_interval);
-									int32_t abs_error = abs(skew_error_fixed);
-
-									// Adaptive gain control (hill-climbing algorithm)
-									// Fast descent to local minimum, then fine adjustment
-									int gain_shift;
-									const char *gain_desc;
-									if (abs_error > 1000) {
-										// Large error: fast convergence with gain 1/2
-										gain_shift = 1;
-										gain_desc = "fast";
-									} else if (abs_error > 100) {
-										// Medium error: normal adjustment with gain 1/4
-										gain_shift = 2;
-										gain_desc = "normal";
-									} else {
-										// Small error: fine tuning with gain 1/8
-										gain_shift = 3;
-										gain_desc = "fine";
-									}
-
-									// Accumulate skew error with adaptive gain
-									g_clock_skew_fixed += skew_error_fixed >> gain_shift;
-
-									g_last_skew_update_time = k_uptime_get();
-									LOG_DBG(
-										"Skew update (%s): drift=%d interval=%u error_fixed=%d total_skew_fixed=%d",
-										gain_desc,
-										drift,
-										local_interval,
-										skew_error_fixed,
-										g_clock_skew_fixed
-									);
-								}
-							}
+								= (int32_t)(ping_rx_ticks - current_rx_ticks) + return_delay_ticks;
 
 							g_last_rx_raw_ticks = ping_rx_ticks;
 							g_last_sync_local_ticks = ping_ticks_for_this_ctr;
 							g_last_sync_timestamp = k_uptime_get();
 
-							// Smooth server offset update to reject RTT jitter
-							// If not initialized, take value directly
 							if (!g_time_initialized) {
 								g_server_ticks_offset = server_offset_ticks;
+								g_skew_ref_offset = server_offset_ticks;
+								g_skew_ref_local_ticks = ping_ticks_for_this_ctr;
 								g_time_initialized = true;
+								server_time_synced = true;
 								LOG_DBG("Server offset initialized: %d ticks", server_offset_ticks);
 							} else {
-								// Large offset jump detection (> 1 second ≈ 32000 ticks)
-								// Directly reset instead of slow filtering
-								if (abs(offset_diff) > 32000) {
+								// Long-baseline skew estimation:
+								// Keep skew reference point fixed, compute total drift
+								// over growing baseline to average out RTT noise
+								uint32_t delta_from_ref = ping_ticks_for_this_ctr - g_skew_ref_local_ticks;
+
+								// Compute innovation (prediction residual) for diagnostics
+								int32_t predicted_drift = (int32_t)((int64_t)g_clock_skew_ppb * (int64_t)delta_from_ref / 1000000000LL);
+								int32_t predicted_offset = g_skew_ref_offset + predicted_drift;
+								int32_t innovation = server_offset_ticks - predicted_offset;
+
+								// Large jump detection (> 1 second ≈ 32000 ticks)
+								if (abs(innovation) > 32000) {
 									LOG_WRN(
-										"Large offset jump detected (%d ticks), resetting offset "
+										"Large offset jump detected (%d ticks), resetting "
 										"(old=%d new=%d)",
-										offset_diff,
+										innovation,
 										g_server_ticks_offset,
 										server_offset_ticks
 									);
 									g_server_ticks_offset = server_offset_ticks;
+									g_skew_ref_offset = server_offset_ticks;
+									g_skew_ref_local_ticks = ping_ticks_for_this_ctr;
+									g_clock_skew_ppb = 0;
 								} else {
-									// Filter: New = Predicted + (Target - Predicted) / 2
-									// We update from the PREDICTED value, not the old value
-									// This eliminates lag caused by the drift
-									g_server_ticks_offset = predicted_offset + (offset_diff / 2);
-									LOG_DBG("Offset update: diff=%d new_offset=%d", offset_diff, g_server_ticks_offset);
+									// Update skew from long-baseline total drift
+									// As baseline grows, RTT noise effect shrinks
+									if (delta_from_ref >= 32768) {
+										int64_t total_drift = (int64_t)(server_offset_ticks - g_skew_ref_offset);
+										int32_t raw_skew_ppb = (int32_t)(total_drift * 1000000000LL / (int64_t)delta_from_ref);
+										// Gentle EMA: long baseline already provides stability
+										g_clock_skew_ppb = g_clock_skew_ppb + (raw_skew_ppb - g_clock_skew_ppb) / 4;
+									}
+
+									// Accept raw measurement as current offset
+									g_server_ticks_offset = server_offset_ticks;
+
+									// Refresh skew reference periodically to avoid uint32 wrap
+									if (delta_from_ref > SKEW_REF_REFRESH_TICKS) {
+										g_skew_ref_offset = server_offset_ticks;
+										g_skew_ref_local_ticks = ping_ticks_for_this_ctr;
+									}
+
+									LOG_DBG("Offset update: innovation=%d offset=%d skew=%d ppb (rtt=%u min=%u)",
+										innovation, g_server_ticks_offset, g_clock_skew_ppb,
+										rtt_ticks, g_min_rtt_ticks);
 								}
 							}
 
 							server_time_synced = true;
 
-							// Convert to ms for human-readable display
-							uint32_t server_time_ms = k_ticks_to_ms_near32(estimated_server_ticks);
+							// Display skew-compensated estimated server time
+							uint32_t local_now = sys_clock_tick_get_32();
+							uint32_t elapsed_since_meas = local_now - ping_ticks_for_this_ctr;
+							int32_t skew_corr = (int32_t)((int64_t)g_clock_skew_ppb * elapsed_since_meas / 1000000000LL);
+							uint32_t est_ticks = (uint32_t)((int32_t)g_server_ticks_offset + (int32_t)local_now + skew_corr);
+							uint32_t server_time_ms = k_ticks_to_ms_near32(est_ticks);
 							uint32_t server_ms = server_time_ms % 1000;
 							uint32_t server_s = (server_time_ms / 1000) % 60;
 							uint32_t server_m = (server_time_ms / 60000) % 60;
@@ -745,7 +678,7 @@ void event_handler(struct esb_evt const *event)
 								server_m,
 								server_s,
 								server_ms,
-								estimated_server_ticks
+								est_ticks
 							);
 						}
 					} else {
@@ -786,6 +719,15 @@ void event_handler(struct esb_evt const *event)
 							case ESB_PONG_FLAG_MAG_CLEAR:
 								cmd_name = "MAG_CLEAR";
 								break;
+							case ESB_PONG_FLAG_MAG_CAL:
+								cmd_name = "MAG_CAL";
+								break;
+							case ESB_PONG_FLAG_MAG_ON:
+								cmd_name = "MAG_ON";
+								break;
+							case ESB_PONG_FLAG_MAG_OFF:
+								cmd_name = "MAG_OFF";
+								break;
 							case ESB_PONG_FLAG_REBOOT:
 								cmd_name = "REBOOT";
 								break;
@@ -825,6 +767,27 @@ void event_handler(struct esb_evt const *event)
 							case ESB_PONG_FLAG_PING:
 								cmd_name = "PING";
 								break;
+							case ESB_PONG_FLAG_FUSION_RESET:
+								cmd_name = "FUSION_RESET";
+								break;
+							case ESB_PONG_FLAG_TCAL_BOOT_ON:
+								cmd_name = "TCAL_BOOT_ON";
+								break;
+							case ESB_PONG_FLAG_TCAL_BOOT_OFF:
+								cmd_name = "TCAL_BOOT_OFF";
+								break;
+							case ESB_PONG_FLAG_TCAL_ON:
+								cmd_name = "TCAL_ON";
+								break;
+							case ESB_PONG_FLAG_TCAL_OFF:
+								cmd_name = "TCAL_OFF";
+								break;
+							case ESB_PONG_FLAG_TDMA_ON:
+								cmd_name = "TDMA_ON";
+								break;
+							case ESB_PONG_FLAG_TDMA_OFF:
+								cmd_name = "TDMA_OFF";
+								break;
 							}
 							if (pong_flags == ESB_PONG_FLAG_SET_CHANNEL) {
 								LOG_INF(
@@ -853,6 +816,9 @@ void event_handler(struct esb_evt const *event)
 						}
 					}
 				}
+			} break;
+			case ESB_SENSOR_DATA_LEN: {
+				// received other tracker's sensor data, likely due to shared pipe, just ignore
 			} break;
 			default:
 				LOG_WRN("Ignoring invalid payload length %u", rx_payload.length);
@@ -891,11 +857,11 @@ int esb_initialize(bool tx)
 		// config.crc = ESB_CRC_16BIT;
 		config.tx_output_power = CONFIG_RADIO_TX_POWER;
 		config.retransmit_delay = RADIO_RETRANSMIT_DELAY;
-		config.retransmit_count = CONNECTION_ENABLE_ACK ? 2 : 5;
-		// config.tx_mode = ESB_TXMODE_AUTO;
-		// config.payload_length = 32;
+		config.retransmit_count = 2;
+		config.tx_mode = ESB_TXMODE_MANUAL_START;
+		// config.payload_length = 252; // config by CONFIG_ESB_MAX_PAYLOAD_LENGTH
 		config.selective_auto_ack = true;
-		// config.use_fast_ramp_up = true;
+		config.use_fast_ramp_up = true;
 	} else {
 		config.protocol = ESB_PROTOCOL_ESB_DPL;
 		config.mode = ESB_MODE_PRX;
@@ -906,9 +872,9 @@ int esb_initialize(bool tx)
 		config.retransmit_delay = RADIO_RETRANSMIT_DELAY;
 		// config.retransmit_count = 3;
 		// config.tx_mode = ESB_TXMODE_AUTO;
-		// config.payload_length = 32;
+		// config.payload_length = 252; // config by CONFIG_ESB_MAX_PAYLOAD_LENGTH
 		config.selective_auto_ack = true;
-		// config.use_fast_ramp_up = true;
+		config.use_fast_ramp_up = true;
 	}
 
 	err = esb_init(&config);
@@ -1090,6 +1056,10 @@ void esb_pair(void)
 			esb_flush_rx();
 			esb_flush_tx();
 			pair_ack_pending = false; // Reset before sending
+
+			/* Feed ESB watchdog during pairing to prevent timeout */
+			watchdog_feed(WDT_CHANNEL_ESB);
+
 			if (esb_send_pair_step(0)) {
 				k_msleep(100);
 				continue;
@@ -1152,7 +1122,7 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	}
 	if (!clock_status) {
 		clocks_start();
-		k_usleep(400);
+		k_usleep(50);
 	}
 	if (data_length < 1) {
 		LOG_ERR("Invalid data length %u", data_length);
@@ -1193,16 +1163,19 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 
 	// Record this packet for TX_FAILED diagnostics
 	last_tx.type = data[0];
-	last_tx.is_ack_payload = false;
 	last_tx.noack = no_ack;
 	last_tx.length = data_length;
 	last_tx.timestamp = k_uptime_get();
 
 	// Try to queue the packet
-	esb_flush_tx();
 	int queue_status = esb_write_payload(&tx_payload);
+	// only flush if tx full
+	if (queue_status == -ENOMEM) {
+		esb_flush_tx();
+		queue_status = esb_write_payload(&tx_payload);
+	}
 
-	// if sending ping packet, we need send another small packet to get ack result asap
+	// Record ping history for RTT calculation
 	if (data[0] == ESB_PING_TYPE && queue_status == 0 && data_length == ESB_PING_LEN) {
 		uint8_t this_ctr = tx_payload.data[2];
 		ping_history[ping_history_idx].counter = this_ctr;
@@ -1216,7 +1189,6 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		ping_history_idx = (ping_history_idx + 1) % PING_HISTORY_SIZE;
 
 		last_tx_time = k_uptime_get();
-		esb_write_ack(ESB_PING_TYPE);
 	} else if (tx_payload.data[0] == ESB_PING_TYPE && queue_status != 0) {
 		// PING failed to queue - this is critical!
 		const char *err_str = "unknown";
@@ -1309,6 +1281,17 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		esb_write_queued++;
 	}
 
+	/*
+	 * TDMA slot gating for noack sensor-data packets.
+	 *
+	 * PING / ACK packets bypass TDMA (no_ack == false) so time-sync and
+	 * connection-health probes are never delayed.
+	 */
+#if CONFIG_CONNECTION_TDMA
+	if (no_ack) {
+		tdma_wait_for_slot();
+	}
+#endif
 	esb_start_tx();
 	send_data = true;
 }
@@ -1342,15 +1325,12 @@ uint64_t esb_get_server_time_ticks_64(void)
 		return 0;
 	}
 
-	int64_t skew_correction = 0;
-	if (g_clock_skew_fixed != 0) {
-		uint32_t current_ticks = sys_clock_tick_get_32();
-		// Calculate elapsed time since last sync point
-		uint32_t elapsed = current_ticks - g_last_sync_local_ticks;
-		skew_correction = ((int64_t)elapsed * g_clock_skew_fixed) >> SKEW_SHIFT;
-	}
-
-	return g_server_ticks_offset + sys_clock_tick_get_32() + skew_correction;
+	uint32_t local_now = sys_clock_tick_get_32();
+	// Apply clock skew compensation only for time elapsed since last PONG
+	// (g_server_ticks_offset already incorporates all drift up to last measurement)
+	uint32_t elapsed = local_now - g_last_sync_local_ticks;
+	int32_t skew_correction = (int32_t)((int64_t)g_clock_skew_ppb * elapsed / 1000000000LL);
+	return (uint32_t)(g_server_ticks_offset + local_now) + skew_correction;
 }
 
 uint64_t esb_get_server_time_us_64(void)
@@ -1376,8 +1356,14 @@ static void esb_thread(void)
 	int64_t start_time = k_uptime_get();
 #endif
 
+	/* Register ESB thread with watchdog */
+	watchdog_register_thread(WDT_CHANNEL_ESB, 0);
+
 	// Read paired address from retained
 	memcpy(paired_addr, retained->paired_addr, sizeof(paired_addr));
+
+	clocks_request_start(0);
+	clock_init_external_async();
 
 	while (1) {
 #if CONFIG_CONNECTION_OVER_HID
@@ -1447,12 +1433,42 @@ static void esb_thread(void)
 					break;
 
 				case ESB_PONG_FLAG_MAG_CLEAR:
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(mag), okay)
 					LOG_INF("Executing remote command: MAG_CLEAR");
 					sensor_calibration_clear_mag(NULL, true);
-#else
-					LOG_WRN("Remote command: MAG_CLEAR not supported (no magnetometer)");
-#endif
+					break;
+
+				case ESB_PONG_FLAG_MAG_CAL:
+					LOG_INF("Executing remote command: MAG_CAL");
+					sensor_calibration_clear_mag(NULL, true);
+					sensor_request_calibration_mag();
+					break;
+
+				case ESB_PONG_FLAG_MAG_ON:
+					LOG_INF("Executing remote command: MAG_ON");
+					sensor_set_mag_enabled(true);
+					break;
+
+				case ESB_PONG_FLAG_MAG_OFF:
+					LOG_INF("Executing remote command: MAG_OFF");
+					sensor_set_mag_enabled(false);
+					break;
+
+				case ESB_PONG_FLAG_TCAL_ON:
+					LOG_INF("TODO: Executing remote command: TCAL_ON");
+					break;
+
+				case ESB_PONG_FLAG_TCAL_OFF:
+					LOG_INF("TODO: Executing remote command: TCAL_OFF");
+					break;
+
+				case ESB_PONG_FLAG_TDMA_ON:
+					LOG_INF("Executing remote command: TDMA_ON");
+					tdma_set_enabled(true);
+					break;
+
+				case ESB_PONG_FLAG_TDMA_OFF:
+					LOG_INF("Executing remote command: TDMA_OFF");
+					tdma_set_enabled(false);
 					break;
 
 				case ESB_PONG_FLAG_REBOOT:
@@ -1553,7 +1569,7 @@ static void esb_thread(void)
 					break;
 
 				case ESB_PONG_FLAG_TCAL_AUTO_ON:
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 					LOG_INF("Executing remote command: TCAL_AUTO_ON");
 					sensor_tcal_set_auto_calibration(true);
 #else
@@ -1562,7 +1578,7 @@ static void esb_thread(void)
 					break;
 
 				case ESB_PONG_FLAG_TCAL_AUTO_OFF:
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 					LOG_INF("Executing remote command: TCAL_AUTO_OFF");
 					sensor_tcal_set_auto_calibration(false);
 #else
@@ -1573,6 +1589,29 @@ static void esb_thread(void)
 				case ESB_PONG_FLAG_PING:
 					LOG_INF("Executing remote command: PING");
 					cmd_ping_start();
+					break;
+
+				case ESB_PONG_FLAG_FUSION_RESET:
+					LOG_INF("Executing remote command: FUSION_RESET");
+					cmd_fusion_reset();
+					break;
+
+				case ESB_PONG_FLAG_TCAL_BOOT_ON:
+#if CONFIG_SENSOR_USE_TCAL
+					LOG_INF("Executing remote command: TCAL_BOOT_ON");
+					sensor_boot_cal_set_enabled(true);
+#else
+					LOG_WRN("Remote command: TCAL_BOOT_ON not supported (T-Cal disabled in config)");
+#endif
+					break;
+
+				case ESB_PONG_FLAG_TCAL_BOOT_OFF:
+#if CONFIG_SENSOR_USE_TCAL
+					LOG_INF("Executing remote command: TCAL_BOOT_OFF");
+					sensor_boot_cal_set_enabled(false);
+#else
+					LOG_WRN("Remote command: TCAL_BOOT_OFF not supported (T-Cal disabled in config)");
+#endif
 					break;
 
 				default:
@@ -1604,6 +1643,9 @@ static void esb_thread(void)
 				);
 			}
 		}
+
+		/* Feed watchdog at end of each loop iteration */
+		watchdog_feed(WDT_CHANNEL_ESB);
 
 		k_msleep(100);
 	}

@@ -4,9 +4,9 @@
 #include "sensor/sensor.h"
 #include "sensor/calibration.h"
 #include "connection/esb.h"
+#include "connection/tdma.h"
 #include "build_defines.h"
-#include <zephyr/sys/printk.h>
-#include <math.h>
+#include "zephyr/sys/printk.h"
 
 #if CONFIG_USB_DEVICE_STACK
 #define USB DT_NODELABEL(usbd)
@@ -204,6 +204,7 @@ static void print_board(void)
 	printk(CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT "\n");
 #endif
 	printk(FW_STRING);
+	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
 
 	printk("\nBoard: " CONFIG_BOARD "\n");
 	printk("SOC: " CONFIG_SOC "\n");
@@ -218,20 +219,26 @@ static void print_sensor(void)
 	}
 	printk("Address: 0x%02X%02X\n", retained->imu_addr, retained->imu_reg);
 
-#if SENSOR_MAG_EXISTS
 	printk(
-		"\nMagnetometer: %s\n",
-		(retained->mag_addr & 0x7F) != 0x7F ? sensor_get_sensor_mag_name() : "Not searching"
+		"\nMagnetometer: %s (%s)\n",
+		(retained->mag_addr & 0x7F) != 0x7F ? sensor_get_sensor_mag_name() : "Not searching",
+		sensor_get_mag_enabled() ? "enabled" : "disabled"
 	);
 	if (retained->mag_reg != 0xFF) {
-		printk(
-			"Interface: %s%s\n",
-			(retained->mag_reg & 0x80) ? "SPI" : "I2C",
-			(retained->mag_addr & 0x80) ? ", external" : ""
-		);
+		const char *mag_interface;
+		if (retained->mag_addr & 0x80) {
+			// External magnetometer (via IMU I2CM or passthrough)
+			if (retained->imu_reg & 0x80) {
+				mag_interface = "EXT (SPI IMU I2CM)";
+			} else {
+				mag_interface = "I2C (passthrough)";
+			}
+		} else {
+			mag_interface = (retained->mag_reg & 0x80) ? "SPI" : "I2C";
+		}
+		printk("Interface: %s\n", mag_interface);
 	}
 	printk("Address: 0x%02X%02X\n", retained->mag_addr, retained->mag_reg);
-#endif
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	printk("\nAccelerometer matrix:\n");
@@ -308,7 +315,7 @@ static void print_sensor(void)
 		(double)retained->gyroBias[1],
 		(double)retained->gyroBias[2]
 	);
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	// Display the real-time calculated gyro offset
 	float current_gyro_offset[3];
 	sensor_calibration_get_last_gyro_offset(current_gyro_offset);
@@ -320,7 +327,6 @@ static void print_sensor(void)
 		(double)sensor_get_current_imu_temperature()
 	);
 #endif
-#if SENSOR_MAG_EXISTS
 	//	printk("Magnetometer bridge offset: %.5f %.5f %.5f\n", (double)retained->magBias[0],
 	//(double)retained->magBias[1], (double)retained->magBias[2]);
 	printk("Magnetometer matrix:\n");
@@ -333,10 +339,10 @@ static void print_sensor(void)
 			(double)retained->magBAinv[3][i]
 		);
 	}
-#endif
 
 	printk("\nFusion: %s\n", sensor_get_sensor_fusion_name());
 
+#if CONFIG_SENSOR_RANGE_STATS
 	// Display runtime range statistics summary
 	const sensor_range_stats_t *stats = sensor_get_range_stats();
 	if (stats->initialized) {
@@ -353,6 +359,7 @@ static void print_sensor(void)
 		printk("  Accel: %.3f g\n", (double)accel_peak);
 		printk("  Samples: %llu (use 'range' for details)\n", stats->sample_count);
 	}
+#endif // CONFIG_SENSOR_RANGE_STATS
 }
 
 static void print_sens_calibration_info(void)
@@ -586,14 +593,15 @@ static void print_help(void)
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	printk("  6-side                     Calibrate 6-side accelerometer\n");
 #endif
-#if SENSOR_MAG_EXISTS
-	printk("  mag                        Clear magnetometer calibration\n");
-#endif
+	printk("  mag                        Show magnetometer status\n");
+	printk("  mag on|off                 Enable/disable magnetometer\n");
+	printk("  mag clear                  Clear magnetometer calibration\n");
+	printk("  mag cal                    Start magnetometer calibration\n");
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 	printk("  sens <x>,<y>,<z>           Set gyro sensitivity (deg diff over %u rev)\n", (int)CONFIG_SENSOR_SENS_REV);
 	printk("  sens reset                 Reset gyro sensitivity calibration\n");
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	// Update the help string to show the new command set
 	printk("  tcal <status|dump|test temp|remove index|auto on|auto off> Temperature calibration\n");
 #endif
@@ -602,6 +610,7 @@ static void print_help(void)
 	printk("  set <address>              Manually set receiver\n");
 	printk("  pair                       Enter pairing mode\n");
 	printk("  clear                      Clear pairing data\n");
+	printk("  tdma <on|off>              Enable/disable TDMA scheduling\n");
 	printk("\n");
 	printk("RF Channel:\n");
 	printk("  channel <0-100>            Set RF channel (saved to NVS)\n");
@@ -615,6 +624,7 @@ static void print_help(void)
 #endif
 	printk("\n");
 	printk("Other:\n");
+	printk("  ping                       Flash LED (same as remote PING command)\n");
 	printk("  meow                       Meow!\n");
 	printk("  help                       Show this help message\n");
 	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 10s)\n");
@@ -629,15 +639,128 @@ static void print_help(void)
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 	printk("  reset sens                 Reset gyro sensitivity calibration\n");
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	printk("  reset tcal                 Reset temperature calibration\n");
 #endif
-#if SENSOR_MAG_EXISTS
 	printk("  reset mag                  Reset magnetometer calibration\n");
-#endif
 	printk("  reset bat                  Reset battery tracker\n");
 	printk("  reset all                  Clear all settings\n");
 	printk("\n");
+}
+
+// --- Command Implementations ---
+
+void cmd_sens_set(float x, float y, float z)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (retained) {
+		float deg_x = x;
+		float deg_y = y;
+		float deg_z = z;
+
+		float den_x = 1.0f - (deg_x / (360.0f * CONFIG_SENSOR_SENS_REV));
+		float den_y = 1.0f - (deg_y / (360.0f * CONFIG_SENSOR_SENS_REV));
+		float den_z = 1.0f - (deg_z / (360.0f * CONFIG_SENSOR_SENS_REV));
+
+		// Prevent division by zero or near-zero
+		if (fabsf(den_x) < 1e-6f || fabsf(den_y) < 1e-6f || fabsf(den_z) < 1e-6f) {
+			printk("Error: Invalid input degrees leading to division by zero. Calibration not applied.\n");
+		} else {
+			retained->gyroSensScale[0] = 1.0f / den_x;
+			retained->gyroSensScale[1] = 1.0f / den_y;
+			retained->gyroSensScale[2] = 1.0f / den_z;
+			retained_update();
+			sys_write(
+				MAIN_GYRO_SENS_ID,
+				&retained->gyroSensScale,
+				retained->gyroSensScale,
+				sizeof(retained->gyroSensScale)
+			);
+			printk(
+				"Gyro sensitivity difference set to: %.3f, %.3f, %.3f\n",
+				(double)deg_x,
+				(double)deg_y,
+				(double)deg_z
+			);
+		}
+	} else {
+		printk("Error: Retained data not available.\n");
+	}
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_sens_reset(void)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (retained) {
+		printk("Resetting gyro sensitivity calibration.\n");
+		retained->gyroSensScale[0] = 1.0f;
+		retained->gyroSensScale[1] = 1.0f;
+		retained->gyroSensScale[2] = 1.0f;
+		retained_update(); // Save changes
+		sys_write(
+			MAIN_GYRO_SENS_ID,
+			&retained->gyroSensScale,
+			retained->gyroSensScale,
+			sizeof(retained->gyroSensScale)
+		);
+		printk("Gyro sensitivity reset.\n");
+	} else {
+		printk("Error: Retained data not available.\n");
+	}
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_reset_zro(void)
+{
+	sensor_calibration_clear(NULL, NULL, true);
+	// Manual command: invalidate fusion to force quaternion recalculation
+	sensor_fusion_invalidate();
+}
+
+void cmd_reset_acc(void)
+{
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+	sensor_calibration_clear_6_side(NULL, true);
+#else
+	printk("Error: 6-side calibration not enabled.\n");
+#endif
+}
+
+void cmd_reset_tcal(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_tcal_clear();
+#else
+	printk("Error: Temperature calibration not enabled.\n");
+#endif
+}
+
+void cmd_reset_bat(void)
+{
+	sys_reset_battery_tracker();
+}
+
+void cmd_fusion_reset(void)
+{
+	printk("Resetting fusion (invalidating quaternion).\n");
+	sensor_fusion_invalidate();
+	printk("Fusion reset complete.\n");
+}
+
+void cmd_bat_debug(void)
+{
+	sys_print_battery_tracker_debug();
+}
+
+void cmd_ping_start(void)
+{
+	printk("Ping received! Flashing LED.\n");
+	set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
 }
 
 static void console_thread(void)
@@ -682,6 +805,7 @@ static void console_thread(void)
 	printk("*** " CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT " ***\n");
 #endif
 	printk(FW_STRING);
+	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
 
 	// Print help on startup
 	print_help();
@@ -700,9 +824,7 @@ static void console_thread(void)
 	uint8_t command_6_side[] = "6-side";
 #endif
 
-#if SENSOR_MAG_EXISTS
 	uint8_t command_mag[] = "mag";
-#endif
 
 	uint8_t command_set[] = "set";
 	uint8_t command_pair[] = "pair";
@@ -714,12 +836,13 @@ static void console_thread(void)
 	uint8_t command_dfu[] = "dfu";
 #endif
 
+	uint8_t command_ping[] = "ping";
 	uint8_t command_meow[] = "meow";
 
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 	uint8_t command_sens[] = "sens";
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	uint8_t command_tcal[] = "tcal";
 #endif
 	// debug
@@ -728,16 +851,15 @@ static void console_thread(void)
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	uint8_t command_reset_arg_acc[] = "acc";
 #endif
-#if SENSOR_MAG_EXISTS
 	uint8_t command_reset_arg_mag[] = "mag";
-#endif
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 	uint8_t command_reset_arg_sens[] = "sens";
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 	uint8_t command_reset_arg_tcal[] = "tcal";
 #endif
 	uint8_t command_reset_arg_bat[] = "bat";
+	uint8_t command_reset_arg_fusion[] = "fusion";
 	uint8_t command_reset_arg_all[] = "all";
 
 	while (1) {
@@ -810,20 +932,20 @@ static void console_thread(void)
 			}
 		}
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 		else if (memcmp(line, command_tcal, sizeof(command_tcal)) == 0) {
 			// check if there are any arguments
 			if (arg == NULL) {
-				printk("Error: Missing argument. Use: tcal <status|clear|dump|test temp|remove index|check|auto on|auto off>\n");
+				printk("Error: Missing argument. Use: tcal <status|clear|dump|test temp|remove index|check|auto on|auto off|boot [on|off]>\n");
 			} else {
 				// Tokenize the argument string by space to get the subcommand
 				char *subcmd = strtok((char *)arg, " ");
 
 				if (subcmd == NULL) {
 					// Handling case where arg might contain only spaces
-					printk("Error: Missing argument. Use: tcal <status|clear|dump|test temp|remove index|check|auto on|auto off>\n");
+					printk("Error: Missing argument. Use: tcal <status|clear|dump|test temp|remove index|check|auto on|auto off|boot [on|off]>\n");
 				} else if (strcmp(subcmd, "status") == 0) {
-					sensor_tcal_status_poly();
+					sensor_tcal_status();
 					printk("Auto-calibration: %s\n", sensor_tcal_get_auto_calibration() ? "enabled" : "disabled");
 				} else if (strcmp(subcmd, "clear") == 0) {
 					cmd_reset_tcal();
@@ -945,8 +1067,33 @@ static void console_thread(void)
 							printk("Status: No calibration data available (auto-cal will trigger)\n");
 						}
 					}
+				} else if (strcmp(subcmd, "boot") == 0) {
+					char *boot_arg = strtok(NULL, " ");
+					if (boot_arg == NULL) {
+						// Show current boot calibration status
+						printk("Boot Calibration Status:\n");
+						printk("  Enabled: %s\n", retained->bootCalState.enabled ? "yes" : "no");
+						printk("  Completed: %s\n", retained->bootCalState.completed ? "yes" : "no");
+						printk("  Attempts: %u\n", retained->bootCalState.attempt_count);
+						printk("  D_offset valid: %s\n", retained->bootCalState.doffset_valid ? "yes" : "no");
+						if (retained->bootCalState.doffset_valid) {
+							printk("  D_offset: [%.5f, %.5f, %.5f] dps\n",
+								(double)retained->bootCalState.doffset[0],
+								(double)retained->bootCalState.doffset[1],
+								(double)retained->bootCalState.doffset[2]);
+						}
+						printk("\nUsage: tcal boot <on|off>\n");
+					} else if (strcmp(boot_arg, "on") == 0) {
+						sensor_boot_cal_set_enabled(true);
+						printk("Boot calibration enabled. Will calibrate on next boot.\n");
+					} else if (strcmp(boot_arg, "off") == 0) {
+						sensor_boot_cal_set_enabled(false);
+						printk("Boot calibration disabled.\n");
+					} else {
+						printk("Error: Invalid argument '%s'. Use: tcal boot <on|off>\n", boot_arg);
+					}
 				} else {
-					printk("Error: Invalid argument '%s'. Use: <status|clear|dump|test temp|remove index|check|auto on|auto off>\n", subcmd);
+					printk("Error: Invalid argument '%s'. Use: <status|clear|dump|test temp|remove index|check|auto on|auto off|boot on|boot off>\n", subcmd);
 				}
 			}
 		}
@@ -956,11 +1103,31 @@ static void console_thread(void)
 			sensor_request_calibration_6_side();
 		}
 #endif
-#if SENSOR_MAG_EXISTS
 		else if (memcmp(line, command_mag, sizeof(command_mag)) == 0) {
-			sensor_calibration_clear_mag(NULL, true);
+			if (arg == NULL) {
+				// No argument: show status
+				printk("Magnetometer: %s\n", sensor_get_mag_enabled() ? "enabled" : "disabled");
+				printk("Hardware: %s\n", sensor_get_sensor_mag_name());
+			} else {
+				char *subcmd = strtok((char *)arg, " ");
+				if (strcmp(subcmd, "on") == 0) {
+					printk("Enabling magnetometer\n");
+					sensor_set_mag_enabled(true);
+				} else if (strcmp(subcmd, "off") == 0) {
+					printk("Disabling magnetometer\n");
+					sensor_set_mag_enabled(false);
+				} else if (strcmp(subcmd, "clear") == 0) {
+					sensor_calibration_clear_mag(NULL, true);
+					printk("Magnetometer calibration cleared\n");
+				} else if (strcmp(subcmd, "cal") == 0 || strcmp(subcmd, "calibrate") == 0) {
+					sensor_calibration_clear_mag(NULL, true);
+					sensor_request_calibration_mag();
+					printk("Magnetometer calibration started\n");
+				} else {
+					printk("Usage: mag [on|off|clear|cal]\n");
+				}
+			}
 		}
-#endif
 		else if (memcmp(line, command_set, sizeof(command_set)) == 0) {
 			uint64_t addr = strtoull(arg, NULL, 16);
 			uint8_t buf[17];
@@ -1029,14 +1196,18 @@ static void console_thread(void)
 #endif
 		}
 #endif
+		else if (memcmp(line, command_ping, sizeof(command_ping)) == 0) {
+			cmd_ping_start();
+		}
 		else if (memcmp(line, command_meow, sizeof(command_meow)) == 0) {
 			print_meow();
 		} else if (memcmp(line, command_debug, sizeof(command_debug)) == 0) {
 			uint32_t duration = 1; // Default 1 second
 			if (arg) {
 				char *endptr;
-				long dur = strtol((char *)arg, &endptr, 10);
-				if (endptr != arg && *endptr == '\0' && dur >= 1 && dur <= 60) {
+				char *arg_char = (char *)arg;
+				long dur = strtol(arg_char, &endptr, 10);
+				if (endptr != arg_char && *endptr == '\0' && dur >= 1 && dur <= 60) {
 					duration = (uint32_t)dur;
 				} else {
 					printk("Invalid duration (1-60s). Using default 1 seconds.\n");
@@ -1044,13 +1215,17 @@ static void console_thread(void)
 			}
 			sensor_debug_start(duration);
 		} else if (memcmp(line, command_range, sizeof(command_range)) == 0) {
+#if CONFIG_SENSOR_RANGE_STATS
 			if (arg && strcmp((char *)arg, "reset") == 0) {
 				sensor_reset_range_stats();
 				printk("Sensor range statistics have been reset.\n");
 			} else {
 				sensor_print_range_stats();
 			}
-		} else if (memcmp(line, command_reset, sizeof(command_reset)) == 0) {
+#else
+			printk("Sensor range statistics not enabled in configuration.\n");
+#endif // CONFIG_SENSOR_RANGE_STATS
+		}	else if (memcmp(line, command_reset, sizeof(command_reset)) == 0) {
 			if (arg && memcmp(arg, command_reset_arg_zro, sizeof(command_reset_arg_zro)) == 0) {
 				cmd_reset_zro();
 			}
@@ -1059,27 +1234,37 @@ static void console_thread(void)
 				cmd_reset_acc();
 			}
 #endif
-#if SENSOR_MAG_EXISTS
 			else if (arg && memcmp(arg, command_reset_arg_mag, sizeof(command_reset_arg_mag)) == 0) {
 				sensor_calibration_clear_mag(NULL, true);
 			}
-#endif
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 			else if (arg && memcmp(arg, command_reset_arg_sens, sizeof(command_reset_arg_sens)) == 0) {
 				cmd_sens_reset();
 			}
 #endif
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 			else if (arg && memcmp(arg, command_reset_arg_tcal, sizeof(command_reset_arg_tcal)) == 0) {
 				cmd_reset_tcal();
 			}
 #endif
 			else if (arg && memcmp(arg, command_reset_arg_bat, sizeof(command_reset_arg_bat)) == 0) {
 				cmd_reset_bat();
+			} else if (arg && memcmp(arg, command_reset_arg_fusion, sizeof(command_reset_arg_fusion)) == 0) {
+				cmd_fusion_reset();
 			} else if (arg && memcmp(arg, command_reset_arg_all, sizeof(command_reset_arg_all)) == 0) {
 				sys_clear();
 			} else {
 				printk("Invalid argument\n");
+			}
+		} else if (memcmp(line, "tdma", 4) == 0) {
+			if (arg && strcmp((char *)arg, "on") == 0) {
+				tdma_set_enabled(true);
+				printk("TDMA enabled\n");
+			} else if (arg && strcmp((char *)arg, "off") == 0) {
+				tdma_set_enabled(false);
+				printk("TDMA disabled\n");
+			} else {
+				printk("TDMA: %s\n", tdma_is_enabled() ? "enabled" : "disabled");
 			}
 		} else {
 			printk("Unknown command\n");

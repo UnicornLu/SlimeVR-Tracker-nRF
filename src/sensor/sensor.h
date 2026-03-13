@@ -28,6 +28,7 @@
 const char* sensor_get_sensor_imu_name(void);
 const char* sensor_get_sensor_mag_name(void);
 const char* sensor_get_sensor_fusion_name(void);
+bool sensor_is_initialized(void);
 
 int sensor_get_sensor_temperature(float *);
 
@@ -43,6 +44,10 @@ void sensor_retained_write(void);
 void sensor_shutdown(void);
 uint8_t sensor_setup_WOM(void);
 
+void sensor_set_mag_enabled(bool enabled);
+bool sensor_get_mag_enabled(void);
+void sensor_refresh_sensor_ids(void);
+
 void sensor_fusion_invalidate(void);
 void sensor_fusion_update_bias(float *g_off);
 
@@ -52,7 +57,7 @@ void main_imu_resume(void);
 void main_imu_wakeup(void);
 void main_imu_restart(void);
 
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
+#if CONFIG_SENSOR_USE_TCAL
 float sensor_get_current_imu_temperature(void);
 #endif
 
@@ -65,6 +70,7 @@ void sensor_debug_start(uint32_t duration_sec);
 void sensor_debug_stop(void);
 bool sensor_debug_is_active(void);
 
+#if CONFIG_SENSOR_RANGE_STATS
 // Sensor range tracking - records min/max values during runtime (not persisted)
 typedef struct {
 	float gyro_max[3];   // Maximum gyro values per axis (deg/s)
@@ -81,6 +87,7 @@ const sensor_range_stats_t* sensor_get_range_stats(void);
 void sensor_reset_range_stats(void);
 // Print range statistics to console
 void sensor_print_range_stats(void);
+#endif // CONFIG_SENSOR_RANGE_STATS
 
 typedef struct sensor_fusion {
 	void (*init)(float, float, float);  // gyro_time, accel_time, mag_time
