@@ -47,6 +47,7 @@
 #define IIM42652_INT_SOURCE1               0x66
 
 #define IIM42652_REG_BANK_SEL              0x76
+#define IIM42652_WHO_AM_I                  0x75
 
 // User Bank 1
 #define IIM42652_INTF_CONFIG5              0x7B

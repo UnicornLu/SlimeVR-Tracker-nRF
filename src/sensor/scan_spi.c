@@ -28,6 +28,7 @@ LOG_MODULE_REGISTER(sensor_scan_spi, LOG_LEVEL_DBG);
 
 int sensor_scan_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg, int dev_addr_count, const uint8_t dev_reg[], const uint8_t dev_id[], const int dev_ids[])
 {
+	LOG_INF("Starting SPI scan, dev_addr_count=%d, preferred_reg=0x%02X", dev_addr_count, *spi_dev_reg);
 	uint8_t buf[3] = {0};
 	struct spi_buf tx_buf = {.len = 1};
 	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
@@ -53,25 +54,31 @@ int sensor_scan_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg, int dev_addr_
 			if (*spi_dev_reg == 0xFF || *spi_dev_reg == reg)
 			{
 				uint8_t id;
-				tx_buf.buf = &reg;
-				reg |= 0x80; // set read bit
-				LOG_DBG("Scanning register: 0x%02X", reg);
+				uint8_t reg_read = reg | 0x80; // set read bit for SPI
+				tx_buf.buf = &reg_read;
+				LOG_INF("Scanning register: 0x%02X (read: 0x%02X)", reg, reg_read);
 				// TODO: BMM150 workaround?
 				int err = spi_transceive_dt(bus, &tx, &rx);
-				LOG_DBG("err: %d", err);
-				id = buf[1] ? buf[1] : buf[2]; // ID may be in first byte, or skip one byte (such as BMI270)
-				LOG_DBG("Read value: 0x%02X, 0x%02X, 0x%02X (0x%02X)", buf[0], buf[1], buf[2], id);
+				LOG_INF("SPI err: %d, Read value: 0x%02X, 0x%02X, 0x%02X", err, buf[0], buf[1], buf[2]);
 				if (err)
+				{
+					LOG_WRN("SPI communication error %d, skipping register 0x%02X", err, reg);
 					continue;
+				}
+				// Try different positions for ID value (some sensors return ID in different bytes)
+				// For most sensors, ID is in buf[1], but some may have it in buf[2] or buf[0]
+				id = buf[1] ? buf[1] : (buf[2] ? buf[2] : buf[0]);
+				LOG_INF("Extracted ID: 0x%02X (from buf[1]=0x%02X, buf[2]=0x%02X, buf[0]=0x%02X)", id, buf[1], buf[2], buf[0]);
 				for (int l = 0; l < id_cnt; l++)
 				{
 					if (id == dev_id[id_ind + l])
 					{
-						*spi_dev_reg = reg;
+						*spi_dev_reg = reg_read;
 						LOG_INF("Valid device found using register: 0x%02X (value: 0x%02X)", reg, id);
 						return dev_ids[fnd_id + l];
 					}
 				}
+				LOG_INF("ID 0x%02X does not match any expected values for register 0x%02X", id, reg);
 			}
 			id_ind += id_cnt;
 			fnd_id += id_cnt;
@@ -92,10 +99,11 @@ int sensor_scan_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg, int dev_addr_
 
 	if (*spi_dev_reg != 0xFF) // preferred register failed, try again with full scan
 	{
-		LOG_WRN("No device found using register: 0x%02X", *spi_dev_reg);
+		LOG_WRN("No device found using preferred register: 0x%02X, retrying full scan", *spi_dev_reg);
 		*spi_dev_reg = 0xFF;
 		return sensor_scan_spi(bus, spi_dev_reg, dev_addr_count, dev_reg, dev_id, dev_ids);
 	}
 
+	LOG_WRN("SPI scan completed, no device found");
 	return -1;
 }

@@ -71,6 +71,7 @@ static uint8_t get_server_constant_tracker_status(int status) __attribute__((unu
 #define SVR_IMU_ICM45605 17
 #define SVR_IMU_ADC_RESISTANCE 18
 #define SVR_IMU_IIM42652 19
+#define SVR_IMU_ICM42686P 20
 #define SVR_IMU_DEV_RESERVED 250
 
 #define SVR_BOARD_UNKNOWN 0
@@ -195,6 +196,8 @@ static uint8_t get_server_constant_imu_id(int id)
 		return SVR_IMU_ICM20948;
 	case IMU_ICM42688:
 		return SVR_IMU_ICM42688;
+	case IMU_ICM42686P:
+		return SVR_IMU_ICM42686P;
 	case IMU_ICM45686:
 		return SVR_IMU_ICM45686;
 	case IMU_IIM42652:
