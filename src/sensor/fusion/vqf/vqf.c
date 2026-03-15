@@ -20,10 +20,8 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 */
-#include "globals.h"
 #include "util.h"
 
-#include "sensor/sensors_enum.h"
 #include "../src/vqf.h" // conflicting with vqf.h in local path
 
 #include "../vqf/vqf.h" // conflicting with vqf.h in vqf-c
@@ -61,8 +59,9 @@ static void set_params()
 	params.restMinT = 2.9f;
 	params.restThAcc = 0.25f;
 	params.restThGyr = 0.7f;
-	params.tauMag = 9.0f;
-	params.magCurrentTau = 0.06f;
+	params.magDistRejectionEnabled = true;
+	params.tauMag = 10.0f;
+	params.magCurrentTau = 0.15f;
 	params.magNormTh = 0.1f;
 	params.magDipTh = 10.0f;
 }
