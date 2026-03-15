@@ -32,13 +32,13 @@ jobs:
       fail-fast: false
       matrix:
         board:
-          - { boardname: "NiNi_slimevr",              filename: "NiNi_slimevr" }
-          - { boardname: "NiNi_slimevr_v2_mag_uf2",  filename: "NiNi_slimevr_v2_mag_uf2" }
-          - { boardname: "NiNi_slimevr_v2_uf2",      filename: "NiNi_slimevr_v2_uf2" }
-          - { boardname: "NiNi_slimevr_v3_mag_uf2",  filename: "NiNi_slimevr_v3_mag_uf2" }
-          - { boardname: "NiNi_slimevr_v3_uf2",      filename: "NiNi_slimevr_v3_uf2" }
-          - { boardname: "NiNi_slimevr_v5_mag_uf2",  filename: "NiNi_slimevr_v5_mag_uf2" }
-          - { boardname: "NiNi_slimevr_v5_uf2",      filename: "NiNi_slimevr_v5_uf2" }
+          - { boardname: "nini_slimevr",              filename: "nini_slimevr" }
+          - { boardname: "nini_slimevr_v2_mag_uf2",  filename: "nini_slimevr_v2_mag_uf2" }
+          - { boardname: "nini_slimevr_v2_uf2",      filename: "nini_slimevr_v2_uf2" }
+          - { boardname: "nini_slimevr_v3_mag_uf2",  filename: "nini_slimevr_v3_mag_uf2" }
+          - { boardname: "nini_slimevr_v3_uf2",      filename: "nini_slimevr_v3_uf2" }
+          - { boardname: "nini_slimevr_v5_mag_uf2",  filename: "nini_slimevr_v5_mag_uf2" }
+          - { boardname: "nini_slimevr_v5_uf2",      filename: "nini_slimevr_v5_uf2" }
 
     steps:
       - name: Checkout app repository
