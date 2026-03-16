@@ -116,6 +116,8 @@ jobs:
                   {boardname: "nini_slimevr_v2_mag_uf2", filename: "nini_slimevr_v2_mag_uf2"},
                   {boardname: "nini_slimevr_v3_uf2", filename: "nini_slimevr_v3_uf2"},
                   {boardname: "nini_slimevr_v3_mag_uf2", filename: "nini_slimevr_v3_mag_uf2"},
+                  {boardname: "nini_slimevr_v4_uf2", filename: "nini_slimevr_v4_uf2"},
+                  {boardname: "nini_slimevr_v4_mag_uf2", filename: "nini_slimevr_v4_mag_uf2"},
                   {boardname: "nini_slimevr_v5_uf2", filename: "nini_slimevr_v5_uf2"},
                   {boardname: "nini_slimevr_v5_mag_uf2", filename: "nini_slimevr_v5_mag_uf2"},        
                 ]
@@ -176,22 +178,6 @@ jobs:
           export PATH="$HOME/.venv/bin:$PATH"
           cd zephyr-workspace
           west zephyr-export
-
-      - name: Remove BOM from board files
-        run: |
-          cd zephyr-workspace
-          find app/boards -type f \( \
-           -name "Kconfig*" -o \
-           -name "*.conf" -o \
-           -name "*.dts" -o \
-           -name "*.overlay" -o \
-           -name "*.yml" -o \
-           -name "*.yaml" \
-           \) -print0 | while IFS= read -r -d '' f; do
-            echo "Removing BOM from: $f"
-            sed -i '1s/^\xEF\xBB\xBF//' "$f"
-           done
-
       - name: 🔨 Build SlimeVR-Tracker-nRF - ${{ matrix.boards.boardname }}
         if: always()
         run: |

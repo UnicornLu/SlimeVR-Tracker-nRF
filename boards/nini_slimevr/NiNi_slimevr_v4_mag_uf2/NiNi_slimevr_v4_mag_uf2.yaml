@@ -1,0 +1,12 @@
+identifier: nini_slimevr_v4_mag_uf2
+name: nini_slimevr_v4_mag_uf2
+vendor: nini_Unicorn
+type: mcu
+arch: arm
+ram: 128
+flash: 512
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+
