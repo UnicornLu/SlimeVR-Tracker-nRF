@@ -1,0 +1,176 @@
+// Copyright (c) 2024 Nordic Semiconductor ASA
+// SPDX-License-Identifier: Apache-2.0
+
+/dts-v1/;
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/led/led.h>
+#include <nordic/nrf52833_qdaa.dtsi>
+
+//move to dtsi?
+
+
+&pinctrl {
+	spi2_default: spi2_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
+					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+					<NRF_PSEL(SPIM_SCK, 0, 29)>;
+		};
+	};
+
+	spi2_sleep: spi2_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
+					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+					<NRF_PSEL(SPIM_SCK, 0, 29)>;
+			low-power-enable;
+		};
+	};
+
+	pwm1_default: pwm1_default {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 0, 2)>;
+		};
+	};
+
+	pwm1_sleep: pwm1_sleep {
+		group1 {
+			psels = <NRF_PIN_DISCONNECTED>;
+			low-power-enable;
+		};
+	};
+
+	
+  	spi1_ws2812_default: spi1_ws2812_default {
+    	group1 {
+     	 psels = <NRF_PSEL(SPIM_MOSI, 0, 20)>;
+    	};
+	};
+
+	spi1_ws2812_sleep: spi1_ws2812_sleep {
+    	group1 {
+      	psels = <NRF_PIN_DISCONNECTED>;
+      	low-power-enable;
+    	};
+ 	};
+};
+
+/ {
+	model = "nini_slimevr_v5_uf2";
+	compatible = "nini_slimevr_v5_uf2";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 0";
+		};
+		button1: button_1 {
+			gpios = <&gpio0 18 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Push button switch 1";
+		};
+	};
+
+    ldo_en: ldo-en {
+        compatible = "gpio-leds";
+        gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
+    };
+
+
+	aliases {
+		sw0 = &button0;
+		sw1 = &button1;
+		led-strip = &led_strip; /* for the WS2812B LED strip */
+	};
+
+	pwmclock: pwmclock {
+		compatible = "pwm-clock";
+		#clock-cells = <1>;
+		pwms = <&pwm1 0 PWM_HZ(32768) PWM_POLARITY_NORMAL>;
+	};
+
+	battery-divider {
+		compatible = "voltage-divider";
+		status = "okay";
+		io-channels = <&adc 12>; /* Measure VDDHDIV5 */
+		output-ohms = <1>;
+		full-ohms = <5>;
+	};
+
+	zephyr,user {
+		int0-gpios = <&gpio0 3 0>;
+		chg-gpios = <&gpio1 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		ldo-gpios = <&gpio1 9 GPIO_PUSH_PULL>;
+		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
+	};
+};
+
+&reg1 {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+&adc {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&gpio0 {
+    status = "okay";
+};
+
+&gpio1 {
+    status = "okay";
+    ldo_en_sleep: ldo-en-sleep {
+        gpio-hog;
+        gpios = <9 GPIO_PULL_DOWN>;
+        input;
+    };
+};
+
+zephyr_udc0: &usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+&nfct {
+	status = "disabled";
+};
+
+&pwm1 {
+	status = "okay";
+	pinctrl-0 = <&pwm1_default>;
+	pinctrl-1 = <&pwm1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&spi2 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+
+	imu_spi: imu@0 {
+		compatible = "vnd,spi-device";
+		spi-max-frequency = <DT_FREQ_M(24)>;
+		label = "imu-spi";
+		reg = <0>;
+	};
+};
+
+

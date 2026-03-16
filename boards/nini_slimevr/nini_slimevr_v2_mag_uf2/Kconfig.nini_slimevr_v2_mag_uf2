@@ -1,0 +1,10 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_NINI_SLIMEVR_V2_MAG_UF2
+	bool "nini SlimeVR V2 MAG UF2 board (I2C)"
+	select SOC_NRF52833_QDAA
+	select BOARD_HAS_DTS
+	help
+	  Enable support for the nini SlimeVR V2 MAG UF2 board with I2C communication.
+

@@ -1,0 +1,8 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+board:
+  name: nini_slimevr_v2_uf2
+  vendor: nini_Unicorn
+  socs:
+    - name: nrf52833
