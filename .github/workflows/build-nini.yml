@@ -1,0 +1,148 @@
+name: Build NiNi Boards with jitingcn sdk-nrf
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - uf2
+  pull_request:
+    branches:
+      - main
+      - dev
+      - uf2
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ZEPHYR_SDK_VERSION: "0.17.4"
+  CUSTOM_NCS_REPO: "https://github.com/jitingcn/sdk-nrf"
+  CUSTOM_NCS_REVISION: "v3.1-branch"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - { boardname: "nini_slimevr_uf2",         filename: "nini_slimevr_uf2 " }
+          - { boardname: "nini_slimevr_v2_mag_uf2",  filename: "nini_slimevr_v2_mag_uf2" }
+          - { boardname: "nini_slimevr_v2_uf2",      filename: "nini_slimevr_v2_uf2" }
+          - { boardname: "nini_slimevr_v3_mag_uf2",  filename: "nini_slimevr_v3_mag_uf2" }
+          - { boardname: "nini_slimevr_v3_uf2",      filename: "nini_slimevr_v3_uf2" }
+          - { boardname: "nini_slimevr_v5_mag_uf2",  filename: "nini_slimevr_v5_mag_uf2" }
+          - { boardname: "nini_slimevr_v5_uf2",      filename: "nini_slimevr_v5_uf2" }
+
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v5
+        with:
+          path: app
+          submodules: recursive
+
+      - name: Install system packages
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git cmake ninja-build gperf ccache dfu-util device-tree-compiler wget \
+            python3-dev python3-pip python3-setuptools python3-wheel python3-venv \
+            xz-utils file make gcc gcc-multilib g++-multilib libsdl2-dev libmagic1
+
+      - name: Setup Python virtualenv
+        run: |
+          python3 -m venv ~/.venv
+          ~/.venv/bin/pip install --upgrade pip
+          ~/.venv/bin/pip install west ninja
+
+      - name: Cache Zephyr SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+          key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
+
+      - name: Install Zephyr SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${{ env.ZEPHYR_SDK_VERSION }}/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz -C ~/
+          ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
+
+      - name: Register Zephyr SDK
+        run: |
+          ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
+
+      - name: Cache NCS workspace
+        id: cache-ncs
+        uses: actions/cache@v4
+        with:
+          path: ncs
+          key: ncs-${{ env.CUSTOM_NCS_REVISION }}-${{ hashFiles('app/**/*.yml', 'app/**/*.yaml', 'app/**/*.conf', 'app/**/*.overlay', 'app/**/*.dts', 'app/**/*.dtsi', 'app/**/*.kconfig', 'app/**/*.Kconfig', 'app/CMakeLists.txt') }}
+
+      - name: Init custom sdk-nrf workspace
+        if: steps.cache-ncs.outputs.cache-hit != 'true'
+        run: |
+          export PATH="$HOME/.venv/bin:$PATH"
+          rm -rf ncs
+          west init -m "${{ env.CUSTOM_NCS_REPO }}" --mr "${{ env.CUSTOM_NCS_REVISION }}" ncs
+          cd ncs
+          west update
+          west zephyr-export
+          ~/.venv/bin/pip install -r zephyr/scripts/requirements.txt
+
+      - name: Restore workspace registration
+        if: steps.cache-ncs.outputs.cache-hit == 'true'
+        run: |
+          export PATH="$HOME/.venv/bin:$PATH"
+          cd ncs
+          west zephyr-export
+          ~/.venv/bin/pip install -r zephyr/scripts/requirements.txt
+
+      - name: Show board folders
+        run: |
+          echo "Boards under app/boards:"
+          find app/boards -maxdepth 2 -type d | sort || true
+
+      - name: Build ${{ matrix.board.boardname }}
+        run: |
+          export PATH="$HOME/.venv/bin:$PATH"
+          cd ncs
+
+          rm -rf "build/${{ matrix.board.filename }}"
+          mkdir -p ../Releases
+
+          west build \
+            -p always \
+            -b "${{ matrix.board.boardname }}" \
+            ../app \
+            --build-dir "build/${{ matrix.board.filename }}" \
+            -- \
+            -DNCS_TOOLCHAIN_VERSION=NONE \
+            -DBOARD_ROOT=../app
+
+          echo "==== Build output tree ===="
+          find "build/${{ matrix.board.filename }}" -type f | sort
+
+          for ext in uf2 hex bin elf; do
+            src="$(find "build/${{ matrix.board.filename }}" -type f -name "zephyr.${ext}" | head -n 1)"
+            if [ -n "$src" ]; then
+              cp "$src" "../Releases/${{ matrix.board.filename }}.${ext}"
+              echo "Saved ../Releases/${{ matrix.board.filename }}.${ext}"
+            else
+              echo "No zephyr.${ext} found for ${{ matrix.board.boardname }}"
+            fi
+          done
+
+      - name: Upload artifact - ${{ matrix.board.filename }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.board.filename }}
+          if-no-files-found: warn
+          path: Releases/${{ matrix.board.filename }}.*
