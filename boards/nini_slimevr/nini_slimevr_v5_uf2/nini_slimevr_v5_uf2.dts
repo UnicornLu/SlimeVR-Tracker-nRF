@@ -79,12 +79,6 @@
 		};
 	};
 
-    ldo_en: ldo-en {
-        compatible = "gpio-leds";
-        gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
-    };
-
-
 	aliases {
 		sw0 = &button0;
 		sw1 = &button1;
@@ -131,11 +125,6 @@
 
 &gpio1 {
     status = "okay";
-    ldo_en_sleep: ldo-en-sleep {
-        gpio-hog;
-        gpios = <9 GPIO_PULL_DOWN>;
-        input;
-    };
 };
 
 zephyr_udc0: &usbd {
