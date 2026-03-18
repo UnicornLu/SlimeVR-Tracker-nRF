@@ -29,8 +29,8 @@
 	spi2_default: spi2_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 30)>,
-				<NRF_PSEL(SPIM_SCK,  0, 29)>;
+					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+					<NRF_PSEL(SPIM_SCK,  0, 29)>;
 			bias-disable;
 		};
 	};
@@ -38,8 +38,9 @@
 	spi2_sleep: spi2_sleep {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 30)>,
-				<NRF_PSEL(SPIM_SCK,  0, 29)>;
+					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+					<NRF_PSEL(SPIM_SCK,  0, 29)>;
+			bias-disable;
 			low-power-enable;
 		};
 	};
@@ -47,7 +48,7 @@
 	i2c0_default: i2c0_default {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
-				<NRF_PSEL(TWIM_SCL, 0, 15)>;
+					<NRF_PSEL(TWIM_SCL, 0, 15)>;
 			bias-disable;
 		};
 	};
@@ -55,46 +56,10 @@
 	i2c0_sleep: i2c0_sleep {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
-				<NRF_PSEL(TWIM_SCL, 0, 15)>;
+					<NRF_PSEL(TWIM_SCL, 0, 15)>;
 			low-power-enable;
 		};
 	};
-
-	/* WS2812 data output: spi1 MOSI on P0.20 */
-spi1_ws2812_default: spi1_ws2812_default {
-  group1 {
-    psels = <NRF_PSEL(SPIM_MOSI, 0, 20)>;
-    bias-disable;
-  };
-};
-
-spi1_ws2812_sleep: spi1_ws2812_sleep {
-  group1 {
-    psels = <NRF_PIN_DISCONNECTED>;
-    low-power-enable;
-  };
-};
-};
-
-&spi1 {
-  status = "okay";
-  compatible = "nordic,nrf-spim";
-  pinctrl-0 = <&spi1_ws2812_default>;
-  pinctrl-1 = <&spi1_ws2812_sleep>;
-  pinctrl-names = "default", "sleep";
-
-  	/* WS2812B (XL-1615RGBC-WS2812B-S) on P0.20 via spi1-MOSI */
-	led_strip: ws2812@0 {
-  		compatible = "worldsemi,ws2812-spi";
-  		reg = <0>;
- 	 	spi-max-frequency = <DT_FREQ_M(3)>;
- 		 chain-length = <1>;
- 		 color-mapping = <LED_COLOR_ID_GREEN
-               			    LED_COLOR_ID_RED
-                 		  LED_COLOR_ID_BLUE>;
-		spi-one-frame = <1>;
-   		spi-zero-frame = <1>;
-};
 };
 
 &spi2 {
