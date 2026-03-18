@@ -1,6 +1,9 @@
 // Based on NiNi_slimevr_v3_mag_uf2, with PWM RGB LED support
 
 /dts-v1/;
+#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/led/led.h>
 #include <nordic/nrf52833_qdaa.dtsi>
 
 //move to dtsi?
