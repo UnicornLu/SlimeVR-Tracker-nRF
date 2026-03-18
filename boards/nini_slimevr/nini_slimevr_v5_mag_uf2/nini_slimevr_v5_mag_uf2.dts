@@ -104,7 +104,7 @@
 
 	zephyr,user {
 		int0-gpios = <&gpio0 3 0>;
-		chg-gpios = <&gpio1 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		ldo-gpios = <&gpio1 9 GPIO_PUSH_PULL>;
 		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
