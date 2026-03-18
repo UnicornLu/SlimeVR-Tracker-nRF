@@ -60,14 +60,14 @@ static void set_params()
 	params.restThAcc = 0.25f;
 	params.restThGyr = 0.7f;
 	params.magDistRejectionEnabled = true;
-	params.tauMag = 36.0f;
-	params.magCurrentTau = 0.32f;
-	params.magNormTh = 0.1f;
+	params.tauMag = 12.0f;
+	params.magCurrentTau = 0.15f;
+	params.magNormTh = 0.10f;
 	params.magDipTh = 10.0f;
-	params.magNewFirstTime = 10.0f;
+	params.magNewFirstTime = 5.0f;
 	params.magNewMinGyr = 15.0f;
-	params.magMinUndisturbedTime = 2.0f;
-	params.magMaxRejectionTime = 240.0f;
+	params.magMinUndisturbedTime = 0.5f;
+	params.magMaxRejectionTime = 180.0f;
 	params.magRejectionFactor = 4.0f;
 }
 
@@ -132,8 +132,21 @@ void vqf_update_accel_ts(float *a, uint64_t timestamp_us)
 
 void vqf_update_mag(float *m, float time)
 {
-	ARG_UNUSED(time);
-	updateMag(&params, &state, &coeffs, m);
+	// Use the caller-supplied time step when valid so that VQF time accumulators
+	// (magCandidateT, magRejectT, etc.) and gain k run at the correct real-time
+	// rate even when the sensor loop runs faster or slower than the mag ODR.
+	//
+	// Build a synthetic cumulative microsecond timestamp from the elapsed time so
+	// updateMagTs can derive the correct dt internally (avoids calling the static
+	// updateMag_internal directly).
+	if (time > 0.0f && time < 10.0f) {
+		uint64_t synth_ts = state.lastMagTsUs + (uint64_t)(time * 1e6f);
+		if (synth_ts == 0)
+			synth_ts = 1; // avoid the "uninitialized" sentinel value
+		updateMagTs(&params, &state, &coeffs, m, synth_ts);
+	} else {
+		updateMag(&params, &state, &coeffs, m);
+	}
 }
 
 void vqf_update_mag_ts(float *m, uint64_t timestamp_us)
