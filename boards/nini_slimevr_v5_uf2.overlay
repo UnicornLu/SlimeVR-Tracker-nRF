@@ -20,7 +20,6 @@
 	aliases {
 		sw0 = &button0;
 		sw1 = &button1;
-		led-strip = &led_strip;
 		imu0 = &imu_spi;
 	};
 };
