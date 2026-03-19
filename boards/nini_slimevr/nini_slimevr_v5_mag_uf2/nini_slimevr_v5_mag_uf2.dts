@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /dts-v1/;
+
 #include <nordic/nrf52833_qdaa.dtsi>
 
 //move to dtsi?
@@ -103,6 +104,7 @@
 		int0-gpios = <&gpio0 3 0>;
 		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		ldo-gpios = <&gpio1 9 GPIO_PUSH_PULL>;
+		vcc-gpios = <&gpio1 9 0>;
 		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
 };
