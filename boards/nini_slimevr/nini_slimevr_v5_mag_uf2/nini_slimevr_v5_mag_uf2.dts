@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /dts-v1/;
-#include <zephyr/dt-bindings/pinctrl/nrf-pinctrl.h>
-#include <zephyr/dt-bindings/gpio/gpio.h>
-#include <zephyr/dt-bindings/led/led.h>
 #include <nordic/nrf52833_qdaa.dtsi>
 
 //move to dtsi?
@@ -111,7 +108,7 @@
 };
 
 &reg1 {
-	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
 };
 
 &adc {
@@ -179,7 +176,6 @@ zephyr_udc0: &usbd {
 		compatible = "i2c-device";
 		label = "mag";
 		reg = <0>;
-		/* Note: no irq-gpios on v4 to avoid conflict with PWM LED on P0.20 */
 	};
 };
 
