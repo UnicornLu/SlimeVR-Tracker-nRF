@@ -102,13 +102,13 @@
 	zephyr,user {
 		int0-gpios = <&gpio0 3 0>;
 		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		dcdc-gpios = <&gpio1 9 GPIO_PULL_UP>;
+		ldo-gpios = <&gpio1 9 GPIO_PULL_UP>;
 		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
 };
 
 &reg1 {
-	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
 };
 
 &adc {
