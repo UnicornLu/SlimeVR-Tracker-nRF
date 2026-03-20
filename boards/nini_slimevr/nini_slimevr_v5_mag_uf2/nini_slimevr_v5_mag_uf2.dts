@@ -102,7 +102,7 @@
 	zephyr,user {
 		int0-gpios = <&gpio0 3 0>;
 		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		vcc-gpios = <&gpio1 9 1>;
+		vcc-gpios = <&gpio1 9 0>;
 		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
 };
