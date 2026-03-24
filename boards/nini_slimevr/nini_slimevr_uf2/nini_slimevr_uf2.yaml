@@ -3,7 +3,7 @@
 
 identifier: nini_slimevr_uf2
 name: nini_slimevr_uf2
-vendor: nini_Unicorn
+vendor: NiNi_Unicorn
 type: mcu
 arch: arm
 ram: 128

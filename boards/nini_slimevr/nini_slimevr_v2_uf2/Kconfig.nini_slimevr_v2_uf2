@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config BOARD_NINI_SLIMEVR_V2_UF2
-	bool "nini SlimeVR V2 UF2 board"
+	bool "NiNi SlimeVR V2 UF2 board"
 	select SOC_NRF52833_QDAA
 	select BOARD_HAS_DTS
 	help
-	  Enable support for the nini SlimeVR V2 UF2 board.
+	  Enable support for the NiNi SlimeVR V2 UF2 board.
