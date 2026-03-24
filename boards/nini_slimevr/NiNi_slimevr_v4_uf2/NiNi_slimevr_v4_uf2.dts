@@ -1,4 +1,5 @@
-// Based on NiNi_slimevr_v3_uf2, with PWM RGB LED support
+// Copyright (c) 2024 Nordic Semiconductor ASA
+// SPDX-License-Identifier: Apache-2.0
 
 /dts-v1/;
 #include <nordic/nrf52833_qdaa.dtsi>

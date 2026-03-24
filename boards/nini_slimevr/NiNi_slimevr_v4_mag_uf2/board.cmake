@@ -1,3 +1,6 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
 board_runner_args(jlink "--device=nRF52833_xxAA" "--speed=4000")
 board_runner_args(pyocd "--target=nrf52833" "--frequency=4000000")
 
