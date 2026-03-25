@@ -83,6 +83,7 @@
 	aliases {
 		sw0 = &button0;
 		sw1 = &button1;
+		imu0 = &imu_spi;
 	};
 
 	pwmclock: pwmclock {
