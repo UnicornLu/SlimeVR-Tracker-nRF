@@ -12,16 +12,16 @@
 &pinctrl {
 	spi2_default: spi2_default {
 		group1 {
-			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+			psels = <NRF_PSEL(SPIM_MISO, 0, 2)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 28)>,
 				<NRF_PSEL(SPIM_SCK, 0, 29)>;
 		};
 	};
 
 	spi2_sleep: spi2_sleep {
 		group1 {
-			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
-				<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+			psels = <NRF_PSEL(SPIM_MISO, 0, 2)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 28)>,
 				<NRF_PSEL(SPIM_SCK, 0, 29)>;
 			low-power-enable;
 		};
@@ -29,22 +29,22 @@
 
 	i2c0_default: i2c0_default {
 		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
-					<NRF_PSEL(TWIM_SCL, 0, 15)>;
+			psels = <NRF_PSEL(TWIM_SDA, 0, 5)>,
+					<NRF_PSEL(TWIM_SCL, 1, 9)>;
 		};
 	};
 
 	i2c0_sleep: i2c0_sleep {
 		group1 {
-			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
-					<NRF_PSEL(TWIM_SCL, 0, 15)>;
+			psels = <NRF_PSEL(TWIM_SDA, 0, 5)>,
+					<NRF_PSEL(TWIM_SCL, 1, 9)>;
 			low-power-enable;
 		};
 	};
 
 	pwm1_default: pwm1_default {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 2)>;
+			psels = <NRF_PSEL(PWM_OUT0, 0, 31)>;
 		};
 	};
 
@@ -58,9 +58,8 @@
 	pwm2_default: pwm2_default {
 		group1 {
 			/* RGB LED pins change later */
-			psels = <NRF_PSEL(PWM_OUT0, 0, 3)>,
-					<NRF_PSEL(PWM_OUT1, 0, 4)>,
-					<NRF_PSEL(PWM_OUT2, 0, 5)>;
+			psels = <NRF_PSEL(PWM_OUT0, 0, 11)>,
+					<NRF_PSEL(PWM_OUT1, 0, 20)>,
 		};
 	};
 
@@ -86,34 +85,25 @@
 	leds {
 		compatible = "gpio-leds";
 		led0: led_0 {
-			gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
+			gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
 		};
 		led1: led_1 {
-			gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
-		};
-		led2: led_2 {
-			gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
+			gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
 		};
 	};
 
 	buttons {
 		compatible = "gpio-keys";
 		button0: button_0 {
-			gpios = <&gpio0 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			gpios = <&gpio0 20 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 			label = "Push button switch 0";
-		};
-		button1: button_1 {
-			gpios = <&gpio0 18 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
-			label = "Push button switch 1";
 		};
 	};
 
 	aliases {
 		sw0 = &button0;
-		sw1 = &button1;
 		led0 = &led0;
 		led1 = &led1;
-		led2 = &led2;
 	};
 
 	pwmclock: pwmclock {
@@ -132,14 +122,12 @@
 
 	zephyr,user {
 		int0-gpios = <&gpio0 3 0>;
-		led0-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
-		led1-gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
-		led2-gpios = <&gpio0 19 GPIO_ACTIVE_HIGH>;
-		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		vcc-gpios = <&gpio1 9 GPIO_PUSH_PULL>;
-		rgb-red-pwms   = <&pwm2 0 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
-		rgb-green-pwms = <&pwm2 1 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
-		rgb-blue-pwms  = <&pwm2 2 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
+		led0-gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
+		led1-gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
+		stby-gpios = <&gpio0 17 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		vcc-gpios = <&gpio0 4 GPIO_PUSH_PULL>;
+		rgb-green-pwms = <&pwm2 2 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
+		rgb-blue-pwms  = <&pwm2 1 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
 	};
 };
 
@@ -195,7 +183,7 @@ zephyr_udc0: &usbd {
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
 	pinctrl-names = "default", "sleep";
-	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+	cs-gpios = <&gpio0 30 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu@0 {
 		compatible = "vnd,spi-device";
