@@ -118,6 +118,7 @@ jobs:
                   {boardname: "nini_slimevr_v3_mag_uf2", filename: "nini_slimevr_v3_mag_uf2"},
                   {boardname: "nini_slimevr_v4_uf2", filename: "nini_slimevr_v4_uf2"},
                   {boardname: "nini_slimevr_v4_mag_uf2", filename: "nini_slimevr_v4_mag_uf2"},
+                  {boardname: "nini_slimevr_v6_mag_uf2", filename: "nini_slimevr_v6_mag_uf2"},
                   {boardname: "nini_slimevr_v5_uf2", filename: "nini_slimevr_v5_uf2"},
                   {boardname: "nini_slimevr_v5_mag_uf2", filename: "nini_slimevr_v5_mag_uf2"},        
                 ]
