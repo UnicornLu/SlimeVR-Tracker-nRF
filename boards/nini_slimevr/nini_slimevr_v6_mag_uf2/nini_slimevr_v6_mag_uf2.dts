@@ -64,6 +64,13 @@
 		zephyr,shell-uart = &cdc_acm_uart0;
 	};
 
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio0 5 GPIO_OPEN_SOURCE>;
+		};
+	};
+
 	buttons {
 		compatible = "gpio-keys";
 		button0: button_0 {
@@ -75,6 +82,7 @@
 	aliases {
 		sw0 = &button0;
 		imu0 = &imu_spi;
+		led0 = &led0;
 	};
 
 	pwmclock: pwmclock {
