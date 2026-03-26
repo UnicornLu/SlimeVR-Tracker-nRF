@@ -128,6 +128,7 @@
 		pwr-gpios = <&gpio0 4 GPIO_PUSH_PULL>;
 		rgb-green-pwms = <&pwm2 2 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
 		rgb-blue-pwms  = <&pwm2 1 PWM_MSEC(20) PWM_POLARITY_NORMAL>;
+		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
 };
 
@@ -207,7 +208,6 @@ zephyr_udc0: &usbd {
 		compatible = "i2c-device";
 		label = "mag";
 		reg = <0>;
-		irq-gpios = <&gpio0 20 GPIO_ACTIVE_HIGH>;
 	};
 };
 
