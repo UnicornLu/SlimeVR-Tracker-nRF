@@ -5,7 +5,7 @@
 			gpios = <&gpio0 11 GPIO_OPEN_SOURCE>;
 		};
 		user_led1: led_1 {
-			gpios = <&gpio0 15 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio0 15 GPIO_OPEN_SOURCE>;
 		};
 	};
 
