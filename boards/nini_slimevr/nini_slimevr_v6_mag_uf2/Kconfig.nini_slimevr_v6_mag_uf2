@@ -1,0 +1,9 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_NINI_SLIMEVR_V6_MAG_UF2
+	bool "NiNi SlimeVR V6 MAG UF2 board (v5 pin map on v4 layout, test)"
+	select SOC_NRF52833_QDAA
+	select BOARD_HAS_DTS
+	help
+	  Test board: v5_mag SPI/I2C/power mapping; omits v4 leds/pwm2 that share pins.
