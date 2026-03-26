@@ -41,7 +41,7 @@
 		group1 {
 			/* RGB LED pins change later */
 			psels = <NRF_PSEL(PWM_OUT0, 0, 11)>,
-					<NRF_PSEL(PWM_OUT1, 0, 20)>;
+					<NRF_PSEL(PWM_OUT1, 0, 15)>;
 		};
 	};
 	pwm2_sleep: pwm2_sleep {
