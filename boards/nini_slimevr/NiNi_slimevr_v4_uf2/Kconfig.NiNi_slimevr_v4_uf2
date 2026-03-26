@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config BOARD_NINI_SLIMEVR_V4_UF2
-	bool "NiNi SlimeVR V4 UF2 board (PWM RGB LED)"
+	bool "NiNi SlimeVR V4 UF2 board"
 	select SOC_NRF52833_QDAA
 	select BOARD_HAS_DTS
 	help
