@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 board:
-  name: nini_slimevr_v4_mag_uf2
+  name: nini_slimevr_v6_uf2
   vendor: NiNi_Unicorn
   socs:
     - name: nrf52833
