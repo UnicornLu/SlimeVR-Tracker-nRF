@@ -111,15 +111,15 @@ jobs:
       fail-fast: false
       matrix:
         boards: [                 
-                  #{boardname: "nini_slimevr_uf2", filename: "nini_slimevr_uf2"},
-                  #{boardname: "nini_slimevr_v2_uf2", filename: "nini_slimevr_v2_uf2"},
-                  #{boardname: "nini_slimevr_v2_mag_uf2", filename: "nini_slimevr_v2_mag_uf2"},
-                  #{boardname: "nini_slimevr_v3_uf2", filename: "nini_slimevr_v3_uf2"},
-                  #{boardname: "nini_slimevr_v3_mag_uf2", filename: "nini_slimevr_v3_mag_uf2"},
-                  #{boardname: "nini_slimevr_v4_uf2", filename: "nini_slimevr_v4_uf2"},
-                  #{boardname: "nini_slimevr_v4_mag_uf2", filename: "nini_slimevr_v4_mag_uf2"},
-                  #{boardname: "nini_slimevr_v5_uf2", filename: "nini_slimevr_v5_uf2"},
-                  #{boardname: "nini_slimevr_v5_mag_uf2", filename: "nini_slimevr_v5_mag_uf2"},
+                  {boardname: "nini_slimevr_uf2", filename: "nini_slimevr_uf2"},
+                  {boardname: "nini_slimevr_v2_uf2", filename: "nini_slimevr_v2_uf2"},
+                  {boardname: "nini_slimevr_v2_mag_uf2", filename: "nini_slimevr_v2_mag_uf2"},
+                  {boardname: "nini_slimevr_v3_uf2", filename: "nini_slimevr_v3_uf2"},
+                  {boardname: "nini_slimevr_v3_mag_uf2", filename: "nini_slimevr_v3_mag_uf2"},
+                  {boardname: "nini_slimevr_v4_uf2", filename: "nini_slimevr_v4_uf2"},
+                  {boardname: "nini_slimevr_v4_mag_uf2", filename: "nini_slimevr_v4_mag_uf2"},
+                  {boardname: "nini_slimevr_v5_uf2", filename: "nini_slimevr_v5_uf2"},
+                  {boardname: "nini_slimevr_v5_mag_uf2", filename: "nini_slimevr_v5_mag_uf2"},
                   {boardname: "nini_slimevr_v6_mag_uf2", filename: "nini_slimevr_v6_mag_uf2"},
                 ]
     runs-on: ubuntu-latest
