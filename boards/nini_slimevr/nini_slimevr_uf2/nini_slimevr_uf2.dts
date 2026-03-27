@@ -112,7 +112,7 @@ zephyr_udc0: &usbd {
 };
 
 &spi2 {
-	status = "enable";
+	status = "okay";
 	compatible = "nordic,nrf-spim";
 	pinctrl-0 = <&spi2_default>;
 	pinctrl-1 = <&spi2_sleep>;
