@@ -24,6 +24,7 @@
 #include "sensor/calibration.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
+#include "system/test_mode.h"
 #include "system/watchdog.h"
 #include "connection.h"
 #include "zephyr/sys/time_units.h"
@@ -83,7 +84,7 @@ static bool esb_paired = false;
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
 static void esb_thread(void);
-K_THREAD_DEFINE(esb_thread_id, 512, esb_thread, NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, 6, 0, 0);
 static int64_t last_tx_time = 0;
 
 static uint32_t ping_success_streak = 0; // consecutive success counter
@@ -121,7 +122,7 @@ static uint32_t g_last_rx_raw_ticks = 0;
 static uint32_t g_last_sync_local_ticks = 0;
 static bool g_time_initialized = false;
 static int64_t g_last_sync_timestamp = 0;
-#define TIME_SYNC_TIMEOUT_MS 90000
+#define TIME_SYNC_TIMEOUT_MS 30000
 
 // Clock skew compensation (tracker vs receiver crystal frequency difference)
 static int32_t g_clock_skew_ppb = 0;         // Estimated clock skew in parts per billion
@@ -264,6 +265,14 @@ void clocks_stop(void)
 	if (!clock_status) {
 		return;
 	}
+
+	/* When using LF synthesizer, HFXO must remain active as it's the source
+	 * for the LF clock. Don't stop HFXO in this case. */
+	if (IS_ENABLED(CONFIG_CLOCK_USE_LF_SYNTH)) {
+		LOG_DBG("HF clock kept running for LF_SYNTH");
+		return;
+	}
+
 	clock_status = false;
 
 	onoff_release(clk_mgr);
@@ -1324,7 +1333,25 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		ping_send_time = k_uptime_get();
 		ping_history_idx = (ping_history_idx + 1) % PING_HISTORY_SIZE;
 	}
-	esb_start_tx();
+	int tx_err = esb_start_tx();
+	if (tx_err == -EBUSY && queue_status == 0) {
+		/*
+		 * Radio still busy (e.g. PING ACK/retransmit in progress).
+		 * Wait briefly for the previous TX to complete, then retry.
+		 * Without this, the queued packet sits in the FIFO unsent
+		 * until the next esb_write() call.
+		 */
+		for (int retry = 0; retry < 10; retry++) {
+			k_usleep(200);
+			tx_err = esb_start_tx();
+			if (tx_err != -EBUSY) {
+				break;
+			}
+		}
+		if (tx_err == -EBUSY) {
+			LOG_WRN("esb_start_tx still busy after retries, packet deferred");
+		}
+	}
 	send_data = true;
 }
 
@@ -1382,6 +1409,14 @@ uint32_t esb_get_server_time(void)
 	return (uint32_t)(time_us / 1000ULL);
 }
 
+int64_t esb_get_sync_age_ms(void)
+{
+	if (!server_time_synced || g_last_sync_timestamp == 0) {
+		return -1;
+	}
+	return k_uptime_get() - g_last_sync_timestamp;
+}
+
 static void esb_thread(void)
 {
 #if CONFIG_CONNECTION_OVER_HID
@@ -1410,7 +1445,7 @@ static void esb_thread(void)
 			esb_initialize(true);
 		}
 		// Check for shutdown timeout if connection errors persist
-		if (ping_failures >= TX_ERROR_THRESHOLD) {
+		if (ping_failures >= TX_ERROR_THRESHOLD && !test_mode_get()) {
 #if CONFIG_CONNECTION_OVER_HID
 			// only raise error while not potentially communicating by usb
 			if (get_status(SYS_STATUS_CONNECTION_ERROR) == false && get_status(SYS_STATUS_USB_CONNECTED) == false && get_status(SYS_STATUS_CALIBRATION_RUNNING) == false)
@@ -1501,6 +1536,16 @@ static void esb_thread(void)
 				case ESB_PONG_FLAG_TDMA_OFF:
 					LOG_INF("Executing remote command: TDMA_OFF");
 					tdma_set_enabled(false);
+					break;
+
+				case ESB_PONG_FLAG_TEST_MODE_ON:
+					LOG_INF("Executing remote command: TEST_MODE_ON");
+					test_mode_set(true);
+					break;
+
+				case ESB_PONG_FLAG_TEST_MODE_OFF:
+					LOG_INF("Executing remote command: TEST_MODE_OFF");
+					test_mode_set(false);
 					break;
 
 				case ESB_PONG_FLAG_REBOOT:

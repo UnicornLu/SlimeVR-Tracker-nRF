@@ -103,6 +103,8 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_FLAG_TCAL_OFF 0x1C      // Disable T-Cal (temperature calibration)
 #define ESB_PONG_FLAG_TDMA_ON 0x1D       // Enable TDMA scheduling
 #define ESB_PONG_FLAG_TDMA_OFF 0x1E      // Disable TDMA scheduling
+#define ESB_PONG_FLAG_TEST_MODE_ON 0x1F  // Enable battery drain test mode
+#define ESB_PONG_FLAG_TEST_MODE_OFF 0x20 // Disable battery drain test mode
 
 bool esb_ready(void);
 
@@ -117,6 +119,9 @@ uint64_t esb_get_server_time_us_64(void);
 
 // Get estimated current server time in milliseconds (0 if not synced)
 uint32_t esb_get_server_time(void);
+
+// Get time since last successful PONG sync in milliseconds (-1 if never synced)
+int64_t esb_get_sync_age_ms(void);
 
 // Helper: log esb_write call frequency
 void esb_write_rate_tick(void);
