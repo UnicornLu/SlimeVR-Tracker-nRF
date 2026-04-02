@@ -131,7 +131,7 @@
 		led0-gpios = <&gpio0 11 GPIO_OPEN_SOURCE>;
 		led1-gpios = <&gpio0 15 GPIO_OPEN_SOURCE>;
 		stby-gpios = <&gpio0 17 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		pwr-gpios = <&gpio0 4 GPIO_PUSH_PULL>;
+		//pwr-gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
 		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
 };
