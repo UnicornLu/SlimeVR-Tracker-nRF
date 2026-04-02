@@ -23,6 +23,19 @@
 			low-power-enable;
 		};
 	};
+
+	pwm0_default: pwm0_default {
+		group1 {
+			psels = <NRF_PIN_DISCONNECTED>;
+		};
+	};
+	
+	pwm0_sleep: pwm0_sleep {
+		group1 {
+			psels = <NRF_PIN_DISCONNECTED>;
+			low-power-enable;
+		};
+	};
 };
 //end
 
@@ -61,6 +74,12 @@
 		sw0 = &button0;
 		sw1 = &button1;
 		led0 = &led0;
+	};
+
+	pwmclock: pwmclock {
+		compatible = "pwm-clock";
+		#clock-cells = <1>;
+		pwms = <&pwm0 0 PWM_HZ(32768) PWM_POLARITY_NORMAL>;
 	};
 
 	battery-divider {
@@ -109,6 +128,13 @@ zephyr_udc0: &usbd {
 
 &nfct {
 	status = "disabled";
+};
+
+&pwm0 {
+	status = "okay";
+	pinctrl-0 = <&pwm0_default>;
+	pinctrl-1 = <&pwm0_sleep>;
+	pinctrl-names = "default", "sleep";
 };
 
 &spi2 {
