@@ -157,6 +157,16 @@ static float accel_actual_time;
 static float gyro_actual_time;
 static float mag_actual_time;
 
+#if CONFIG_SENSOR_USE_LOW_POWER_2
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 2048
+#elif CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 1536
+#else
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 1024
+#endif
+
+static uint8_t sensor_fifo_raw_buffer[SENSOR_FIFO_RAW_BUFFER_SIZE];
+
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
 // Gyroscope oversampling state for noise reduction
 // Accumulates gyro samples and averages them before fusion
@@ -804,8 +814,8 @@ static void set_update_time_ms(int time_ms)
 	// TODO: maybe not get rid of it? it is now repurposed to also change FIFO threshold
 	// TODO: return pin_config and replace call in sensor_init
 #if IMU_INT_EXISTS
-	float fifo_threshold = time_ms / 1000.0f / sensor_actual_time; // target loop rate
-	sensor_fifo_threshold = fifo_threshold;
+	float fifo_threshold = (float)time_ms / 1000.0f / sensor_actual_time; // target loop rate
+	sensor_fifo_threshold = (int16_t)fifo_threshold;
 	LOG_INF("FIFO THS/WM/WTM: %.2f -> %d", (double)fifo_threshold, sensor_fifo_threshold);
 	sensor_imu->setup_DRDY(sensor_fifo_threshold); // do not need to reset pin config
 #endif
@@ -1127,36 +1137,8 @@ void sensor_loop(void)
 			// - At 1000Hz ODR with 33ms low power update: 1000 * 0.033 = ~33 packets
 			// - At 1000Hz ODR with 100ms low power 2 update: 1000 * 0.100 = ~100 packets
 			// - With 4x oversampling at 1600Hz: effectively same as 400Hz but with 4x raw packets
-#if CONFIG_SENSOR_USE_LOW_POWER_2
-			uint8_t* rawData = (uint8_t*)k_malloc(2048);  // Increased for oversampling: worst case ~100 packets * 20 bytes = 2000 bytes
-			if (rawData == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for FIFO buffer");
-				set_status(SYS_STATUS_SENSOR_ERROR, true);
-				main_ok = false;
-			}
-			uint16_t packets = sensor_imu->fifo_read(rawData, 2048);
-#elif CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-			// With oversampling, we read more raw gyro samples per update interval
-			// E.g., 1600Hz * 6ms = ~10 packets, but need margin for timing jitter
-			uint8_t* rawData = (uint8_t*)k_malloc(1536);  // ~75 packets * 20 bytes, enough for 4x oversampling
-			if (rawData == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for FIFO buffer");
-				set_status(SYS_STATUS_SENSOR_ERROR, true);
-				main_ok = false;
-			}
-			uint16_t packets = sensor_imu->fifo_read(rawData, 1536);
-#else
-			uint8_t* rawData = (uint8_t*)k_malloc(1024);  // Standard: ~50 packets * 20 bytes
-			if (rawData == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for FIFO buffer");
-				set_status(SYS_STATUS_SENSOR_ERROR, true);
-				main_ok = false;
-			}
-			uint16_t packets = sensor_imu->fifo_read(rawData, 1024);
-#endif
+			uint8_t *rawData = sensor_fifo_raw_buffer;
+			uint16_t packets = sensor_imu->fifo_read(rawData, sizeof(sensor_fifo_raw_buffer));
 
 #if CONFIG_SENSOR_USE_TCAL
 			// Read IMU temperature after FIFO read so FIFO-backed drivers
@@ -1509,9 +1491,6 @@ void sensor_loop(void)
 				processed_packets++;
 			}
 
-			// Free the FIFO buffer
-			k_free(rawData);
-
 #if DEBUG
 			if (valid_acquisition)
 				total_processed_packets += processed_packets;
@@ -1639,7 +1618,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_gyro_timesteps_f; // floor
 					int max_expected = (int)(expected_gyro_timesteps_f + 0.99f); // ceiling
 					if (g_count < min_expected - 1 || g_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f gyro timesteps (oversampling %dx), got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f gyro timesteps (oversampling %dx), got %d (elapsed %lldms)",
 							(double)expected_gyro_timesteps_f,
 							CONFIG_SENSOR_GYRO_OVERSAMPLING, g_count, elapsed_ms);
 				}
@@ -1650,7 +1629,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_gyro_samples; // floor
 					int max_expected = (int)(expected_gyro_samples + 0.99f); // ceiling
 					if (g_count < min_expected - 1 || g_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f gyro samples, got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f gyro samples, got %d (elapsed %lldms)",
 							(double)expected_gyro_samples, g_count, elapsed_ms);
 				}
 #endif
@@ -1663,7 +1642,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_accel_timesteps_f; // floor
 					int max_expected = (int)(expected_accel_timesteps_f + 0.99f); // ceiling
 					if (a_count < min_expected - 1 || a_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f accel timesteps (oversampling %dx), got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f accel timesteps (oversampling %dx), got %d (elapsed %lldms)",
 							(double)expected_accel_timesteps_f,
 							CONFIG_SENSOR_ACCEL_OVERSAMPLING, a_count, elapsed_ms);
 				}
@@ -1673,7 +1652,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_accel_samples; // floor
 					int max_expected = (int)(expected_accel_samples + 0.99f); // ceiling
 					if (a_count < min_expected - 1 || a_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f accel samples, got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f accel samples, got %d (elapsed %lldms)",
 							(double)expected_accel_samples, a_count, elapsed_ms);
 				}
 #endif
