@@ -66,10 +66,10 @@
 	pwmleds {
 		compatible = "pwm-leds";
 		pwm_led0: pwm_led_0 {
-			pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
+			pwms = <&pwm2 0 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 		};
 		pwm_led1: pwm_led_1 {
-			pwms = <&pwm0 1 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
+			pwms = <&pwm2 1 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 		};
 	};
 	leds {
@@ -112,15 +112,15 @@
 
 	zephyr,user {
 		int0-gpios = <&gpio0 3 0>;
-		led0-gpios = <&gpio0 11 GPIO_OPEN_SOURCE>;
-		led1-gpios = <&gpio0 15 GPIO_OPEN_SOURCE>;
+		led0-gpios = <&gpio0 11 GPIO_OPEN_DRAIN>;
+		led1-gpios = <&gpio0 15 GPIO_OPEN_DRAIN>;
 		stby-gpios = <&gpio0 17 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		pwr-gpios = <&gpio0 4 GPIO_PUSH_PULL>;
+		pwr-gpios = <&gpio0 4 GPIO_OPEN_SOURCE>;
 	};
 };
 
 &reg1 {
-	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
 };
 
 &adc {
