@@ -179,6 +179,13 @@ zephyr_udc0: &usbd {
 	pinctrl-names = "default", "sleep";
 };
 
+&pwm1 {
+	status = "okay";
+	pinctrl-0 = <&pwm1_default>;
+	pinctrl-1 = <&pwm1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
 &spi2 {
 	status = "okay";
 	compatible = "nordic,nrf-spim";
