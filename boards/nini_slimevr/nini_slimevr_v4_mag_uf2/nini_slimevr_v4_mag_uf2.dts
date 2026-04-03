@@ -82,10 +82,10 @@
 	pwmleds {
 		compatible = "pwm-leds";
 		pwm_led0: pwm_led_0 {
-			pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
+			pwms = <&pwm2 0 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 		};
 		pwm_led1: pwm_led_1 {
-			pwms = <&pwm0 1 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
+			pwms = <&pwm2 1 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 		};
 	};
 	leds {
@@ -110,6 +110,8 @@
 		sw0 = &button0;
 		led0 = &led0;
 		led1 = &led1;
+		pwm-led0 = &pwm_led0;
+		pwm-led1 = &pwm_led1;
 	};
 
 	pwmclock: pwmclock {
