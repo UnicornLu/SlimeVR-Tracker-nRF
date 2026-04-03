@@ -94,6 +94,7 @@
 		int0-gpios = <&gpio0 30 0>;
 		led0-gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
 		chg-gpios = <&gpio1 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		pwr-gpios = <&gpio0 31 GPIO_OPEN_SOURCE>;
 	};
 };
 
