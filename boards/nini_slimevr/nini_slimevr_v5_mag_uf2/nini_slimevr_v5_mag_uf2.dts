@@ -8,7 +8,7 @@
 
 
 &pinctrl {
-	spi2_default: spi2_default {
+	spi3_default: spi3_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
 					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
@@ -16,7 +16,7 @@
 		};
 	};
 
-	spi2_sleep: spi2_sleep {
+	spi3_sleep: spi3_sleep {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 31)>,
 					<NRF_PSEL(SPIM_MOSI, 0, 30)>,
@@ -38,17 +38,18 @@
 			psels = <NRF_PSEL(TWIM_SDA, 0, 17)>,
 					<NRF_PSEL(TWIM_SCL, 0, 15)>;
 			bias-disable;
-			low-power-enable;			
+			low-power-enable;
 		};
 	};
 
-	pwm1_default: pwm1_default {
+	pwm0_default: pwm0_default {
 		group1 {
 			psels = <NRF_PSEL(PWM_OUT0, 0, 2)>;
+			nordic,drive-mode = <NRF_DRIVE_D0S1>;
 		};
 	};
 
-	pwm1_sleep: pwm1_sleep {
+	pwm0_sleep: pwm0_sleep {
 		group1 {
 			psels = <NRF_PIN_DISCONNECTED>;
 			low-power-enable;
@@ -56,7 +57,7 @@
 	};
 };
 
-	
+
 
 / {
 	model = "nini_slimevr_v5_mag_uf2";
@@ -69,7 +70,7 @@
 		zephyr,shell-uart = &cdc_acm_uart0;
 	};
 
-	
+
 	buttons {
 		compatible = "gpio-keys";
 		button0: button_0 {
@@ -80,13 +81,12 @@
 
 	aliases {
 		sw0 = &button0;
-		imu0 = &imu_spi;
 	};
 
 	pwmclock: pwmclock {
 		compatible = "pwm-clock";
 		#clock-cells = <1>;
-		pwms = <&pwm1 0 PWM_HZ(32768) PWM_POLARITY_NORMAL>;
+		pwms = <&pwm0 0 PWM_HZ(32768) PWM_POLARITY_NORMAL>;
 	};
 
 	battery-divider {
@@ -106,7 +106,7 @@
 };
 
 &reg1 {
-	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+	regulator-initial-mode = <NRF5X_REG_MODE_DCDC>;
 };
 
 &adc {
@@ -137,22 +137,23 @@ zephyr_udc0: &usbd {
 	status = "disabled";
 };
 
-&pwm1 {
+&pwm0 {
 	status = "okay";
-	pinctrl-0 = <&pwm1_default>;
-	pinctrl-1 = <&pwm1_sleep>;
+	pinctrl-0 = <&pwm0_default>;
+	pinctrl-1 = <&pwm0_sleep>;
 	pinctrl-names = "default", "sleep";
 };
 
-&spi2 {
+&spi3 {
 	status = "okay";
 	compatible = "nordic,nrf-spim";
-	pinctrl-0 = <&spi2_default>;
-	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-0 = <&spi3_default>;
+	pinctrl-1 = <&spi3_sleep>;
 	pinctrl-names = "default", "sleep";
+	max-frequency = <DT_FREQ_M(24)>;
 	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
 
-	imu_spi: imu@0 {
+	imu_spi: imu_spi@0 {
 		compatible = "vnd,spi-device";
 		spi-max-frequency = <DT_FREQ_M(24)>;
 		label = "imu-spi";
