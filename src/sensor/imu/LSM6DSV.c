@@ -17,6 +17,9 @@ float gyro_sensitivity = 0.070f; // Default 2000dps (FS = ±2000 dps: 70 mdps/LS
 static uint8_t accel_fs = FS_XL_16G;
 static uint8_t gyro_fs = FS_G_2000DPS;
 
+static const float odr_rates[] = {7680.0f, 3840.0f, 1920.0f, 960.0f, 480.0f, 240.0f, 120.0f, 60.0f, 30.0f, 15.0f, 7.5f, 1.875f};
+static const uint8_t odr_values[] = {ODR_7_68kHz, ODR_3_84kHz, ODR_1_92kHz, ODR_960Hz, ODR_480Hz, ODR_240Hz, ODR_120Hz, ODR_60Hz, ODR_30Hz, ODR_15Hz, ODR_7_5Hz, ODR_1_875Hz};
+
 // Store chip type: 0x70 for LSM6DSV, 0x71 for LSM6DSV16B/ISM330BX
 static uint8_t chip_who_am_i = 0x70;
 
@@ -66,13 +69,12 @@ int lsm_init(float clock_rate, float accel_time, float gyro_time, float *accel_a
 	LOG_INF("Initializing LSM6DSV...");
 	sensor_interface_spi_configure(SENSOR_INTERFACE_DEV_IMU, MHZ(10), 0);
 
-	// Soft reset clears all registers including sensor hub config
+	// sensor_init() already issued shutdown/reset before calling init.
+	// Continue from the post-reset state and rebuild runtime configuration below.
 	ext_continuous_active = false;
 	ext_scanning_mode = false; // After init, switch to operational mode for immediate continuous
 
-	// Perform soft reset to ensure known state
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL3, 0x01); // SW_RESET
-	k_msleep(2); // Wait for reset to complete
+	int err = 0;
 
 	// Read WHO_AM_I to verify communication
 	uint8_t who_am_i = 0;
@@ -147,8 +149,8 @@ int lsm_init(float clock_rate, float accel_time, float gyro_time, float *accel_a
 
 	last_accel_odr = 0xff; // reset last odr to force update
 	last_gyro_odr = 0xff; // reset last odr to force update
-	// Re-enable SHUB_PU_EN if sensor hub (ext interface) was configured during scan
-	// Soft reset clears IF_CFG, but we need internal pull-ups for auxiliary I2C bus
+	// Re-enable SHUB_PU_EN if sensor hub (ext interface) was configured during scan.
+	// The pre-init shutdown reset clears IF_CFG, so restore auxiliary I2C pull-ups here.
 	uint8_t if_cfg = 0x18; // INT H_LACTIVE active low, PP_OD open-drain
 	if (sensor_interface_ext_get() != NULL)
 		if_cfg |= 0x40; // SHUB_PU_EN: enable internal pull-up for auxiliary I2C
@@ -186,6 +188,7 @@ void lsm_shutdown(void)
 	last_accel_odr = 0xff; // reset last odr
 	last_gyro_odr = 0xff; // reset last odr
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL3, 0x01); // SW_RESET
+	k_msleep(2); // Wait for reset to complete before the next init path continues
 	if (err)
 		LOG_ERR("Communication error");
 }
@@ -256,8 +259,8 @@ int lsm_update_odr(float accel_time, float gyro_time, float *accel_actual_time, 
 	int ODR;
 	uint8_t OP_MODE_XL;
 	uint8_t OP_MODE_G;
-	uint8_t ODR_XL;
-	uint8_t ODR_G;
+	uint8_t ODR_XL = ODR_OFF;
+	uint8_t ODR_G = ODR_OFF;
 
 	// Calculate accel
 	// Note: freq_scale adjusts the actual output rate (e.g., 960Hz * 0.96 = ~923Hz)
@@ -265,79 +268,20 @@ int lsm_update_odr(float accel_time, float gyro_time, float *accel_actual_time, 
 	if (accel_time <= 0 || accel_time == INFINITY) // off, standby interpreted as off
 	{
 		OP_MODE_XL = OP_MODE_XL_HP;
-		ODR_XL = ODR_OFF;
-		ODR = 0;
+		accel_time = 0;
 	}
 	else
 	{
 		OP_MODE_XL = OP_MODE_XL_HP;
 		ODR = 1 / accel_time;
-		// Do NOT apply freq_scale here - it's used for actual_time calculation only
-	}
-
-	if (ODR == 0)
-	{
-		accel_time = 0; // off
-	}
-	else if (ODR > 3840) // TODO: this is absolutely awful
-	{
-		ODR_XL = ODR_7_68kHz;
-		accel_time = 1.0 / 7680;
-	}
-	else if (ODR > 1920)
-	{
-		ODR_XL = ODR_3_84kHz;
-		accel_time = 1.0 / 3840;
-	}
-	else if (ODR > 960)
-	{
-		ODR_XL = ODR_1_92kHz;
-		accel_time = 1.0 / 1920;
-	}
-	else if (ODR > 480)
-	{
-		ODR_XL = ODR_960Hz;
-		accel_time = 1.0 / 960;
-	}
-	else if (ODR > 240)
-	{
-		ODR_XL = ODR_480Hz;
-		accel_time = 1.0 / 480;
-	}
-	else if (ODR > 120)
-	{
-		ODR_XL = ODR_240Hz;
-		accel_time = 1.0 / 240;
-	}
-	else if (ODR > 60)
-	{
-		ODR_XL = ODR_120Hz;
-		accel_time = 1.0 / 120;
-	}
-	else if (ODR > 30)
-	{
-		ODR_XL = ODR_60Hz;
-		accel_time = 1.0 / 60;
-	}
-	else if (ODR > 15)
-	{
-		ODR_XL = ODR_30Hz;
-		accel_time = 1.0 / 30;
-	}
-	else if (ODR > 7.5)
-	{
-		ODR_XL = ODR_15Hz;
-		accel_time = 1.0 / 15;
-	}
-	else if (ODR > 1.875)
-	{
-		ODR_XL = ODR_7_5Hz;
-		accel_time = 1.0 / 7.5;
-	}
-	else
-	{
-		ODR_XL = ODR_1_875Hz;
-		accel_time = 1.0 / 1.875;
+		for (int i = 0; i < ARRAY_SIZE(odr_rates); i++)
+		{
+			if (i + 1 < ARRAY_SIZE(odr_rates) && ODR <= odr_rates[i + 1])
+				continue;
+			ODR_XL = odr_values[i];
+			accel_time = 1.0f / odr_rates[i];
+			break;
+		}
 	}
 	accel_time /= freq_scale; // scale by internal freq adjustment
 
@@ -346,86 +290,26 @@ int lsm_update_odr(float accel_time, float gyro_time, float *accel_actual_time, 
 	if (gyro_time <= 0) // off
 	{
 		OP_MODE_G = OP_MODE_G_HP;
-		ODR_G = ODR_OFF;
-		ODR = 0;
+		gyro_time = 0;
 	}
 	else if (gyro_time == INFINITY) // sleep
 	{
 		OP_MODE_G = OP_MODE_G_SLEEP;
 		ODR_G = last_gyro_odr; // using last ODR
-		ODR = 0;
+		gyro_time = 0;
 	}
 	else
 	{
 		OP_MODE_G = OP_MODE_G_HP;
-		ODR_G = 0; // the compiler complains unless I do this
 		ODR = 1 / gyro_time;
-		// Do NOT apply freq_scale here - it's used for actual_time calculation only
-	}
-
-	if (ODR == 0)
-	{
-		gyro_time = 0; // off
-	}
-	else if (ODR > 3840) // TODO: this is absolutely awful
-	{
-		ODR_G = ODR_7_68kHz;
-		gyro_time = 1.0 / 7680;
-	}
-	else if (ODR > 1920)
-	{
-		ODR_G = ODR_3_84kHz;
-		gyro_time = 1.0 / 3840;
-	}
-	else if (ODR > 960)
-	{
-		ODR_G = ODR_1_92kHz;
-		gyro_time = 1.0 / 1920;
-	}
-	else if (ODR > 480)
-	{
-		ODR_G = ODR_960Hz;
-		gyro_time = 1.0 / 960;
-	}
-	else if (ODR > 240)
-	{
-		ODR_G = ODR_480Hz;
-		gyro_time = 1.0 / 480;
-	}
-	else if (ODR > 120)
-	{
-		ODR_G = ODR_240Hz;
-		gyro_time = 1.0 / 240;
-	}
-	else if (ODR > 60)
-	{
-		ODR_G = ODR_120Hz;
-		gyro_time = 1.0 / 120;
-	}
-	else if (ODR > 30)
-	{
-		ODR_G = ODR_60Hz;
-		gyro_time = 1.0 / 60;
-	}
-	else if (ODR > 15)
-	{
-		ODR_G = ODR_30Hz;
-		gyro_time = 1.0 / 30;
-	}
-	else if (ODR > 7.5)
-	{
-		ODR_G = ODR_15Hz;
-		gyro_time = 1.0 / 15;
-	}
-	else if (ODR > 1.875)
-	{
-		ODR_G = ODR_7_5Hz;
-		gyro_time = 1.0 / 7.5;
-	}
-	else
-	{
-		ODR_G = ODR_1_875Hz;
-		gyro_time = 1.0 / 1.875;
+		for (int i = 0; i < ARRAY_SIZE(odr_rates); i++)
+		{
+			if (i + 1 < ARRAY_SIZE(odr_rates) && ODR <= odr_rates[i + 1])
+				continue;
+			ODR_G = odr_values[i];
+			gyro_time = 1.0f / odr_rates[i];
+			break;
+		}
 	}
 	gyro_time /= freq_scale; // scale by internal freq adjustment
 

@@ -1,8 +1,10 @@
 #include "globals.h"
 #include "system/system.h"
 #include "system/battery_tracker.h"
+#include "system/test_mode.h"
 #include "sensor/sensor.h"
 #include "sensor/calibration.h"
+#include "sensor/fusion/vqf/vqf.h"
 #include "connection/esb.h"
 #include "connection/tdma.h"
 #include "build_defines.h"
@@ -504,11 +506,12 @@ static void print_help(void)
 	printk("  tdma <on|off>              Enable/disable TDMA scheduling\n");
 	printk("\n");
 	printk("RF Channel:\n");
-	printk("  channel <0-100>            Set RF channel (saved to NVS)\n");
+	printk("  channel <1-100>            Set RF channel (saved to NVS)\n");
 	printk("    Example: channel 25       Set RF channel to 25\n");
 	printk("  clearchannel               Clear RF channel (use default)\n");
 	printk("\n");
 	printk("System:\n");
+	printk("  shutdown                   Power off the device\n");
 	printk("  reboot                     Soft reset the device\n");
 #if DFU_EXISTS
 	printk("  dfu                        Enter DFU bootloader\n");
@@ -521,9 +524,10 @@ static void print_help(void)
 	printk("  ping                       Flash LED (same as remote PING command)\n");
 	printk("  meow                       Meow!\n");
 	printk("  help                       Show this help message\n");
-	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 10s)\n");
+	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 1s)\n");
 	printk("  range                      Show sensor range statistics (min/max values)\n");
 	printk("  range reset                Reset sensor range statistics\n");
+	printk("  vqfbench [iterations]      Benchmark VQF update paths (default 1000)\n");
 	printk("\n");
 	printk("Debug Commands:\n");
 	printk("  reset zro                  Reset ZRO calibration\n");
@@ -657,6 +661,12 @@ void cmd_ping_start(void)
 	set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
 }
 
+void cmd_shutdown(void)
+{
+	printk("Shutting down device.\n");
+	sys_command_shutdown();
+}
+
 static void console_thread(void)
 {
 #if USB_EXISTS && DFU_EXISTS
@@ -706,6 +716,7 @@ static void console_thread(void)
 
 	uint8_t command_info[] = "info";
 	uint8_t command_uptime[] = "uptime";
+	uint8_t command_shutdown[] = "shutdown";
 	uint8_t command_reboot[] = "reboot";
 	uint8_t command_battery[] = "battery";
 	uint8_t command_scan[] = "scan";
@@ -713,6 +724,7 @@ static void console_thread(void)
 	uint8_t command_help[] = "help";
 	uint8_t command_debug[] = "debug";
 	uint8_t command_range[] = "range";
+	uint8_t command_vqfbench[] = "vqfbench";
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	uint8_t command_6_side[] = "6-side";
@@ -783,6 +795,8 @@ static void console_thread(void)
 			uint64_t uptime = k_uptime_ticks();
 			print_uptime(uptime, "Uptime");
 			print_uptime(uptime - retained->uptime_latest + retained->uptime_sum, "Accumulated");
+		} else if (memcmp(line, command_shutdown, sizeof(command_shutdown)) == 0) {
+			cmd_shutdown();
 		} else if (memcmp(line, command_reboot, sizeof(command_reboot)) == 0) {
 			sys_request_system_reboot(false);
 		} else if (memcmp(line, command_battery, sizeof(command_battery)) == 0) {
@@ -1037,14 +1051,14 @@ static void console_thread(void)
 			esb_clear_pair();
 		} else if (memcmp(line, command_channel, sizeof(command_channel)) == 0) {
 			if (!arg) {
-				printk("Usage: channel <0-100>\n");
+				printk("Usage: channel <1-100>\n");
 				printk("Example: channel 25 - Set RF channel to 25\n");
 			} else {
 				char *endptr;
 				long channel = strtol(arg, &endptr, 10);
 
-				if (*endptr != '\0' || channel < 0 || channel > 100) {
-					printk("Invalid channel. Must be a number between 0 and 100.\n");
+				if (*endptr != '\0' || channel < 1 || channel > 100) {
+					printk("Invalid channel. Must be a number between 1 and 100.\n");
 				} else {
 					printk("Setting RF channel to %d\n", (int)channel);
 					// Save to retained memory
@@ -1137,6 +1151,18 @@ static void console_thread(void)
 #else
 			printk("Sensor range statistics not enabled in configuration.\n");
 #endif // CONFIG_SENSOR_RANGE_STATS
+		} else if (memcmp(line, command_vqfbench, sizeof(command_vqfbench)) == 0) {
+			uint32_t iterations = 1000;
+			if (arg) {
+				char *endptr;
+				long parsed = strtol((char *)arg, &endptr, 10);
+				if (endptr != (char *)arg && *endptr == '\0' && parsed > 0 && parsed <= 20000) {
+					iterations = (uint32_t)parsed;
+				} else {
+					printk("Invalid iteration count. Using default 1000.\n");
+				}
+			}
+			vqf_run_benchmark(iterations);
 		}	else if (memcmp(line, command_reset, sizeof(command_reset)) == 0) {
 			if (arg && memcmp(arg, command_reset_arg_zro, sizeof(command_reset_arg_zro)) == 0) {
 				cmd_reset_zro();
@@ -1177,6 +1203,16 @@ static void console_thread(void)
 				printk("TDMA disabled\n");
 			} else {
 				printk("TDMA: %s\n", tdma_is_enabled() ? "enabled" : "disabled");
+			}
+		} else if (memcmp(line, "test", 4) == 0) {
+			if (arg && strcmp((char *)arg, "on") == 0) {
+				test_mode_set(true);
+				printk("Test mode enabled\n");
+			} else if (arg && strcmp((char *)arg, "off") == 0) {
+				test_mode_set(false);
+				printk("Test mode disabled\n");
+			} else {
+				printk("Test mode: %s\n", test_mode_get() ? "enabled" : "disabled");
 			}
 		} else {
 			printk("Unknown command\n");

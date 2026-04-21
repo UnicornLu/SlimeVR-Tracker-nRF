@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "system/system.h"
 #include "system/power.h"
+#include "system/test_mode.h"
 #include "system/watchdog.h"
 #include "util.h"
 #include "connection/connection.h"
@@ -156,6 +157,16 @@ static float accel_actual_time;
 static float gyro_actual_time;
 static float mag_actual_time;
 
+#if CONFIG_SENSOR_USE_LOW_POWER_2
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 2048
+#elif CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 1536
+#else
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 1024
+#endif
+
+static uint8_t sensor_fifo_raw_buffer[SENSOR_FIFO_RAW_BUFFER_SIZE];
+
 #if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
 // Gyroscope oversampling state for noise reduction
 // Accumulates gyro samples and averages them before fusion
@@ -209,7 +220,7 @@ static const sensor_mag_t *sensor_mag = &sensor_mag_none;
 // Temperature used by T-Cal (°C).
 // Low-pass filtered to reduce IMU temperature sensor noise which can cause compensation jitter.
 #ifndef SENSOR_TCAL_TEMP_FILTER_TAU_MS
-#define SENSOR_TCAL_TEMP_FILTER_TAU_MS 500  // ms
+#define SENSOR_TCAL_TEMP_FILTER_TAU_MS 200  // ms
 #endif
 
 static float sensor_tcal_temp = 25.0f;      // Filtered temperature (°C)
@@ -803,8 +814,8 @@ static void set_update_time_ms(int time_ms)
 	// TODO: maybe not get rid of it? it is now repurposed to also change FIFO threshold
 	// TODO: return pin_config and replace call in sensor_init
 #if IMU_INT_EXISTS
-	float fifo_threshold = time_ms / 1000.0f / sensor_actual_time; // target loop rate
-	sensor_fifo_threshold = fifo_threshold;
+	float fifo_threshold = (float)time_ms / 1000.0f / sensor_actual_time; // target loop rate
+	sensor_fifo_threshold = (int16_t)fifo_threshold;
 	LOG_INF("FIFO THS/WM/WTM: %.2f -> %d", (double)fifo_threshold, sensor_fifo_threshold);
 	sensor_imu->setup_DRDY(sensor_fifo_threshold); // do not need to reset pin config
 #endif
@@ -858,7 +869,8 @@ static void sensor_update_sensor_state(void)
 {
 	bool calibrating = get_status(SYS_STATUS_CALIBRATION_RUNNING);
 	bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.005) : q_epsilon(q, last_q, 0.05); // TODO: Probably okay to use the constantly updating last_q?
-	if (!calibrating && resting)
+	bool in_test_mode = test_mode_get();
+	if (!in_test_mode && !calibrating && resting)
 	{
 		int64_t last_data_delta = k_uptime_get() - last_data_time;
 		if (sensor_mode < SENSOR_SENSOR_MODE_LOW_POWER && last_data_delta > CONFIG_SENSOR_LP_TIMEOUT) // No motion in lp timeout
@@ -1054,6 +1066,22 @@ int sensor_init(void)
 	sensor_fusion_init = true;
 	last_mag_fusion_ticks = 0; // reset so first mag update uses nominal mag_actual_time as dt
 	// last_mag_fusion_ticks reset is sufficient; no extra state to clear.
+
+	if (connection_get_data_collection()) {
+		connection_send_raw_metadata(
+			gyro_actual_range,
+			accel_actual_range,
+			1.0f / gyro_actual_time,
+			1.0f / accel_actual_time,
+			mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+			(uint8_t)sensor_imu_id,
+			(uint8_t)sensor_mag_id
+		);
+		LOG_INF("Data collection mode: metadata sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
+			(double)gyro_actual_range, (double)accel_actual_range,
+			1.0 / (double)gyro_actual_time);
+	}
+
 	return 0;
 }
 
@@ -1062,6 +1090,8 @@ int sensor_init(void)
 
 static int64_t last_status_time = 0;
 static int64_t max_loop_time = 0;
+
+static bool last_data_collection_state = false;
 
 #if DEBUG
 static int64_t last_acquisition_time = INT64_MAX;
@@ -1101,6 +1131,34 @@ void sensor_loop(void)
 #if DEBUG
 			int64_t loop_begin = k_uptime_ticks();
 #endif
+
+			/* Detect data collection activation transition and send metadata */
+			bool dc_active = connection_get_data_collection();
+			if (dc_active && !last_data_collection_state) {
+				sys_interface_resume();
+				connection_send_raw_metadata(
+					gyro_actual_range,
+					accel_actual_range,
+					1.0f / gyro_actual_time,
+					1.0f / accel_actual_time,
+					mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+					(uint8_t)sensor_imu_id,
+					(uint8_t)sensor_mag_id
+				);
+				LOG_INF("Data collection activated: metadata sent");
+			} else if (dc_active && connection_raw_metadata_resend_due()) {
+				connection_send_raw_metadata(
+					gyro_actual_range,
+					accel_actual_range,
+					1.0f / gyro_actual_time,
+					1.0f / accel_actual_time,
+					mag_available && mag_enabled ? 1.0f / mag_actual_time : 0.0f,
+					(uint8_t)sensor_imu_id,
+					(uint8_t)sensor_mag_id
+				);
+			}
+			last_data_collection_state = dc_active;
+
 			// Resume devices
 			sys_interface_resume();
 
@@ -1118,8 +1176,19 @@ void sensor_loop(void)
 			if (mag_available && mag_enabled && mag_use_oneshot)
 				sensor_mag->mag_oneshot();
 
+			// Read gyroscope (FIFO)
+			// Buffer size calculation:
+			// - Worst case is ICM 20 byte packet
+			// - At 1600Hz gyro ODR with 6ms update interval: 1600 * 0.006 = ~10 packets
+			// - At 1000Hz ODR with 33ms low power update: 1000 * 0.033 = ~33 packets
+			// - At 1000Hz ODR with 100ms low power 2 update: 1000 * 0.100 = ~100 packets
+			// - With 4x oversampling at 1600Hz: effectively same as 400Hz but with 4x raw packets
+			uint8_t *rawData = sensor_fifo_raw_buffer;
+			uint16_t packets = sensor_imu->fifo_read(rawData, sizeof(sensor_fifo_raw_buffer));
+
 #if CONFIG_SENSOR_USE_TCAL
-			// Read IMU temperature
+			// Read IMU temperature after FIFO read so FIFO-backed drivers
+			// can return a sample synchronized with the current accel/gyro batch.
 			temp = sensor_imu->temp_read();
 			// Only update if the value looks like a valid temperature (-20 to 60).
 			if (temp != 0.0f && temp > -20.0f && temp < 60.0f)
@@ -1156,48 +1225,10 @@ void sensor_loop(void)
 				connection_update_sensor_temp(sensor_tcal_temp);
 			}
 #else
-			// Read IMU temperature
+			// Read IMU temperature after FIFO read so FIFO-backed drivers can reuse it.
 			temp = sensor_imu->temp_read(); // TODO: use as calibration data
 			last_temp_time = k_uptime_get();
 			connection_update_sensor_temp(temp);
-#endif
-
-			// Read gyroscope (FIFO)
-			// Buffer size calculation:
-			// - Worst case is ICM 20 byte packet
-			// - At 1600Hz gyro ODR with 6ms update interval: 1600 * 0.006 = ~10 packets
-			// - At 1000Hz ODR with 33ms low power update: 1000 * 0.033 = ~33 packets
-			// - At 1000Hz ODR with 100ms low power 2 update: 1000 * 0.100 = ~100 packets
-			// - With 4x oversampling at 1600Hz: effectively same as 400Hz but with 4x raw packets
-#if CONFIG_SENSOR_USE_LOW_POWER_2
-			uint8_t* rawData = (uint8_t*)k_malloc(2048);  // Increased for oversampling: worst case ~100 packets * 20 bytes = 2000 bytes
-			if (rawData == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for FIFO buffer");
-				set_status(SYS_STATUS_SENSOR_ERROR, true);
-				main_ok = false;
-			}
-			uint16_t packets = sensor_imu->fifo_read(rawData, 2048);
-#elif CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
-			// With oversampling, we read more raw gyro samples per update interval
-			// E.g., 1600Hz * 6ms = ~10 packets, but need margin for timing jitter
-			uint8_t* rawData = (uint8_t*)k_malloc(1536);  // ~75 packets * 20 bytes, enough for 4x oversampling
-			if (rawData == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for FIFO buffer");
-				set_status(SYS_STATUS_SENSOR_ERROR, true);
-				main_ok = false;
-			}
-			uint16_t packets = sensor_imu->fifo_read(rawData, 1536);
-#else
-			uint8_t* rawData = (uint8_t*)k_malloc(1024);  // Standard: ~50 packets * 20 bytes
-			if (rawData == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for FIFO buffer");
-				set_status(SYS_STATUS_SENSOR_ERROR, true);
-				main_ok = false;
-			}
-			uint16_t packets = sensor_imu->fifo_read(rawData, 1024);
 #endif
 
 			// Debug info
@@ -1217,6 +1248,10 @@ void sensor_loop(void)
 			bool new_mag_data = false;
 			if (mag_available && mag_enabled)
 				new_mag_data = sensor_mag->mag_read(raw_m); // returns false if no new sample (DRDY not set)
+
+			if (new_mag_data && connection_get_data_collection()) {
+				connection_queue_raw_mag(raw_m);
+			}
 
 			if (reconfig) // TODO: get rid of reconfig?
 			{
@@ -1258,12 +1293,33 @@ void sensor_loop(void)
 			float debug_raw_m[3] = {0};
 			float debug_cal_m[3] = {0};
 			bool debug_mag_valid = false;
+			/* Persistent accel for data collection: accel tags arrive less
+			 * frequently than gyro tags, so we hold the latest accel value
+			 * and pair it with each gyro sample. */
+			static float raw_collect_a[3] = {0};
+
 			for (uint16_t i = 0; i < packets; i++)
 			{
 				float raw_a[3] = {0};
 				float raw_g[3] = {0};
 				if (sensor_imu->fifo_process(i, rawData, raw_a, raw_g))
 					continue; // skip on error
+
+				/* Update persistent accel when we get an accel tag (non-zero) */
+				if (raw_a[0] != 0 || raw_a[1] != 0 || raw_a[2] != 0) {
+					memcpy(raw_collect_a, raw_a, sizeof(raw_collect_a));
+				}
+
+				/* Only queue raw samples on gyro tags to avoid
+				 * duplicate entries from separate accel/gyro FIFO tags.
+				 * Pair with the most recent accel reading. */
+				if (connection_get_data_collection() &&
+				    (raw_g[0] != 0 || raw_g[1] != 0 || raw_g[2] != 0)) {
+					struct raw_imu_sample raw_sample;
+					memcpy(raw_sample.gyro, raw_g, sizeof(raw_sample.gyro));
+					memcpy(raw_sample.accel, raw_collect_a, sizeof(raw_sample.accel));
+					connection_queue_raw_sample(&raw_sample);
+				}
 
 				// Debug: Log gyro values to see if they're all zero
 				static int gyro_log_count = 0;
@@ -1506,9 +1562,6 @@ void sensor_loop(void)
 				processed_packets++;
 			}
 
-			// Free the FIFO buffer
-			k_free(rawData);
-
 #if DEBUG
 			if (valid_acquisition)
 				total_processed_packets += processed_packets;
@@ -1636,7 +1689,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_gyro_timesteps_f; // floor
 					int max_expected = (int)(expected_gyro_timesteps_f + 0.99f); // ceiling
 					if (g_count < min_expected - 1 || g_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f gyro timesteps (oversampling %dx), got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f gyro timesteps (oversampling %dx), got %d (elapsed %lldms)",
 							(double)expected_gyro_timesteps_f,
 							CONFIG_SENSOR_GYRO_OVERSAMPLING, g_count, elapsed_ms);
 				}
@@ -1647,7 +1700,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_gyro_samples; // floor
 					int max_expected = (int)(expected_gyro_samples + 0.99f); // ceiling
 					if (g_count < min_expected - 1 || g_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f gyro samples, got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f gyro samples, got %d (elapsed %lldms)",
 							(double)expected_gyro_samples, g_count, elapsed_ms);
 				}
 #endif
@@ -1660,7 +1713,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_accel_timesteps_f; // floor
 					int max_expected = (int)(expected_accel_timesteps_f + 0.99f); // ceiling
 					if (a_count < min_expected - 1 || a_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f accel timesteps (oversampling %dx), got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f accel timesteps (oversampling %dx), got %d (elapsed %lldms)",
 							(double)expected_accel_timesteps_f,
 							CONFIG_SENSOR_ACCEL_OVERSAMPLING, a_count, elapsed_ms);
 				}
@@ -1670,7 +1723,7 @@ void sensor_loop(void)
 					int min_expected = (int)expected_accel_samples; // floor
 					int max_expected = (int)(expected_accel_samples + 0.99f); // ceiling
 					if (a_count < min_expected - 1 || a_count > max_expected + 1)
-						LOG_WRN("Expected ~%.1f accel samples, got %d (elapsed %lldms)",
+						LOG_DBG("Expected ~%.1f accel samples, got %d (elapsed %lldms)",
 							(double)expected_accel_samples, a_count, elapsed_ms);
 				}
 #endif
@@ -1790,6 +1843,30 @@ void sensor_loop(void)
 						(double)vqf_info.rest_deviations[0], (double)vqf_info.rest_deviations[1],
 						(double)vqf_info.bias[0], (double)vqf_info.bias[1], (double)vqf_info.bias[2],
 						(double)vqf_info.bias_sigma, (double)vqf_info.delta);
+#if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
+					printk("     Adapt: tauAcc:%.2fs motInt:%.3f\n",
+						(double)vqf_info.tau_acc, (double)vqf_info.motion_intensity);
+#endif
+					printk("     RestDiag: enter:%u exit:%u total:%.1fs last:%.1fs up:%.0fs rest%%:%.1f\n",
+						vqf_info.rest_enter_count, vqf_info.rest_exit_count,
+						(double)vqf_info.rest_total_s, (double)vqf_info.rest_last_duration_s,
+						(double)vqf_info.uptime_s,
+						(double)(vqf_info.uptime_s > 0 ? 100.0f * vqf_info.rest_total_s / vqf_info.uptime_s : 0));
+					printk("     BiasP[%.1f,%.1f,%.1f]\n",
+						(double)vqf_info.biasP[0], (double)vqf_info.biasP[1], (double)vqf_info.biasP[2]);
+					{
+						uint8_t n = vqf_info.rest_event_count;
+						if (n > 8) n = 8;
+						if (n > 0) {
+							printk("     RestLog(%u events):", vqf_info.rest_event_count);
+							for (uint8_t ri = 0; ri < n; ri++) {
+								printk(" %s@%.0fs",
+									vqf_info.rest_events[ri].entered ? "EN" : "EX",
+									(double)vqf_info.rest_events[ri].time_s);
+							}
+							printk("\n");
+						}
+					}
 					if (mag_enabled) {
 						printk("     Mag: DisAng:%.2f° CorrRate:%.2f°/s\n",
 							(double)vqf_info.mag_dis_angle, (double)vqf_info.mag_corr_rate);
@@ -1817,7 +1894,7 @@ void sensor_loop(void)
 			// Check if we need to force send based on time to maintain minimum packet rate
 			int64_t now = k_uptime_get();
 			bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.003f) : q_epsilon(q, last_q, 0.05f);
-			int64_t min_interval = 1000;
+			int64_t min_interval = test_mode_get() ? TEST_MODE_MIN_SEND_INTERVAL_MS : 1000;
 			bool force_send_by_time = (now - last_sensor_send_time) >= min_interval;
 
 			if (send_quat_data || send_lin_accel_data || force_send_by_time)

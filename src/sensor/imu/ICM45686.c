@@ -14,6 +14,9 @@ static const float gyro_sensitivity = 2000.0f / 32768.0f; // Always 2000dps
 static const float accel_sensitivity_32 = 32.0f / ((uint32_t)2<<30); // 32G forced
 static const float gyro_sensitivity_32 = 4000.0f / ((uint32_t)2<<30); // 4000dps forced
 
+static const uint16_t times[] = {6400, 3200, 1600, 800, 400, 200, 100, 50, 25, 2, 0};
+static const uint8_t odrs[] = {ACCEL_ODR_6_4kHz, ACCEL_ODR_3_2kHz, ACCEL_ODR_1_6kHz, ACCEL_ODR_800Hz, ACCEL_ODR_400Hz, ACCEL_ODR_200Hz, ACCEL_ODR_100Hz, ACCEL_ODR_50Hz, ACCEL_ODR_25Hz, ACCEL_ODR_12_5Hz};
+
 static uint8_t last_accel_odr = 0xff;
 static uint8_t last_gyro_odr = 0xff;
 static const float clock_reference = 32000;
@@ -28,6 +31,35 @@ static uint8_t ext_cont_sub = 0;
 static uint8_t ext_cont_len = 0;
 static bool ext_scanning_mode = true;
 static void icm45_ext_stop_continuous(void);
+
+// Cache the latest FIFO temperature so temperature reads can stay synchronized
+// with the current accel/gyro batch when FIFO packets are available.
+static float fifo_temp = 25.0f;
+static bool fifo_temp_valid = false;
+
+static void icm45_cache_fifo_temp(const uint8_t *data, uint16_t packets)
+{
+	fifo_temp_valid = false;
+	int32_t raw_temp_sum = 0;
+	uint16_t valid_packets = 0;
+
+	for (uint16_t i = 0; i < packets; i++)
+	{
+		const uint8_t *packet = &data[i * PACKET_SIZE];
+		if (packet[0] != 0x78 && packet[0] != 0x7A)
+			continue;
+
+		int16_t raw_temp = (int16_t)((((uint16_t)packet[13]) << 8) | packet[14]);
+		raw_temp_sum += raw_temp;
+		valid_packets++;
+	}
+
+	if (valid_packets == 0)
+		return;
+
+	fifo_temp = ((float)raw_temp_sum / (128.0f * valid_packets)) + 25.0f;
+	fifo_temp_valid = true;
+}
 
 LOG_MODULE_REGISTER(ICM45686, LOG_LEVEL_DBG);
 
@@ -208,16 +240,16 @@ int icm45_init(float clock_rate, float accel_time, float gyro_time, float *accel
 	// After init, switch to operational mode for immediate continuous I2CM reads
 	ext_scanning_mode = false;
 	ext_continuous_active = false;
+	fifo_temp = 25.0f;
+	fifo_temp_valid = false;
 
 	// setup interface for SPI
 	sensor_interface_spi_configure(SENSOR_INTERFACE_DEV_IMU, MHZ(24), 0);
 
 	int err = 0;
 
-	// Perform soft reset to ensure known state
-	LOG_INF("Performing soft reset...");
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_REG_MISC2, 0x02); // Soft reset
-	k_msleep(2); // Wait for reset to complete (datasheet: 1ms)
+	// sensor_init() already issued shutdown/reset before calling init.
+	// Continue from the post-reset state and rebuild runtime configuration below.
 
 	// Read WHO_AM_I to verify communication
 	uint8_t who_am_i = 0;
@@ -244,7 +276,7 @@ int icm45_init(float clock_rate, float accel_time, float gyro_time, float *accel
 	ireg_buf[1] = ICM45686_IPREG_BAR_REG_59;
 	ireg_buf[2] = 0xB6 & ~0x92; // disable internal pull resistors for AP pins (pin 7, 1, 14)
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
-	// Re-enable I2CM mode after soft reset (if ext was configured during scan)
+	// Re-enable I2CM mode after the pre-init shutdown reset (if ext was configured during scan)
 	ireg_buf[1] = ICM45686_IPREG_BAR_REG_60;
 	ireg_buf[2] = ICM45686_BIT_AUX1_I2CM_MODE; // I2CM mode only, no internal pull-ups
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3);
@@ -324,6 +356,8 @@ void icm45_shutdown(void)
 	icm45_ext_stop_continuous();
 	last_accel_odr = 0xff; // reset last odr
 	last_gyro_odr = 0xff; // reset last odr
+	fifo_temp = 25.0f;
+	fifo_temp_valid = false;
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_REG_MISC2, 0x02); // Soft reset
 	k_msleep(2); // Wait for reset to complete (datasheet: 1ms) - ensures clean state for init
 	// TODO: not working
@@ -353,76 +387,28 @@ int icm45_update_odr(float accel_time, float gyro_time, float *accel_actual_time
 	uint8_t GYRO_UI_FS_SEL = GYRO_UI_FS_SEL_4000DPS;
 	uint8_t ACCEL_MODE;
 	uint8_t GYRO_MODE;
-	uint8_t ACCEL_ODR;
-	uint8_t GYRO_ODR;
+	uint8_t ACCEL_ODR = 0;
+	uint8_t GYRO_ODR = 0;
 
 	// Calculate accel
 	if (accel_time <= 0 || accel_time == INFINITY) // off, standby interpreted as off
 	{
 		ACCEL_MODE = ACCEL_MODE_OFF;
-		ODR = 0;
+		accel_time = 0; // off
 	}
 	else
 	{
 		ACCEL_MODE = ACCEL_MODE_LN;
 		ODR = 1 / accel_time;
 		ODR /= clock_scale; // scale clock
-	}
-
-	if (ACCEL_MODE != ACCEL_MODE_LN)
-	{
-		ACCEL_ODR = 0;
-		accel_time = 0; // off
-	}
-	else if (ODR > 3200) // TODO: this is absolutely awful
-	{
-		ACCEL_ODR = ACCEL_ODR_6_4kHz;
-		accel_time = 1.0 / 6400;
-	}
-	else if (ODR > 1600)
-	{
-		ACCEL_ODR = ACCEL_ODR_3_2kHz;
-		accel_time = 1.0 / 3200;
-	}
-	else if (ODR > 800)
-	{
-		ACCEL_ODR = ACCEL_ODR_1_6kHz;
-		accel_time = 1.0 / 1600;
-	}
-	else if (ODR > 400)
-	{
-		ACCEL_ODR = ACCEL_ODR_800Hz;
-		accel_time = 1.0 / 800;
-	}
-	else if (ODR > 200)
-	{
-		ACCEL_ODR = ACCEL_ODR_400Hz;
-		accel_time = 1.0 / 400;
-	}
-	else if (ODR > 100)
-	{
-		ACCEL_ODR = ACCEL_ODR_200Hz;
-		accel_time = 1.0 / 200;
-	}
-	else if (ODR > 50)
-	{
-		ACCEL_ODR = ACCEL_ODR_100Hz;
-		accel_time = 1.0 / 100;
-	}
-	else if (ODR > 25)
-	{
-		ACCEL_ODR = ACCEL_ODR_50Hz;
-		accel_time = 1.0 / 50;
-	}
-	else if (ODR > 12.5)
-	{
-		ACCEL_ODR = ACCEL_ODR_25Hz;
-		accel_time = 1.0 / 25;
-	}
-	else
-	{
-		ACCEL_ODR = ACCEL_ODR_12_5Hz;
-		accel_time = 1.0 / 12.5;
+		for (int i = 1; i < ARRAY_SIZE(times); i++)
+		{
+			if (ODR <= (i > 9 ? times[i] / 25.0 : times[i]))
+				continue;
+			ACCEL_ODR = odrs[i - 1];
+			accel_time = i > 10 ? times[i - 1] / 25.0 : 1.0 / times[i - 1];
+			break;
+		}
 	}
 	accel_time /= clock_scale; // scale clock
 
@@ -430,74 +416,26 @@ int icm45_update_odr(float accel_time, float gyro_time, float *accel_actual_time
 	if (gyro_time <= 0) // off
 	{
 		GYRO_MODE = GYRO_MODE_OFF;
-		ODR = 0;
+		gyro_time = 0; // off
 	}
 	else if (gyro_time == INFINITY) // standby
 	{
 		GYRO_MODE = GYRO_MODE_STANDBY;
-		ODR = 0;
+		gyro_time = 0; // off
 	}
 	else
 	{
 		GYRO_MODE = GYRO_MODE_LN;
 		ODR = 1 / gyro_time;
 		ODR /= clock_scale; // scale clock
-	}
-
-	if (GYRO_MODE != GYRO_MODE_LN)
-	{
-		GYRO_ODR = 0;
-		gyro_time = 0; // off
-	}
-	else if (ODR > 3200) // TODO: this is absolutely awful
-	{
-		GYRO_ODR = GYRO_ODR_6_4kHz;
-		gyro_time = 1.0 / 6400;
-	}
-	else if (ODR > 1600)
-	{
-		GYRO_ODR = GYRO_ODR_3_2kHz;
-		gyro_time = 1.0 / 3200;
-	}
-	else if (ODR > 800)
-	{
-		GYRO_ODR = GYRO_ODR_1_6kHz;
-		gyro_time = 1.0 / 1600;
-	}
-	else if (ODR > 400)
-	{
-		GYRO_ODR = GYRO_ODR_800Hz;
-		gyro_time = 1.0 / 800;
-	}
-	else if (ODR > 200)
-	{
-		GYRO_ODR = GYRO_ODR_400Hz;
-		gyro_time = 1.0 / 400;
-	}
-	else if (ODR > 100)
-	{
-		GYRO_ODR = GYRO_ODR_200Hz;
-		gyro_time = 1.0 / 200;
-	}
-	else if (ODR > 50)
-	{
-		GYRO_ODR = GYRO_ODR_100Hz;
-		gyro_time = 1.0 / 100;
-	}
-	else if (ODR > 25)
-	{
-		GYRO_ODR = GYRO_ODR_50Hz;
-		gyro_time = 1.0 / 50;
-	}
-	else if (ODR > 12.5)
-	{
-		GYRO_ODR = GYRO_ODR_25Hz;
-		gyro_time = 1.0 / 25;
-	}
-	else
-	{
-		GYRO_ODR = GYRO_ODR_12_5Hz;
-		gyro_time = 1.0 / 12.5;
+		for (int i = 1; i < ARRAY_SIZE(times); i++)
+		{
+			if (ODR <= (i > 9 ? times[i] / 25.0 : times[i]))
+				continue;
+			GYRO_ODR = odrs[i - 1];
+			gyro_time = i > 10 ? times[i - 1] / 25.0 : 1.0 / times[i - 1];
+			break;
+		}
 	}
 	gyro_time /= clock_scale; // scale clock
 
@@ -548,6 +486,7 @@ uint16_t icm45_fifo_read(uint8_t *data, uint16_t len)
 	err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_COUNT_0, &rawCount[0], 2);
 	uint16_t packets = (uint16_t)(rawCount[0] << 8 | rawCount[1]); // Turn the 16 bits into a unsigned 16-bit value
 
+	fifo_temp_valid = false;
 	if (packets == 0)
 		return 0;
 
@@ -564,6 +503,8 @@ uint16_t icm45_fifo_read(uint8_t *data, uint16_t len)
 	err |= ssi_burst_read_interval(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_DATA, data, count, PACKET_SIZE);
 	if (err)
 		LOG_ERR("Communication error");
+	else
+		icm45_cache_fifo_temp(data, packets);
 
 	return packets;
 }
@@ -655,6 +596,9 @@ void icm45_gyro_read(float g[3])
 
 float icm45_temp_read(void)
 {
+	if (fifo_temp_valid)
+		return fifo_temp;
+
 	uint8_t rawTemp[2];
 	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM45686_TEMP_DATA1_UI, &rawTemp[0], 2);
 	if (err)

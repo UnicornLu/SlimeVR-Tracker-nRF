@@ -33,7 +33,7 @@ extern uint8_t last_reset;
 // extern const nrfx_timer_t m_timer;
 extern bool esb_state;
 extern bool timer_state;
-extern bool send_data;
+
 // TODO: esb/sensor?
 extern uint16_t led_clock;
 extern uint32_t led_clock_offset;
@@ -83,7 +83,6 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_FLAG_DFU 0x09           // Enter DFU bootloader
 #define ESB_PONG_FLAG_SET_CHANNEL 0x0A   // Set RF channel (data[8-11] contains channel value)
 #define ESB_PONG_FLAG_CLEAR_CHANNEL 0x0B // Clear RF channel setting (restore default)
-// Reserved for future use: 0x0C-0xFF
 #define ESB_PONG_FLAG_SENS_SET 0x0C
 #define ESB_PONG_FLAG_SENS_RESET 0x0D
 #define ESB_PONG_FLAG_RESET_ZRO 0x0E
@@ -103,11 +102,24 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_FLAG_TCAL_OFF 0x1C      // Disable T-Cal (temperature calibration)
 #define ESB_PONG_FLAG_TDMA_ON 0x1D       // Enable TDMA scheduling
 #define ESB_PONG_FLAG_TDMA_OFF 0x1E      // Disable TDMA scheduling
+#define ESB_PONG_FLAG_TEST_MODE_ON 0x1F  // Enable battery drain test mode
+#define ESB_PONG_FLAG_TEST_MODE_OFF 0x20 // Disable battery drain test mode
+#define ESB_PONG_FLAG_DFU_OTA 0x21       // Enter OTA DFU bootloader
+#define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
+#define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+
+// Raw data collection packet types
+#define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
+#define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
+#define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
 
 bool esb_ready(void);
 
 // Get remote command flag to echo back in PING
 uint8_t esb_get_ping_ack_flag(void);
+
+// Additional delay applied to the base ping interval after repeated failures.
+uint32_t esb_get_ping_backoff_ms(void);
 
 // Get estimated current server time in ticks (0 if not synced) - high precision
 uint64_t esb_get_server_time_ticks_64(void);
@@ -117,6 +129,9 @@ uint64_t esb_get_server_time_us_64(void);
 
 // Get estimated current server time in milliseconds (0 if not synced)
 uint32_t esb_get_server_time(void);
+
+// Get time since last successful PONG sync in milliseconds (-1 if never synced)
+int64_t esb_get_sync_age_ms(void);
 
 // Helper: log esb_write call frequency
 void esb_write_rate_tick(void);

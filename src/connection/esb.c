@@ -24,8 +24,10 @@
 #include "sensor/calibration.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
+#include "system/test_mode.h"
 #include "system/watchdog.h"
 #include "connection.h"
+#include "zephyr/sys/byteorder.h"
 #include "zephyr/sys/time_units.h"
 
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
@@ -47,7 +49,6 @@ uint8_t last_reset = 0;
 // const nrfx_timer_t m_timer = NRFX_TIMER_INSTANCE(1);
 bool esb_state = false;
 bool timer_state = false;
-bool send_data = false;
 uint16_t led_clock = 0;
 uint32_t led_clock_offset = 0;
 
@@ -80,10 +81,19 @@ static bool esb_paired = false;
 #define PING_RECOVERY_THRESHOLD 1
 #endif
 
+#define PING_BACKOFF_LVL1_THRESHOLD 2
+#define PING_BACKOFF_LVL2_THRESHOLD 5
+#define PING_BACKOFF_LVL3_THRESHOLD 10
+#define PING_BACKOFF_LVL4_THRESHOLD 20
+#define PING_BACKOFF_LVL1_MS        500
+#define PING_BACKOFF_LVL2_MS        1500
+#define PING_BACKOFF_LVL3_MS        4000
+#define PING_BACKOFF_LVL4_MS        9000
+
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
 static void esb_thread(void);
-K_THREAD_DEFINE(esb_thread_id, 512, esb_thread, NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, 6, 0, 0);
 static int64_t last_tx_time = 0;
 
 static uint32_t ping_success_streak = 0; // consecutive success counter
@@ -94,6 +104,7 @@ static uint32_t ping_failures = 0;
 static uint32_t ping_ctr_sent = 0;
 static uint8_t ping_counter = 0;
 static int64_t ping_send_time = 0;
+
 
 // Track send cycles for recent PINGs (circular buffer)
 #define PING_HISTORY_SIZE 10
@@ -121,7 +132,7 @@ static uint32_t g_last_rx_raw_ticks = 0;
 static uint32_t g_last_sync_local_ticks = 0;
 static bool g_time_initialized = false;
 static int64_t g_last_sync_timestamp = 0;
-#define TIME_SYNC_TIMEOUT_MS 90000
+#define TIME_SYNC_TIMEOUT_MS 15000
 
 // Clock skew compensation (tracker vs receiver crystal frequency difference)
 static int32_t g_clock_skew_ppb = 0;         // Estimated clock skew in parts per billion
@@ -201,6 +212,41 @@ static int64_t last_enomem_time = 0;
 #define ENOMEM_ERROR_THRESHOLD 3    // Force recovery after N consecutive errors
 #define ENOMEM_ERROR_WINDOW_MS 1000 // Reset counter if no error for this duration
 
+static void esb_clear_time_sync_state(void)
+{
+	server_time_synced = false;
+	g_time_initialized = false;
+	g_last_sync_timestamp = 0;
+	g_last_rx_raw_ticks = 0;
+	g_last_sync_local_ticks = 0;
+	g_server_ticks_offset = 0;
+	g_clock_skew_ppb = 0;
+	g_skew_ref_offset = 0;
+	g_skew_ref_local_ticks = 0;
+	g_min_rtt_ticks = 10;
+	g_sync_update_count = 0;
+}
+
+
+
+uint32_t esb_get_ping_backoff_ms(void)
+{
+	if (ping_failures >= PING_BACKOFF_LVL4_THRESHOLD) {
+		return PING_BACKOFF_LVL4_MS;
+	}
+	if (ping_failures >= PING_BACKOFF_LVL3_THRESHOLD) {
+		return PING_BACKOFF_LVL3_MS;
+	}
+	if (ping_failures >= PING_BACKOFF_LVL2_THRESHOLD) {
+		return PING_BACKOFF_LVL2_MS;
+	}
+	if (ping_failures >= PING_BACKOFF_LVL1_THRESHOLD) {
+		return PING_BACKOFF_LVL1_MS;
+	}
+
+	return 0;
+}
+
 bool clock_status = false;
 
 #if defined(CONFIG_CLOCK_CONTROL_NRF)
@@ -264,6 +310,14 @@ void clocks_stop(void)
 	if (!clock_status) {
 		return;
 	}
+
+	/* When using LF synthesizer, HFXO must remain active as it's the source
+	 * for the LF clock. Don't stop HFXO in this case. */
+	if (IS_ENABLED(CONFIG_CLOCK_USE_LF_SYNTH)) {
+		LOG_DBG("HF clock kept running for LF_SYNTH");
+		return;
+	}
+
 	clock_status = false;
 
 	onoff_release(clk_mgr);
@@ -342,7 +396,7 @@ void event_handler(struct esb_evt const *event)
 		tx_success_count++;
 		// Reset ENOMEM error counter on successful transmission
 		consecutive_enomem_errors = 0;
-		if (esb_paired) {
+		if (esb_paired && !connection_get_data_collection()) {
 			clocks_stop();
 		}
 		break;
@@ -408,7 +462,7 @@ void event_handler(struct esb_evt const *event)
 			);
 		}
 
-		if (esb_paired) {
+		if (esb_paired && !connection_get_data_collection()) {
 			clocks_stop();
 		}
 		break;
@@ -456,26 +510,6 @@ void event_handler(struct esb_evt const *event)
 			}
 		} else {
 			switch (rx_payload.length) {
-			case 4: {
-				// TODO: Device should never receive packets if it is already
-				// paired, why is this packet received? This may be part of
-				// acknowledge
-				//					if (!nrfx_timer_init_check(&m_timer))
-				{
-					LOG_WRN("Timer not initialized");
-					break;
-				}
-				if (timer_state == false) {
-					//						nrfx_timer_resume(&m_timer);
-					timer_state = true;
-				}
-				//					nrfx_timer_clear(&m_timer);
-				last_reset = 0;
-				led_clock = (rx_payload.data[0] << 8) + rx_payload.data[1]; // sync led flashes :)
-				led_clock_offset = 0;
-				LOG_DBG("RX, timer reset");
-				pair_ack_pending = false;
-			} break;
 			case ESB_PONG_LEN: {
 				if (rx_payload.data[0] == ESB_PONG_TYPE) {
 					// check CRC first
@@ -710,6 +744,21 @@ void event_handler(struct esb_evt const *event)
 						// No history found - likely too old or buffer wrapped
 					}
 
+					/* Parse dynamic TDMA config from NORMAL PONG bytes 8-11.
+					 * Only valid when pong_flags == NORMAL (other commands
+					 * use bytes 8-11 for command-specific data). */
+					if (pong_flags == ESB_PONG_FLAG_NORMAL) {
+						uint8_t tdma_slot   = rx_payload.data[8];
+						uint8_t tdma_total  = rx_payload.data[9];
+						uint8_t tdma_sticks = rx_payload.data[10];
+						uint8_t tdma_epoch  = rx_payload.data[11];
+
+						if (tdma_slot != 0xFF && tdma_total > 0 && tdma_sticks > 0 &&
+						    tdma_epoch != tdma_get_config_epoch()) {
+							tdma_update_config(tdma_slot, tdma_total, tdma_sticks, tdma_epoch);
+						}
+					}
+
 					// handle remote commands and delayed execution
 					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
 						if (received_remote_command == ESB_PONG_FLAG_NORMAL) {
@@ -761,6 +810,9 @@ void event_handler(struct esb_evt const *event)
 								break;
 							case ESB_PONG_FLAG_DFU:
 								cmd_name = "DFU";
+								break;
+							case ESB_PONG_FLAG_DFU_OTA:
+								cmd_name = "DFU_OTA";
 								break;
 							case ESB_PONG_FLAG_SET_CHANNEL:
 								cmd_name = "SET_CHANNEL";
@@ -846,7 +898,34 @@ void event_handler(struct esb_evt const *event)
 				// received other tracker's sensor data, likely due to shared pipe, just ignore
 			} break;
 			default:
-				LOG_WRN("Ignoring invalid payload length %u", rx_payload.length);
+				/* ACK payload from receiver carrying ARQ retransmit requests */
+				if (rx_payload.length >= 4 &&
+				    rx_payload.data[0] == 0xAA &&
+				    connection_get_data_collection()) {
+					uint8_t retx_n = rx_payload.data[1];
+					uint8_t max_entries = (rx_payload.length - 2) / 2;
+					if (retx_n > max_entries) {
+						retx_n = max_entries;
+					}
+					extern volatile uint16_t raw_retx_queue[];
+					extern volatile uint8_t  raw_retx_count;
+					for (uint8_t i = 0; i < retx_n; i++) {
+						uint16_t seq = sys_get_be16(&rx_payload.data[2 + i * 2]);
+						/* Deduplicate */
+						bool found = false;
+						for (uint8_t j = 0; j < raw_retx_count; j++) {
+							if (raw_retx_queue[j] == seq) {
+								found = true;
+								break;
+							}
+						}
+						if (!found && raw_retx_count < 16) {
+							raw_retx_queue[raw_retx_count++] = seq;
+						}
+					}
+				} else {
+					LOG_WRN("Ignoring invalid payload length %u", rx_payload.length);
+				}
 			} // end of rx_payload length switch
 		}
 		break;
@@ -947,7 +1026,7 @@ void esb_deinitialize(void)
 {
 	if (esb_initialized) {
 		esb_initialized = false;
-		k_msleep(10); // wait for pending transmissions
+		k_msleep(3); // wait for pending transmissions
 		esb_disable();
 	}
 	esb_initialized = false;
@@ -1035,11 +1114,7 @@ void esb_pair(void)
 	ping_failed = false;
 	ping_pending = false;
 	// Reset time sync state
-	server_time_synced = false;
-	g_time_initialized = false;
-	g_last_sync_timestamp = 0;
-	g_min_rtt_ticks = 10;
-	g_sync_update_count = 0;
+	esb_clear_time_sync_state();
 	if (!paired_addr[0]) // zero, no receiver paired
 	{
 		LOG_INF("Pairing");
@@ -1199,6 +1274,16 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		esb_flush_tx();
 		queue_status = esb_write_payload(&tx_payload);
 	}
+
+	bool is_raw = (data[0] >= 0x10 && data[0] <= 0x12);
+	// manually repeat raw packets for better reliability
+	if (is_raw) {
+		tx_payload.noack = true;
+		queue_status = esb_write_payload(&tx_payload);
+		if (queue_status == 0) {
+			queue_status = esb_write_payload(&tx_payload);
+		}
+	}
 # if 0
 	if (no_ack) {
 		// manually repeat packet for noack packets for better reliability
@@ -1307,10 +1392,13 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	 *
 	 * PING / ACK packets bypass TDMA (no_ack == false) so time-sync and
 	 * connection-health probes are never delayed.
+	 * Raw data (0x10-0x12) always bypasses TDMA for minimum latency.
 	 */
 #if CONFIG_CONNECTION_TDMA
 	if (no_ack) {
-		tdma_wait_for_slot();
+		if (!is_raw) {
+			tdma_wait_for_slot();
+		}
 	}
 #endif
 	/*
@@ -1324,8 +1412,13 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		ping_send_time = k_uptime_get();
 		ping_history_idx = (ping_history_idx + 1) % PING_HISTORY_SIZE;
 	}
+	/*
+	 * In MANUAL_START mode the radio auto-drains the FIFO once started.
+	 * esb_start_tx() only needs to kick the first packet; if -EBUSY,
+	 * the TX chain is already running and our queued packet will be
+	 * sent automatically.  No retry or recovery needed.
+	 */
 	esb_start_tx();
-	send_data = true;
 }
 
 bool esb_ready(void)
@@ -1382,6 +1475,14 @@ uint32_t esb_get_server_time(void)
 	return (uint32_t)(time_us / 1000ULL);
 }
 
+int64_t esb_get_sync_age_ms(void)
+{
+	if (!server_time_synced || g_last_sync_timestamp == 0) {
+		return -1;
+	}
+	return k_uptime_get() - g_last_sync_timestamp;
+}
+
 static void esb_thread(void)
 {
 #if CONFIG_CONNECTION_OVER_HID
@@ -1410,7 +1511,7 @@ static void esb_thread(void)
 			esb_initialize(true);
 		}
 		// Check for shutdown timeout if connection errors persist
-		if (ping_failures >= TX_ERROR_THRESHOLD) {
+		if (ping_failures >= TX_ERROR_THRESHOLD && !test_mode_get()) {
 #if CONFIG_CONNECTION_OVER_HID
 			// only raise error while not potentially communicating by usb
 			if (get_status(SYS_STATUS_CONNECTION_ERROR) == false && get_status(SYS_STATUS_USB_CONNECTED) == false && get_status(SYS_STATUS_CALIBRATION_RUNNING) == false)
@@ -1437,7 +1538,7 @@ static void esb_thread(void)
 				switch (received_remote_command) {
 				case ESB_PONG_FLAG_SHUTDOWN:
 					LOG_WRN("Executing remote command: SHUTDOWN");
-					sys_request_system_off(false);
+					sys_command_shutdown();
 					break;
 
 				case ESB_PONG_FLAG_CALIBRATE:
@@ -1503,6 +1604,16 @@ static void esb_thread(void)
 					tdma_set_enabled(false);
 					break;
 
+				case ESB_PONG_FLAG_TEST_MODE_ON:
+					LOG_INF("Executing remote command: TEST_MODE_ON");
+					test_mode_set(true);
+					break;
+
+				case ESB_PONG_FLAG_TEST_MODE_OFF:
+					LOG_INF("Executing remote command: TEST_MODE_OFF");
+					test_mode_set(false);
+					break;
+
 				case ESB_PONG_FLAG_REBOOT:
 					LOG_WRN("Executing remote command: REBOOT");
 					sys_request_system_reboot(false);
@@ -1523,6 +1634,19 @@ static void esb_thread(void)
 					sys_request_system_reboot(false);
 #else
 					LOG_WRN("Remote command: DFU not supported (no bootloader)");
+#endif
+					break;
+
+				case ESB_PONG_FLAG_DFU_OTA:
+#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+					LOG_WRN("Executing remote command: DFU_OTA (enter OTA bootloader)");
+#if CONFIG_BUILD_OUTPUT_UF2
+					NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
+					k_msleep(2);
+#endif
+					sys_request_system_reboot(false);
+#else
+					LOG_WRN("Remote command: DFU_OTA not supported (no bootloader)");
 #endif
 					break;
 
@@ -1644,6 +1768,17 @@ static void esb_thread(void)
 #else
 					LOG_WRN("Remote command: TCAL_BOOT_OFF not supported (T-Cal disabled in config)");
 #endif
+					break;
+
+				case ESB_PONG_FLAG_DATA_COLLECT_ON:
+					LOG_INF("Executing remote command: DATA_COLLECT_ON");
+					connection_set_data_collection(true);
+					test_mode_set(true);  // Prevent sleep during data collection
+					break;
+
+				case ESB_PONG_FLAG_DATA_COLLECT_OFF:
+					LOG_INF("Executing remote command: DATA_COLLECT_OFF");
+					connection_set_data_collection(false);
 					break;
 
 				default:
