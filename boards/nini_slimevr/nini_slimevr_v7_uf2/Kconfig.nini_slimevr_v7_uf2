@@ -1,0 +1,6 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_NINI_SLIMEVR_V7_UF2
+	select SOC_NRF52833_QDAA
+
