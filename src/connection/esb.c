@@ -1280,9 +1280,6 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	if (is_raw) {
 		tx_payload.noack = true;
 		queue_status = esb_write_payload(&tx_payload);
-		if (queue_status == 0) {
-			queue_status = esb_write_payload(&tx_payload);
-		}
 	}
 # if 0
 	if (no_ack) {
@@ -1587,11 +1584,17 @@ static void esb_thread(void)
 					break;
 
 				case ESB_PONG_FLAG_TCAL_ON:
-					LOG_INF("TODO: Executing remote command: TCAL_ON");
+#if CONFIG_SENSOR_USE_TCAL
+					LOG_INF("Executing remote command: TCAL_ON");
+					sensor_tcal_set_enabled(true);
+#endif
 					break;
 
 				case ESB_PONG_FLAG_TCAL_OFF:
-					LOG_INF("TODO: Executing remote command: TCAL_OFF");
+#if CONFIG_SENSOR_USE_TCAL
+					LOG_INF("Executing remote command: TCAL_OFF");
+					sensor_tcal_set_enabled(false);
+#endif
 					break;
 
 				case ESB_PONG_FLAG_TDMA_ON:
@@ -1779,6 +1782,7 @@ static void esb_thread(void)
 				case ESB_PONG_FLAG_DATA_COLLECT_OFF:
 					LOG_INF("Executing remote command: DATA_COLLECT_OFF");
 					connection_set_data_collection(false);
+					test_mode_set(false);
 					break;
 
 				default:
