@@ -61,7 +61,7 @@ static int64_t magneto_progress_time;
 #define MAG_CAL_ACCEL_MAG_MAX_SQ 1.3f
 
 // Minimum samples before attempting trial calibration
-#define MAG_CAL_MIN_SAMPLES 65
+#define MAG_CAL_MIN_SAMPLES 64
 // Attempt trial calibration every this many new samples (manual cal)
 #define MAG_CAL_TRIAL_INTERVAL 80
 
@@ -119,7 +119,7 @@ static int64_t online_last_sample_time; // rate limiting
 // Drop octants that have not been refreshed for too long.
 // This is kept separate from the check cadence: stale-history rejection should
 // not depend on how often the background thread decides to run Magneto.
-#define ONLINE_STALE_QUADRANT_MAX_AGE 80
+#define ONLINE_STALE_QUADRANT_MAX_AGE 320
 // Minimum direction change to accept an online sample. The configured value is
 // expressed in degrees and converted to the equivalent 1 - cos(theta) threshold.
 static float online_last_dir[3];
@@ -143,11 +143,24 @@ static float cal_norm_var_ema;    // EMA of squared deviation from mean
 static uint32_t cal_norm_count;   // number of norm samples processed
 #define CAL_NORM_EMA_ALPHA 0.01f  // smoothing factor (~100 sample window)
 // Don't update calibration if current norm CV is below this threshold
-#define CAL_NORM_GOOD_CV 0.07f    // 7% = good enough calibration
+#define CAL_NORM_GOOD_CV 0.05f    // 5% = good enough calibration
 
 // Minimum time between online calibration updates (prevents frequent VQF mag ref resets)
 #define ONLINE_MIN_UPDATE_INTERVAL_S 6  // 6 seconds cooldown
 static int64_t online_last_update_time;
+
+// Suppress online sample collection for N ms after buffer resets (wake-up,
+// reboot, environment change, calibration update).  This lets sensor data
+// stabilise before collecting, avoiding transient/mixed-environment samples
+// that produce poor calibration fits.
+#define ONLINE_COLLECTION_SUPPRESS_MS 1500
+static int64_t online_collection_suppress_until;
+
+// Minimum sustained VQF magnetic disturbance duration before allowing an online
+// calibration update.  Short disturbance bursts are usually transient interference;
+// updating calibration during those resets VQF's heading reference for no benefit.
+#define ONLINE_VQF_DIST_MIN_DURATION_MS 3000
+static int64_t online_vqf_dist_start_time;
 
 // Require at least N successful calibration updates before trusting the
 // norm CV gate. Prevents a single early fit from being declared "good enough"
@@ -683,18 +696,12 @@ static void magneto_online_runtime_load_retained(void)
 	magneto_online_reset();
 	online_update_count = retained->onlineMagState.update_count;
 	online_last_buf_avg_norm = retained->onlineMagState.last_buf_avg_norm;
-	cal_norm_ema = retained->onlineMagState.norm_ema;
-	cal_norm_var_ema = retained->onlineMagState.norm_var_ema;
-	cal_norm_count = retained->onlineMagState.norm_count;
 }
 
 void sensor_calibration_online_mag_retained_save(void)
 {
 	retained->onlineMagState.update_count = (uint8_t)CLAMP(online_update_count, 0, 255);
 	retained->onlineMagState.last_buf_avg_norm = online_last_buf_avg_norm;
-	retained->onlineMagState.norm_ema = cal_norm_ema;
-	retained->onlineMagState.norm_var_ema = cal_norm_var_ema;
-	retained->onlineMagState.norm_count = cal_norm_count;
 }
 
 void sensor_calibration_online_mag_retained_clear(void)
@@ -792,12 +799,12 @@ int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 	}
 	float magnitude = v_avg(diagonal);
 	float average[3] = {magnitude, magnitude, magnitude};
-	if (!v_epsilon(m_inv[0], zero, 1)
+	if (!v_epsilon(m_inv[0], zero, magnitude * 2.0f)
 		|| !v_epsilon(
 			diagonal,
 			average,
 			MAX(magnitude * 0.2f, 0.1f)
-		)) // check offset is <1 unit and diagonals are within 20%
+		)) // check offset is <hm*2 (supports fixed magnet bias) and diagonals are within 20%
 	{
 		sensor_calibration_clear_mag(m_inv, write);
 		LOG_WRN("Invalidated calibration");
@@ -1502,6 +1509,10 @@ static void magneto_online_clear_history(void)
 	online_last_check_time = 0;
 	memset(online_last_dir, 0, sizeof(online_last_dir));
 	memset(online_last_accel_dir, 0, sizeof(online_last_accel_dir));
+	// Suppress collection for a few seconds so transient/stale samples from
+	// wake-up, reboot, or environment transitions are not mixed into the
+	// fresh buffer.
+	online_collection_suppress_until = k_uptime_get() + ONLINE_COLLECTION_SUPPRESS_MS;
 }
 
 static bool magneto_online_quadrant_is_recent(const quadrant_buf_t *qbuf)
@@ -1683,7 +1694,8 @@ static bool magneto_quality_check(double *ata_buf, double norm_sum_val, double s
 	}
 	float magnitude = v_avg(diagonal);
 	float average[3] = {magnitude, magnitude, magnitude};
-	if (!v_epsilon(m_inv[0], zero, 1)
+	float hm = (float)(norm_sum_val / sample_count_val);
+	if (!v_epsilon(m_inv[0], zero, hm * 2.0f)
 	    || !v_epsilon(diagonal, average, MAX(magnitude * 0.2f, 0.1f))) {
 		return false;
 	}
@@ -2388,24 +2400,55 @@ void sensor_calibration_online_mag_sample(const float m[3])
 		return;
 	}
 
+	int64_t now = k_uptime_get();
+
+	// Track VQF disturbance duration (before any sample gates) so the
+	// background check function knows how long disturbance has persisted.
+#if CONFIG_SENSOR_USE_VQF
+	if (vqf_get_mag_dist_detected()) {
+		if (online_vqf_dist_start_time == 0) {
+			online_vqf_dist_start_time = now;
+		}
+	} else {
+		online_vqf_dist_start_time = 0;
+	}
+#endif
+
+	// Suppress collection after buffer resets (wake-up, reboot, environment
+	// change, calibration update) to let sensor data stabilise.
+	if (now < online_collection_suppress_until) {
+		return;
+	}
+
 	// Reject if VQF detects magnetic disturbance (only when we have an existing
 	// calibration — VQF only receives mag data when calibrated, so mag_dist_detected
 	// is meaningless without calibration).
-	// Exception: if current calibration quality is bad (norm CV > 10%), the disturbance
+	// Exception 1: if current calibration quality is bad (norm CV > 6%), the disturbance
 	// detection itself may be unreliable due to the bad calibration, so skip the gate.
+	// Exception 2: if VQF has been reporting disturbance continuously for a long time,
+	// the "disturbance" is likely a calibration drift or environment change rather than
+	// transient interference.  Allow samples through to enable recalibration.
+	// Without this, a deadlock occurs: VQF reports disturbance → gate blocks samples →
+	// cal_norm_count stops updating (guarded by !magDistDetected in sensor.c) → CV
+	// stays frozen at a low value → gate never opens → no recalibration possible.
 #if CONFIG_SENSOR_USE_VQF
 	{
 		float zero[3] = {0};
 		bool has_cal = (v_diff_mag(magBAinv[0], zero) != 0);
 		float current_cv = sensor_calibration_get_mag_quality();
-		if (has_cal && current_cv < 0.10f && vqf_get_mag_dist_detected()) {
-			return;
+		if (has_cal && current_cv < 0.06f && vqf_get_mag_dist_detected()) {
+			// Sustained disturbance override: if disturbance has persisted for
+			// more than 5 seconds, allow samples through.
+			bool sustained = (online_vqf_dist_start_time > 0 &&
+			                  (now - online_vqf_dist_start_time) > 5000);
+			if (!sustained) {
+				return;
+			}
 		}
 	}
 #endif
 
 	// Rate limit: minimum interval between samples
-	int64_t now = k_uptime_get();
 	if (now - online_last_sample_time < ONLINE_MIN_INTERVAL_MS) {
 		return;
 	}
@@ -2511,6 +2554,24 @@ static bool sensor_calibration_online_mag_check(void)
 	bool has_existing = (v_diff_mag(magBAinv[0], zero) != 0);
 	float current_cv = has_existing ? sensor_calibration_get_mag_quality() : 1.0f;
 
+	// When VQF has a reliable calibration (CV < 4%) and is NOT experiencing
+	// sustained magnetic disturbance, skip the calibration check entirely.
+	// Updating calibration resets VQF's mag reference (vqf_reset_mag_ref),
+	// causing ~6s of heading instability.  Only attempt a recalibration
+	// when VQF has been detecting disturbance for >3 seconds, indicating
+	// the current calibration is genuinely insufficient.
+#if CONFIG_SENSOR_USE_VQF
+	if (has_existing && current_cv < 0.04f) {
+		if (online_vqf_dist_start_time == 0) {
+			return false; // VQF not disturbed — current cal is fine
+		}
+		int64_t dist_duration_ms = now - online_vqf_dist_start_time;
+		if (dist_duration_ms < ONLINE_VQF_DIST_MIN_DURATION_MS) {
+			return false; // transient disturbance — wait
+		}
+	}
+#endif
+
 	// If the current calibration is already good enough AND we've had enough
 	// updates to trust that assessment, skip the heavy Magneto fit.
 	//
@@ -2520,7 +2581,21 @@ static bool sensor_calibration_online_mag_check(void)
 	//   Tier 2 (relaxed): CV is excellent AND we've done many updates
 	//     → trust the fit regardless of dir_bias (directional fluctuations
 	//       during normal rotation are just sampling noise, not real problems)
-	if (has_existing && current_cv < CAL_NORM_GOOD_CV && online_update_count >= ONLINE_MIN_UPDATES) {
+	//
+	// Exception: skip convergence checks when VQF is experiencing sustained
+	// magnetic disturbance.  The CV value is frozen during disturbance (norm
+	// tracking gated by !magDistDetected in sensor.c), so a low frozen CV
+	// does NOT mean the calibration is still good — the environment may have
+	// changed.  If the code reached here past the CV < 4% disturbance gate
+	// above, the disturbance is sustained and recalibration should proceed.
+#if CONFIG_SENSOR_USE_VQF
+	bool vqf_sustained_dist = (online_vqf_dist_start_time > 0 &&
+	                           (now - online_vqf_dist_start_time) > ONLINE_VQF_DIST_MIN_DURATION_MS);
+#else
+	bool vqf_sustained_dist = false;
+#endif
+	if (has_existing && current_cv < CAL_NORM_GOOD_CV && online_update_count >= ONLINE_MIN_UPDATES
+	    && !vqf_sustained_dist) {
 		float dir_bias_check = magneto_online_recent_dir_bias();
 
 		// Tier 2: Excellent fit + sufficient history — lock it in.
@@ -2555,14 +2630,14 @@ static bool sensor_calibration_online_mag_check(void)
 
 	// Detect magnetic environment changes by comparing the buffer's
 	// average raw field strength against the last update's reference.
-	// When the norm changes by >40% (e.g., moving between a desk and
+	// When the norm changes by >25% (e.g., moving between a desk and
 	// a high-interference area), clear buffers to prevent mixed-data
 	// fits.  Direction is preserved — only scale changes.
 	float buf_avg_norm = (float)(recent_norm_sum / recent_sample_count);
 
 	if (has_existing && online_update_count > 0 && online_last_buf_avg_norm > 0.0f) {
 		float norm_ratio = buf_avg_norm / online_last_buf_avg_norm;
-		if (norm_ratio > 1.4f || norm_ratio < 0.71f) {
+		if (norm_ratio > 1.25f || norm_ratio < 0.80f) {
 			LOG_WRN("Online mag cal: env change detected (buf norm %.3f -> %.3f, ratio %.2f), "
 			        "resetting buffers",
 			        (double)online_last_buf_avg_norm, (double)buf_avg_norm, (double)norm_ratio);

@@ -172,8 +172,12 @@ void tdma_wait_for_slot(void)
 	} else {
 		/* Overshot significantly — TX anyway to prevent cascade */
 		tdma_slot_overshoots++;
-		LOG_DBG("TDMA overshoot: pos=%d (slot 0-%d)",
-			pos_in_slot, (int)(slot_ticks - 1));
+		LOG_WRN("TDMA overshoot: pos=%d target=%u slept=%u (slot 0-%d)",
+			pos_in_slot, ticks_to_target,
+			(uint32_t)(frame_phase >= target_phase ?
+				frame_phase - target_phase :
+				frame_phase + frame_ticks - target_phase),
+			(int)(slot_ticks - 1));
 	}
 
 	/* Periodic TDMA statistics */
@@ -222,6 +226,12 @@ void tdma_update_config(uint8_t slot_index, uint8_t total_slots, uint8_t slot_ti
 {
 #if CONFIG_CONNECTION_TDMA
 	if (total_slots == 0 || slot_ticks == 0) {
+		return;
+	}
+
+	if (slot_index >= total_slots) {
+		LOG_WRN("TDMA: Invalid slot_index=%u (>= total_slots=%u), ignoring config update",
+			slot_index, total_slots);
 		return;
 	}
 
