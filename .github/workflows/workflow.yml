@@ -112,6 +112,7 @@ jobs:
       matrix:
         boards: [                 
                   {boardname: "nini_slimevr_uf2", filename: "nini_slimevr_uf2"},
+                  {boardname: "nini_slimevr_mag_uf2", filename: "nini_slimevr_mag_uf2"},
                   {boardname: "nini_slimevr_v2_uf2", filename: "nini_slimevr_v2_uf2"},
                   {boardname: "nini_slimevr_v2_mag_uf2", filename: "nini_slimevr_v2_mag_uf2"},
                   {boardname: "nini_slimevr_v3_uf2", filename: "nini_slimevr_v3_uf2"},
