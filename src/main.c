@@ -27,6 +27,7 @@
 #include "sensor/sensor.h"
 
 #include <zephyr/sys/reboot.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 #include <hal/nrf_gpio.h>
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 #if !DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios) && CONFIG_BOARD_PROMICRO_UF2
@@ -59,9 +60,14 @@ int main(void)
 #endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
 	uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
+	const bool pwr_active_low = (DT_GPIO_FLAGS(ZEPHYR_USER_NODE, pwr_gpios) & GPIO_ACTIVE_LOW) != 0;
 	nrf_gpio_cfg(pwr_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
-		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_D0H1, NRF_GPIO_PIN_NOSENSE);
-	nrf_gpio_pin_set(pwr_psel);
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0D1, NRF_GPIO_PIN_NOSENSE);
+	if (pwr_active_low) {
+		nrf_gpio_pin_clear(pwr_psel);
+	} else {
+		nrf_gpio_pin_set(pwr_psel);
+	}
 #endif
 #if IGNORE_RESET && BUTTON_EXISTS
 	bool reset_pin_reset = false;

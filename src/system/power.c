@@ -10,6 +10,7 @@
 #include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/poweroff.h>
 #include <zephyr/sys/reboot.h>
@@ -104,33 +105,30 @@ static const struct gpio_dt_spec clk = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, clk_gp
 
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
 
-/* Strongly drive active-high enables low; stay output (no cfg_default — that enables pull-up). */
-static void sys_gpio_power_disable(uint32_t psel)
+/* LDO EN via open drain: sink low / release (do not use cfg_default — enables pull-up). */
+static void sys_gpio_ldo_en_set(uint32_t psel, bool enable)
 {
+	const bool active_low = (DT_GPIO_FLAGS(ZEPHYR_USER_NODE, pwr_gpios) & GPIO_ACTIVE_LOW) != 0;
+	const bool drive_on = active_low ? !enable : enable;
+
 	nrf_gpio_cfg(psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
-		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0D1, NRF_GPIO_PIN_NOSENSE);
-	nrf_gpio_pin_clear(psel);
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0D1, NRF_GPIO_PIN_NOSENSE);
+	if (drive_on) {
+		nrf_gpio_pin_set(psel);
+	} else {
+		nrf_gpio_pin_clear(psel);
+	}
 }
 
-static void sys_disconnect_sensor_power(void)
+static void sys_gpio_ldo_en_disable(uint32_t psel)
 {
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
-	uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
-	LOG_INF("Cutting sensor power (PSEL %u)", pwr_psel);
-	sys_gpio_power_disable(pwr_psel);
-#endif
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
-	uint32_t vcc_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, vcc_gpios);
-	LOG_INF("Cutting sensor VCC (PSEL %u)", vcc_psel);
-	sys_gpio_power_disable(vcc_psel);
-#endif
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
-	uint32_t gnd_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, gnd_gpios);
-	LOG_INF("Releasing sensor GND (PSEL %u)", gnd_psel);
-	nrf_gpio_cfg(gnd_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
-		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
-	nrf_gpio_pin_set(gnd_psel);
-#endif
+	sys_gpio_ldo_en_set(psel, false);
+}
+
+/* nRF loses GPIO config in System OFF; pulldown until entry helps only briefly. */
+static void sys_gpio_ldo_en_prepare_system_off(uint32_t psel)
+{
+	nrf_gpio_cfg_input(psel, NRF_GPIO_PIN_PULLDOWN);
 }
 
 static void sys_disconnect_interface_pins(void)
@@ -421,8 +419,7 @@ static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 static void sys_system_off(void) // TODO: add timeout
 {
 	LOG_INF("System off requested");
-	configure_system_off(); // IMU shutdown over bus while sensor rail is still up
-	sys_disconnect_sensor_power();
+	configure_system_off(); // IMU shutdown over bus while LDO is still on
 	sensor_calibration_online_mag_cold_start();
 #if CONFIG_SENSOR_USE_TCAL
 	// Reset boot calibration state so it will recalibrate on next boot
@@ -432,23 +429,30 @@ static void sys_system_off(void) // TODO: add timeout
 	// sensor_fusion_update_bias(NULL);
 	// sensor_retained_write();
 	set_regulator(SYS_REGULATOR_LDO); // Switch to LDO
-	// Set system off
-#if IMU_INT_EXISTS
-	// Configure interrupt pin as it is not used
-	uint32_t int0_gpios = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, int0_gpios);
-	LOG_INF("Wake up GPIO pin: %u", int0_gpios);
-	nrf_gpio_cfg(int0_gpios, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
-	LOG_INF("Disconnected IMU wake up GPIO");
-#endif
-	// Cut sensor rail and release bus pins (command shutdown only; not used in WOM)
 	sys_disconnect_interface_pins();
 	LOG_INF("Powering off nRF");
-#if CONFIG_DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
-	disconnect_sensor_pins();
-#endif
 	sys_update_battery_tracker(current_battery_pptt, device_plugged);
 	// retained_update();
 	wait_for_logging();
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+	{
+		uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
+		sys_gpio_ldo_en_disable(pwr_psel);
+		k_busy_wait(10000);
+		sys_gpio_ldo_en_prepare_system_off(pwr_psel);
+		LOG_INF("LDO EN off before System OFF, PSEL %u, gpio read=%u", pwr_psel,
+			nrf_gpio_pin_read(pwr_psel));
+	}
+#endif
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
+	sys_gpio_ldo_en_disable(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, vcc_gpios));
+#endif
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
+	uint32_t gnd_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, gnd_gpios);
+	nrf_gpio_cfg(gnd_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
+	nrf_gpio_pin_set(gnd_psel);
+#endif
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
