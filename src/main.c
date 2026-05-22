@@ -27,21 +27,13 @@
 #include "sensor/sensor.h"
 
 #include <zephyr/sys/reboot.h>
-#include <zephyr/drivers/gpio.h>
+#include <hal/nrf_gpio.h>
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
-static const struct gpio_dt_spec pwr = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, pwr_gpios);
-#else
-#if CONFIG_BOARD_PROMICRO_UF2
+#if !DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios) && CONFIG_BOARD_PROMICRO_UF2
 #warning "IMU power pins not defined: do not stack IMU on PROMICRO"
-#endif // CONFIG_BOARD_PROMICRO_UF2
 #endif
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
-static const struct gpio_dt_spec gnd = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gnd_gpios);
-#else
-#if CONFIG_BOARD_PROMICRO_UF2
+#if !DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios) && CONFIG_BOARD_PROMICRO_UF2
 #warning "IMU gnd pins not defined: do not stack IMU on PROMICRO"
-#endif // CONFIG_BOARD_PROMICRO_UF2
 #endif
 #define DFU_DBL_RESET_MEM 0x20007F7C
 #define DFU_DBL_RESET_APP 0x4ee5677e
@@ -60,12 +52,16 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 int main(void)
 {
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
-	gpio_pin_configure_dt(&gnd, GPIO_OUTPUT_ACTIVE);
-	gpio_pin_set_dt(&gnd, 0);
+	uint32_t gnd_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, gnd_gpios);
+	nrf_gpio_cfg(gnd_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0D1, NRF_GPIO_PIN_NOSENSE);
+	nrf_gpio_pin_clear(gnd_psel);
 #endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
-	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_ACTIVE);
-	gpio_pin_set_dt(&pwr, 1);
+	uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
+	nrf_gpio_cfg(pwr_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_D0H1, NRF_GPIO_PIN_NOSENSE);
+	nrf_gpio_pin_set(pwr_psel);
 #endif
 #if IGNORE_RESET && BUTTON_EXISTS
 	bool reset_pin_reset = false;
