@@ -581,8 +581,8 @@ void sys_command_shutdown(void)
 	LOG_INF("Command shutdown requested");
 	reboot_counter_write(0);
 	set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
-	k_msleep(1500);
-	sys_request_system_off(false);
+	/* Do not delay here: 1.5s sleep kept pwr high while users measured the rail. */
+	sys_request_system_off(true);
 }
 
 void sys_reset_mode(uint8_t mode)

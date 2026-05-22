@@ -104,13 +104,12 @@ static const struct gpio_dt_spec clk = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, clk_gp
 
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
 
-/* Drive active-high power enables low, then disconnect (uses PSEL, not port-local pin). */
+/* Strongly drive active-high enables low; stay output (no cfg_default — that enables pull-up). */
 static void sys_gpio_power_disable(uint32_t psel)
 {
 	nrf_gpio_cfg(psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
-		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0D1, NRF_GPIO_PIN_NOSENSE);
 	nrf_gpio_pin_clear(psel);
-	nrf_gpio_cfg_default(psel);
 }
 
 static void sys_disconnect_sensor_power(void)
@@ -128,8 +127,9 @@ static void sys_disconnect_sensor_power(void)
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
 	uint32_t gnd_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, gnd_gpios);
 	LOG_INF("Releasing sensor GND (PSEL %u)", gnd_psel);
+	nrf_gpio_cfg(gnd_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
 	nrf_gpio_pin_set(gnd_psel);
-	nrf_gpio_cfg_default(gnd_psel);
 #endif
 }
 
@@ -149,7 +149,6 @@ static void sys_disconnect_interface_pins(void)
 	nrf_gpio_cfg_default(mag_cs_gpios);
 	LOG_INF("Disconnected Magnetometer CS GPIO");
 #endif
-	sys_disconnect_sensor_power();
 }
 
 void sys_interface_suspend(void)
@@ -422,7 +421,8 @@ static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 static void sys_system_off(void) // TODO: add timeout
 {
 	LOG_INF("System off requested");
-	configure_system_off(); // Common subsystem shutdown and prepare sense pins
+	configure_system_off(); // IMU shutdown over bus while sensor rail is still up
+	sys_disconnect_sensor_power();
 	sensor_calibration_online_mag_cold_start();
 #if CONFIG_SENSOR_USE_TCAL
 	// Reset boot calibration state so it will recalibrate on next boot
