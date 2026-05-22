@@ -83,10 +83,7 @@ static const struct gpio_dt_spec ldo_en = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, ldo
 #else
 #pragma message "LDO enable GPIO does not exist"
 #endif
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
-#define PWR_EXISTS true
-static const struct gpio_dt_spec pwr = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, pwr_gpios);
-#else
+#if !DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
 #pragma message "Power GPIO does not exist"
 #endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, int0_gpios)
@@ -101,14 +98,40 @@ static const struct gpio_dt_spec clk = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, clk_gp
 #else
 #pragma message "CLK GPIO does not exist"
 #endif
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
-#define VCC_EXISTS true
-static const struct gpio_dt_spec vcc = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, vcc_gpios);
-#else
+#if !DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
 #pragma message "VCC GPIO does not exist"
 #endif
 
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
+
+/* Drive active-high power enables low, then disconnect (uses PSEL, not port-local pin). */
+static void sys_gpio_power_disable(uint32_t psel)
+{
+	nrf_gpio_cfg(psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
+		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
+	nrf_gpio_pin_clear(psel);
+	nrf_gpio_cfg_default(psel);
+}
+
+static void sys_disconnect_sensor_power(void)
+{
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+	uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
+	LOG_INF("Cutting sensor power (PSEL %u)", pwr_psel);
+	sys_gpio_power_disable(pwr_psel);
+#endif
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
+	uint32_t vcc_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, vcc_gpios);
+	LOG_INF("Cutting sensor VCC (PSEL %u)", vcc_psel);
+	sys_gpio_power_disable(vcc_psel);
+#endif
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
+	uint32_t gnd_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, gnd_gpios);
+	LOG_INF("Releasing sensor GND (PSEL %u)", gnd_psel);
+	nrf_gpio_pin_set(gnd_psel);
+	nrf_gpio_cfg_default(gnd_psel);
+#endif
+}
 
 static void sys_disconnect_interface_pins(void)
 {
@@ -126,20 +149,7 @@ static void sys_disconnect_interface_pins(void)
 	nrf_gpio_cfg_default(mag_cs_gpios);
 	LOG_INF("Disconnected Magnetometer CS GPIO");
 #endif
-/*
-	TODO: for promicro, leaving ext_vcc on draws ~50uA, disconnect works, pulldown may be more reliable
-	what to do about boards that use ext_vcc? it is not expected to leave on during WOM
-*/
-#if PWR_EXISTS
-	LOG_INF("Power GPIO pin: %u", pwr.pin);
-	nrf_gpio_cfg_default(pwr.pin);
-	LOG_INF("Disconnected power GPIO");
-#endif
-#if VCC_EXISTS
-	LOG_INF("VCC GPIO pin: %u", vcc.pin);
-	nrf_gpio_cfg_default(vcc.pin);
-	LOG_INF("Disconnected VCC GPIO");
-#endif
+	sys_disconnect_sensor_power();
 }
 
 void sys_interface_suspend(void)
@@ -294,10 +304,6 @@ static void disconnect_sensor_pins(void)
 	}
 #endif
 
-// #if PWR_EXISTS
-// 	gpio_pin_configure_dt(&pwr, GPIO_DISCONNECTED);
-// 	LOG_INF("Disconnected power GPIO");
-// #endif
 // #if INT0_EXISTS
 // 	gpio_pin_configure_dt(&int0, GPIO_DISCONNECTED);
 // 	LOG_INF("Disconnected INT0 GPIO");
@@ -434,7 +440,7 @@ static void sys_system_off(void) // TODO: add timeout
 	nrf_gpio_cfg(int0_gpios, NRF_GPIO_PIN_DIR_INPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_PULLDOWN, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
 	LOG_INF("Disconnected IMU wake up GPIO");
 #endif
-	// Disconnect remaining interface pins // TODO: only an improvement during shutdown? causes higher usage in WOM
+	// Cut sensor rail and release bus pins (command shutdown only; not used in WOM)
 	sys_disconnect_interface_pins();
 	LOG_INF("Powering off nRF");
 #if CONFIG_DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
