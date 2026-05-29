@@ -52,14 +52,18 @@ void connection_write_packet_5();
 // Raw sensor data collection (runtime controlled via PONG command)
 
 struct raw_imu_sample {
-	float gyro[3];   // deg/s from fifo_process
-	float accel[3];  // g from fifo_process
-	float temp_c;    // T-Cal temperature in deg C for raw data collection
+	float gyr_quat[4];  // accumulated raw gyro quaternion (w,x,y,z)
+	float accel[3];     // g from fifo_process
+	float temp_c;       // T-Cal temperature in deg C for raw data collection
 };
 
 // Enable/disable data collection (called from PONG command handler)
 void connection_set_data_collection(bool enable);
 bool connection_get_data_collection(void);
+
+// OTA suppression: reduce poll rate when another tracker is being updated
+void connection_set_ota_suppressed(bool suppressed);
+bool connection_get_ota_suppressed(void);
 
 // Queue a raw IMU sample for transmission (called from sensor thread)
 void connection_queue_raw_sample(const struct raw_imu_sample *sample);
@@ -71,6 +75,9 @@ void connection_queue_raw_mag(const float mag[3]);
 void connection_send_raw_metadata(float gyro_range, float accel_range,
 				  float gyro_odr, float accel_odr,
 				  float mag_odr, uint8_t imu_id, uint8_t mag_id);
+
+// Send calibration data packets (type 0x14, called after metadata)
+void connection_send_raw_calibration(void);
 
 // Check if metadata needs periodic re-send (returns true if due)
 bool connection_raw_metadata_resend_due(void);

@@ -29,9 +29,11 @@
 #include "tdma.h"
 #include "build_defines.h"
 #include "hid.h"
+#include "retained.h"
 #include "system/battery_tracker.h"
 #include "system/watchdog.h"
 #include "system/test_mode.h"
+#include "system/esb_ota.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -446,23 +448,23 @@ static int64_t last_runtime_time = 0;
  * Sensor thread queues raw IMU/mag samples via message queues.
  * Connection thread drains them and sends ESB packets with floats.
  *
- * ESB Raw IMU packet (type 0x10, 48 bytes):
- *   [0]    type 0x10
+ * ESB Raw IMU + GyrQuat packet (type 0x13, 52 bytes):
+ *   [0]    type 0x13
  *   [1]    tracker_id
  *   [2-3]  sequence (16-bit BE)
- *   [4-15] gyro x,y,z (float × 3, deg/s)
- *   [16-27] accel x,y,z (float × 3, g)
- *   [28-39] mag x,y,z (float × 3, or zeros)
- *   [40]   flags (bit0: has_new_mag)
- *   [41-44] T-Cal temperature (float, deg C)
- *   [45-47] reserved
+ *   [4-19] gyr_quat w,x,y,z (float × 4, accumulated raw integration)
+ *   [20-31] accel x,y,z (float × 3, g)
+ *   [32-43] mag x,y,z (float × 3, or zeros)
+ *   [44]   flags (bit0: has_new_mag)
+ *   [45-48] T-Cal temperature (float, deg C)
+ *   [49-51] reserved
  */
 #include <zephyr/sys/byteorder.h>
 
 #define RAW_IMU_QUEUE_SIZE  16
 
 struct raw_imu_queued {
-	float gyro[3];
+	float gyr_quat[4];
 	float accel[3];
 	float temp_c;
 };
@@ -471,13 +473,17 @@ K_MSGQ_DEFINE(raw_imu_msgq, sizeof(struct raw_imu_queued), RAW_IMU_QUEUE_SIZE, 4
 
 static uint16_t raw_sequence = 0;
 static bool data_collection_active = false;
+static volatile bool ota_suppressed = false;  /* Reduce poll rate during parallel OTA */
+static int64_t ota_suppress_start_time = 0;   /* Timestamp when suppress was enabled */
+#define OTA_SUPPRESS_TIMEOUT_MS (10 * 60 * 1000)
 
 /*
  * ARQ ring buffer: stores last RAW_RING_SIZE sent packets for retransmission.
  * Indexed by (sequence % RAW_RING_SIZE).
  */
 #define RAW_RING_SIZE 512
-static uint8_t raw_ring[RAW_RING_SIZE][ESB_MAX_PAYLOAD_LEN];
+#define RAW_PACKET_SIZE 52  /* Fixed raw data packet size (type 0x13 with gyrQuat) */
+static uint8_t raw_ring[RAW_RING_SIZE][RAW_PACKET_SIZE];
 static bool    raw_ring_valid[RAW_RING_SIZE];
 
 /*
@@ -498,6 +504,11 @@ static int64_t raw_metadata_last_ms = 0;
 static float latest_mag[3] = {0};
 static bool latest_mag_valid = false;
 
+/* Calibration drip-feed state (one packet per connection cycle) */
+static bool raw_cal_pending = false;
+static uint8_t raw_cal_phase = 0;      /* 0=accel, 1=mag, 2=gyro, 3=tcal_state, 4=tcal_points */
+static uint16_t raw_cal_point_idx = 0; /* current TCal point index */
+
 void connection_set_data_collection(bool enable)
 {
 	if (enable && !data_collection_active) {
@@ -506,6 +517,7 @@ void connection_set_data_collection(bool enable)
 		raw_sequence = 0;
 		raw_metadata_sent = false;
 		latest_mag_valid = false;
+		raw_cal_pending = false;
 		/* Reset ARQ state */
 		memset(raw_ring_valid, 0, sizeof(raw_ring_valid));
 		raw_retx_count = 0;
@@ -520,12 +532,28 @@ bool connection_get_data_collection(void)
 	return data_collection_active;
 }
 
+void connection_set_ota_suppressed(bool suppressed)
+{
+	ota_suppressed = suppressed;
+	if (suppressed) {
+		ota_suppress_start_time = k_uptime_get();
+	} else {
+		ota_suppress_start_time = 0;
+	}
+	LOG_INF("OTA suppression %s", suppressed ? "ENABLED (slow poll)" : "DISABLED (normal poll)");
+}
+
+bool connection_get_ota_suppressed(void)
+{
+	return ota_suppressed;
+}
+
 void connection_queue_raw_sample(const struct raw_imu_sample *sample)
 {
 	if (!data_collection_active) return;
 
 	struct raw_imu_queued entry;
-	memcpy(entry.gyro, sample->gyro, sizeof(entry.gyro));
+	memcpy(entry.gyr_quat, sample->gyr_quat, sizeof(entry.gyr_quat));
 	memcpy(entry.accel, sample->accel, sizeof(entry.accel));
 	entry.temp_c = sample->temp_c;
 
@@ -549,7 +577,7 @@ void connection_send_raw_metadata(float gyro_range, float accel_range,
 				  float gyro_odr, float accel_odr,
 				  float mag_odr, uint8_t imu, uint8_t mag)
 {
-	uint8_t buf[ESB_MAX_PAYLOAD_LEN];
+	uint8_t buf[RAW_PACKET_SIZE];
 	memset(buf, 0, sizeof(buf));
 	buf[0] = ESB_RAW_META_TYPE;
 	buf[1] = tracker_id;
@@ -561,9 +589,111 @@ void connection_send_raw_metadata(float gyro_range, float accel_range,
 	buf[22] = imu;
 	buf[23] = mag;
 
-	esb_write(buf, false, ESB_MAX_PAYLOAD_LEN);
+	esb_write(buf, false, RAW_PACKET_SIZE);
 	raw_metadata_sent = true;
 	raw_metadata_last_ms = k_uptime_get();
+}
+
+void connection_send_raw_calibration(void)
+{
+	/* Mark calibration for drip-feed sending.
+	 * Actual packets are sent one-per-cycle in connection_process_raw_data().
+	 */
+	raw_cal_phase = 0;
+	raw_cal_point_idx = 0;
+	raw_cal_pending = true;
+}
+
+/**
+ * Send one calibration packet per call (drip-feed).
+ * Returns true if a packet was sent, false if calibration is complete.
+ */
+static bool connection_cal_drip_send(void)
+{
+	if (!raw_cal_pending) return false;
+
+	uint8_t buf[RAW_PACKET_SIZE];
+	memset(buf, 0, sizeof(buf));
+	buf[0] = ESB_RAW_CAL_TYPE;
+	buf[1] = tracker_id;
+
+	switch (raw_cal_phase) {
+	case 0: /* Accel calibration */
+		buf[2] = RAW_CAL_SUB_ACCEL;
+		memcpy(&buf[3], retained->accBAinv, sizeof(retained->accBAinv));
+		esb_write(buf, false, RAW_PACKET_SIZE);
+		raw_cal_phase = 1;
+		return true;
+
+	case 1: /* Mag calibration */
+		buf[2] = RAW_CAL_SUB_MAG;
+		memcpy(&buf[3], retained->magBAinv, sizeof(retained->magBAinv));
+		esb_write(buf, false, RAW_PACKET_SIZE);
+		raw_cal_phase = 2;
+		return true;
+
+	case 2: /* Gyro calibration */
+		buf[2] = RAW_CAL_SUB_GYRO;
+		memcpy(&buf[3], retained->gyroBias, sizeof(retained->gyroBias));
+		memcpy(&buf[15], retained->gyroSensScale, sizeof(retained->gyroSensScale));
+		esb_write(buf, false, RAW_PACKET_SIZE);
+#if CONFIG_SENSOR_USE_TCAL
+		raw_cal_phase = 3;
+#else
+		raw_cal_pending = false;
+#endif
+		return true;
+
+#if CONFIG_SENSOR_USE_TCAL
+	case 3: { /* T-Cal state */
+		buf[2] = RAW_CAL_SUB_TCAL;
+		buf[3] = retained->tcal_enabled ? 1 : 0;
+		uint16_t npoints = retained->tempCalState.count;
+		memcpy(&buf[4], &npoints, 2);
+		float temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
+		float temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
+		memcpy(&buf[6], &temp_min, 4);
+		memcpy(&buf[10], &temp_max, 4);
+		memcpy(&buf[14], retained->tempCalCorrectionOffset, 12);
+		esb_write(buf, false, RAW_PACKET_SIZE);
+		if (npoints > 0) {
+			raw_cal_phase = 4;
+			raw_cal_point_idx = 0;
+		} else {
+			raw_cal_pending = false;
+		}
+		return true;
+	}
+
+	case 4: { /* T-Cal points (2 per packet) */
+		uint16_t count = retained->tempCalState.count;
+		uint16_t i = raw_cal_point_idx;
+		if (i >= count) {
+			raw_cal_pending = false;
+			return false;
+		}
+		buf[2] = RAW_CAL_SUB_TCAL_POINTS;
+		buf[3] = (uint8_t)(i / 2); /* chunk_idx */
+		memcpy(&buf[4], &count, 2);
+		uint8_t n = (i + 1 < count) ? 2 : 1;
+		buf[6] = n;
+		memcpy(&buf[7], &retained->tempCalPoints[i], 16);
+		if (n == 2) {
+			memcpy(&buf[23], &retained->tempCalPoints[i + 1], 16);
+		}
+		esb_write(buf, false, RAW_PACKET_SIZE);
+		raw_cal_point_idx += 2;
+		if (raw_cal_point_idx >= count) {
+			raw_cal_pending = false;
+		}
+		return true;
+	}
+#endif
+
+	default:
+		raw_cal_pending = false;
+		return false;
+	}
 }
 
 bool connection_raw_metadata_resend_due(void)
@@ -591,7 +721,7 @@ bool connection_process_raw_data(void)
 
 		if (raw_ring_valid[idx]) {
 			/* Retransmit from ring buffer */
-			esb_write(raw_ring[idx], false, ESB_MAX_PAYLOAD_LEN);
+			esb_write(raw_ring[idx], false, RAW_PACKET_SIZE);
 			raw_retx_total++;
 		}
 
@@ -608,44 +738,50 @@ bool connection_process_raw_data(void)
 	/* Priority 2: Send new IMU sample */
 	struct raw_imu_queued sample;
 	if (k_msgq_get(&raw_imu_msgq, &sample, K_NO_WAIT) == 0) {
-		uint8_t buf[ESB_MAX_PAYLOAD_LEN];
+		uint8_t buf[RAW_PACKET_SIZE];
 		memset(buf, 0, sizeof(buf));
 
-		buf[0] = ESB_RAW_IMU_TYPE;
+		buf[0] = ESB_RAW_IMU_QUAT_TYPE;
 		buf[1] = tracker_id;
 		uint16_t seq = raw_sequence++;
 		sys_put_be16(seq, &buf[2]);
 
-		/* Gyro float × 3 */
-		memcpy(&buf[4], &sample.gyro[0], 4);
-		memcpy(&buf[8], &sample.gyro[1], 4);
-		memcpy(&buf[12], &sample.gyro[2], 4);
+		/* GyrQuat float × 4 (w, x, y, z) */
+		memcpy(&buf[4], &sample.gyr_quat[0], 4);
+		memcpy(&buf[8], &sample.gyr_quat[1], 4);
+		memcpy(&buf[12], &sample.gyr_quat[2], 4);
+		memcpy(&buf[16], &sample.gyr_quat[3], 4);
 
 		/* Accel float × 3 */
-		memcpy(&buf[16], &sample.accel[0], 4);
-		memcpy(&buf[20], &sample.accel[1], 4);
-		memcpy(&buf[24], &sample.accel[2], 4);
+		memcpy(&buf[20], &sample.accel[0], 4);
+		memcpy(&buf[24], &sample.accel[1], 4);
+		memcpy(&buf[28], &sample.accel[2], 4);
 
 		/* Piggyback latest mag if available */
 		uint8_t flags = 0;
 		if (latest_mag_valid) {
-			memcpy(&buf[28], &latest_mag[0], 4);
-			memcpy(&buf[32], &latest_mag[1], 4);
-			memcpy(&buf[36], &latest_mag[2], 4);
+			memcpy(&buf[32], &latest_mag[0], 4);
+			memcpy(&buf[36], &latest_mag[1], 4);
+			memcpy(&buf[40], &latest_mag[2], 4);
 			flags |= 0x01; /* has_new_mag */
 			latest_mag_valid = false;
 		}
 
-		buf[40] = flags;
-		memcpy(&buf[41], &sample.temp_c, sizeof(sample.temp_c));
+		buf[44] = flags;
+		memcpy(&buf[45], &sample.temp_c, sizeof(sample.temp_c));
 
 		/* Save to ring buffer for potential retransmission */
 		uint16_t ring_idx = seq % RAW_RING_SIZE;
-		memcpy(raw_ring[ring_idx], buf, ESB_MAX_PAYLOAD_LEN);
+		memcpy(raw_ring[ring_idx], buf, RAW_PACKET_SIZE);
 		raw_ring_valid[ring_idx] = true;
 
-		esb_write(buf, false, ESB_MAX_PAYLOAD_LEN);
+		esb_write(buf, false, RAW_PACKET_SIZE);
 		return true;
+	}
+
+	/* Priority 3: Drip-feed calibration packets when idle */
+	if (raw_cal_pending) {
+		return connection_cal_drip_send();
 	}
 
 	return false;
@@ -758,6 +894,13 @@ void connection_thread(void)
 			continue;
 		}
 
+		/*
+		 * Process OTA packets queued from ESB ISR (safe in thread context).
+		 * Must run before esb_ota_is_active() check since BEGIN activates OTA.
+		 * Also must run before PING to process ACK payloads from previous PINGs.
+		 */
+		esb_process_ota_rx_queue();
+
 		/* PING has highest priority.
 		 *
 		 * When TDMA is enabled and the last sync is getting stale
@@ -792,6 +935,33 @@ void connection_thread(void)
 			last_ping_time = now;
 			// k_usleep(400);
 			continue;
+		}
+
+		/*
+		 * ESB OTA mode: when active, stop sending sensor data and instead
+		 * send frequent OTA status/poll packets. The receiver responds
+		 * with OTA data in the ACK payload.
+		 */
+		if (esb_ota_is_active()) {
+			esb_ota_check_timeout();
+			esb_ota_periodic_status();
+			k_msleep(2);
+			continue;
+		}
+
+		/*
+		 * OTA suppression: when another tracker is being updated,
+		 * this tracker reduces its poll rate to free radio bandwidth.
+		 */
+		if (ota_suppressed) {
+			/* Safety timeout: auto-unsuppress after timeout */
+			if (ota_suppress_start_time > 0 &&
+			    (now - ota_suppress_start_time) > OTA_SUPPRESS_TIMEOUT_MS) {
+				LOG_WRN("OTA suppress timeout, auto-unsuppressing");
+				connection_set_ota_suppressed(false);
+			} else {
+				k_msleep(100); /* ~10 Hz poll rate */
+			}
 		}
 
 		/* Skip sensor data during connection error */
