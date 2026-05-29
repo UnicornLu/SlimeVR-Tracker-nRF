@@ -26,6 +26,7 @@
 #include "system/system.h"
 #include "system/test_mode.h"
 #include "system/watchdog.h"
+#include "system/esb_ota.h"
 #include "connection.h"
 #include "zephyr/sys/byteorder.h"
 #include "zephyr/sys/time_units.h"
@@ -123,6 +124,17 @@ static uint32_t received_channel_value = 0; // Store channel value from PONG dat
 static float received_sens_data[3] = {0};   // Store sensitivity data
 #define REMOTE_COMMAND_DELAY_MS 1500
 
+/* ── OTA packet queue (ISR → thread) ─────────────────────────────
+ * OTA packets received in ESB ISR are queued here and processed
+ * in the connection thread where flash/logging is safe. */
+#define OTA_RX_QUEUE_SIZE 16
+static struct {
+	uint8_t data[CONFIG_ESB_MAX_PAYLOAD_LENGTH];
+	uint8_t length;
+} ota_rx_queue[OTA_RX_QUEUE_SIZE];
+static volatile uint8_t ota_rx_head;
+static volatile uint8_t ota_rx_tail;
+
 // Server time synchronization for TDMA scheduling (using ticks)
 static bool server_time_synced = false;
 
@@ -140,11 +152,8 @@ static int32_t g_skew_ref_offset = 0;        // Offset at skew reference point
 static uint32_t g_skew_ref_local_ticks = 0;  // Local ticks at skew reference point (updated infrequently)
 #define SKEW_REF_REFRESH_TICKS (60 * 32768)  // Refresh skew reference every ~60s
 
-// Minimum RTT tracking for asymmetric delay compensation
-// In ESB, return path (ACK) has fixed delay ≈ min_rtt/2
-// Forward path absorbs all retransmission overhead
-// Init to ~305µs (10 ticks): conservative estimate for clean 2Mbps ESB RTT,
-// avoids wildly wrong first offset if first PONG has retransmissions.
+// Minimum RTT tracking for PONG acceptance threshold and diagnostics.
+// Init to ~305µs (10 ticks): conservative estimate for clean 2Mbps ESB RTT.
 static uint32_t g_min_rtt_ticks = 10;
 static uint32_t g_min_rtt_age = 0; // PONGs since last min_rtt update
 #define MIN_RTT_AGE_LIMIT 120      // Age out after ~120 PONGs (~2 min at 1/s)
@@ -606,7 +615,7 @@ void event_handler(struct esb_evt const *event)
 						);
 					} else if (ping_ticks_for_this_ctr != 0) {
 						// ====================================================================
-						// RTT and Server Time Offset Calculation (ESB Asymmetric Model)
+						// RTT and Server Time Offset Calculation (Reference-Point Model)
 						// ====================================================================
 						// In ESB, the return path (ACK) has FIXED delay regardless of
 						// retransmissions. All retransmission time is on the forward path.
@@ -615,8 +624,7 @@ void event_handler(struct esb_evt const *event)
 						// With retransmit:  T1 --[fail]--[fail]--[air]--> T2
 						//                   T4 <--[ACK]-- T3≈T2
 						//
-						// return_delay ≈ min_rtt / 2  (constant)
-						// offset = T2 - T4 + return_delay
+						// offset = T2 - T4 (constant one-way bias cancels for TDMA)
 						// ====================================================================
 
 						/* Use ISR-accurate T4 timestamp captured in the RADIO
@@ -670,10 +678,13 @@ void event_handler(struct esb_evt const *event)
 							rtt_threshold_us = 1000;
 						}
 						if (rtt_us < rtt_threshold_us) {
-							// Asymmetric offset: ACK return path has fixed delay
-							int32_t return_delay_ticks = (int32_t)g_min_rtt_ticks / 2;
+							// Reference-point offset: T2 - T4
+							// The constant one-way delay bias is the same for
+							// all trackers and cancels out in TDMA slot alignment.
+							// Decoupling from min_rtt avoids noise injection when
+							// min_rtt ages/updates.
 							int32_t server_offset_ticks
-								= (int32_t)(ping_rx_ticks - t4_ticks) + return_delay_ticks;
+								= (int32_t)(ping_rx_ticks - t4_ticks);
 
 							g_last_rx_raw_ticks = ping_rx_ticks;
 							g_last_sync_local_ticks = ping_ticks_for_this_ctr;
@@ -722,25 +733,30 @@ void event_handler(struct esb_evt const *event)
 									}
 
 									/*
-									 * EMA-filtered offset update.
-									 *
-								 * With ISR-accurate T4 timestamps, measurement noise
-								 * is ±2 ticks (down from ±15 with EVENT_IRQ).
-								 * Use alpha=1/2 throughout for fast tracking.
+								 * Predict-Update EMA offset filter.
 								 *
-								 * Warm-up (first 5 PONGs): alpha=3/4 for aggressive
-								 * convergence when min_rtt is still settling.
+								 * Use skew prediction as the expected offset,
+								 * so EMA innovation contains only measurement
+								 * noise (not deterministic drift).  This allows
+								 * a smaller alpha for better noise rejection
+								 * while skew handles drift tracking.
+								 *
+								 * Warm-up (first 5 PONGs): alpha=3/4 for fast
+								 * initial convergence before skew is estimated.
 								 */
 								g_sync_update_count++;
-								int32_t offset_innovation = server_offset_ticks - (int32_t)g_server_ticks_offset;
+								/* Predict: where we expect the offset to be based on skew */
+								uint32_t delta_since_sync = ping_ticks_for_this_ctr - g_last_sync_local_ticks;
+								int32_t predicted_current = (int32_t)g_server_ticks_offset
+									+ (int32_t)((int64_t)g_clock_skew_ppb * delta_since_sync / 1000000000LL);
+								int32_t offset_innovation = server_offset_ticks - predicted_current;
 								if (g_sync_update_count <= SYNC_WARM_UP_COUNT) {
-									/* Warm-up: alpha=3/4 */
-									g_server_ticks_offset += (offset_innovation * 3 + 2) / 4;
+									/* Warm-up: alpha=3/4 for fast convergence */
+									g_server_ticks_offset = predicted_current + (offset_innovation * 3 + 2) / 4;
 								} else {
-									/* Steady state: alpha=1/2 */
-									g_server_ticks_offset += (offset_innovation + 1) / 2;
+									/* Steady state: alpha=1/4 (skew handles drift) */
+									g_server_ticks_offset = predicted_current + (offset_innovation + 2) / 4;
 								}
-
 								// Refresh skew reference periodically to avoid uint32 wrap
 								if (delta_from_ref > SKEW_REF_REFRESH_TICKS) {
 										g_skew_ref_offset = server_offset_ticks;
@@ -795,8 +811,12 @@ void event_handler(struct esb_evt const *event)
 
 					// handle remote commands and delayed execution
 					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
-						if (received_remote_command == ESB_PONG_FLAG_NORMAL) {
-							// new command received
+						if (received_remote_command == ESB_PONG_FLAG_NORMAL ||
+						    (received_remote_command == acked_remote_command &&
+						     pong_flags != received_remote_command)) {
+							// new command received, or override already-executed command
+							// whose confirmation was superseded by the receiver
+							// (but skip re-accepting the same command repeatedly)
 							received_remote_command = pong_flags;
 							remote_command_receive_time = k_uptime_get();
 
@@ -899,6 +919,18 @@ void event_handler(struct esb_evt const *event)
 							case ESB_PONG_FLAG_TDMA_OFF:
 								cmd_name = "TDMA_OFF";
 								break;
+							case ESB_PONG_FLAG_OTA_QUERY_INFO:
+								cmd_name = "OTA_QUERY_INFO";
+								break;
+							case ESB_PONG_FLAG_OTA_ABORT:
+								cmd_name = "OTA_ABORT";
+								break;
+							case ESB_PONG_FLAG_OTA_SUPPRESS:
+								cmd_name = "OTA_SUPPRESS";
+								break;
+							case ESB_PONG_FLAG_OTA_UNSUPPRESS:
+								cmd_name = "OTA_UNSUPPRESS";
+								break;
 							}
 							if (pong_flags == ESB_PONG_FLAG_SET_CHANNEL) {
 								LOG_INF(
@@ -909,11 +941,14 @@ void event_handler(struct esb_evt const *event)
 									REMOTE_COMMAND_DELAY_MS
 								);
 							} else {
+								bool is_ota = (pong_flags >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
+									       pong_flags <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
 								LOG_INF(
-									"Remote command %s (0x%02X) received, will execute in %dms",
+									"Remote command %s (0x%02X) received, %s",
 									cmd_name,
 									pong_flags,
-									REMOTE_COMMAND_DELAY_MS
+									is_ota ? "executing immediately" :
+									"will execute in 1500ms"
 								);
 							}
 						}
@@ -957,7 +992,23 @@ void event_handler(struct esb_evt const *event)
 							raw_retx_queue[raw_retx_count++] = seq;
 						}
 					}
-				} else {
+				}
+				/* OTA packets from receiver (in ACK payload) —
+				 * queue for deferred processing in thread context
+				 * (flash ops and logging not safe in ISR) */
+				else if (rx_payload.length >= 2 &&
+					 rx_payload.data[0] >= ESB_OTA_DATA_TYPE &&
+					 rx_payload.data[0] <= ESB_OTA_ACTIVATE_TYPE) {
+					uint8_t next = (ota_rx_head + 1) % OTA_RX_QUEUE_SIZE;
+					if (next != ota_rx_tail) {
+						memcpy(ota_rx_queue[ota_rx_head].data,
+						       rx_payload.data, rx_payload.length);
+						ota_rx_queue[ota_rx_head].length = rx_payload.length;
+						__DMB();
+						ota_rx_head = next;
+					}
+				}
+				else {
 					LOG_WRN("Ignoring invalid payload length %u", rx_payload.length);
 				}
 			} // end of rx_payload length switch
@@ -1251,6 +1302,21 @@ void esb_clear_pair(void)
 	LOG_INF("Pairing data reset");
 }
 
+void esb_process_ota_rx_queue(void)
+{
+	while (ota_rx_tail != ota_rx_head) {
+		uint8_t idx = ota_rx_tail;
+		if (ota_rx_queue[idx].data[0] != ESB_OTA_DATA_TYPE) {
+			LOG_WRN("OTA queue: non-data type=0x%02X len=%u",
+				ota_rx_queue[idx].data[0], ota_rx_queue[idx].length);
+		}
+		esb_ota_process_rx_packet(ota_rx_queue[idx].data,
+					  ota_rx_queue[idx].length);
+		__DMB();
+		ota_rx_tail = (idx + 1) % OTA_RX_QUEUE_SIZE;
+	}
+}
+
 void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 {
 	if (!esb_initialized || !esb_paired) {
@@ -1304,21 +1370,33 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	bool is_raw = (data[0] >= 0x10 && data[0] <= 0x12);
 
 	/*
-	 * TDMA slot gating for noack sensor-data packets.
+	 * TDMA slot gating / random backoff for noack sensor-data packets.
 	 *
 	 * Wait BEFORE queuing: if the packet were queued first and the radio
 	 * were still auto-draining a previous TX, the new packet could be
 	 * transmitted before the TDMA slot (bypassing the wait entirely).
 	 *
-	 * PING / ACK packets bypass TDMA (no_ack == false) so time-sync and
+	 * PING / ACK packets bypass this (no_ack == false) so time-sync and
 	 * connection-health probes are never delayed.
-	 * Raw data (0x10-0x12) always bypasses TDMA for minimum latency.
+	 * Raw data (0x10-0x12) always bypasses for minimum latency.
+	 *
+	 * When TDMA is disabled (compile-time or runtime), use random backoff
+	 * to reduce collision
 	 */
-#if CONFIG_CONNECTION_TDMA
 	if (no_ack && !is_raw) {
-		tdma_wait_for_slot();
-	}
+#if CONFIG_CONNECTION_TDMA
+		if (tdma_is_enabled()) {
+			tdma_wait_for_slot();
+		} else
 #endif
+		{
+			/* Random backoff: 0-1ms jitter using low bits of cycle counter */
+			uint32_t jitter_us = (k_cycle_get_32() & 0x3FF) % 1000;
+			if (jitter_us > 100) {
+				k_usleep(jitter_us);
+			}
+		}
+	}
 
 	// Try to queue the packet (now inside the TDMA slot window)
 	int queue_status = esb_write_payload(&tx_payload);
@@ -1578,7 +1656,11 @@ static void esb_thread(void)
 
 		if (received_remote_command != ESB_PONG_FLAG_NORMAL && received_remote_command != acked_remote_command
 			&& remote_command_receive_time > 0) {
-			if (now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
+			/* OTA commands (0x30-0x33) bypass the safety delay since they are
+			 * time-sensitive and not destructive like SHUTDOWN/CALIBRATE. */
+			bool is_ota_cmd = (received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
+					   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
+			if (is_ota_cmd || now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
 				switch (received_remote_command) {
 				case ESB_PONG_FLAG_SHUTDOWN:
 					LOG_WRN("Executing remote command: SHUTDOWN");
@@ -1830,6 +1912,26 @@ static void esb_thread(void)
 					LOG_INF("Executing remote command: DATA_COLLECT_OFF");
 					connection_set_data_collection(false);
 					test_mode_set(false);
+					break;
+
+				case ESB_PONG_FLAG_OTA_QUERY_INFO:
+					LOG_INF("Executing remote command: OTA_QUERY_INFO");
+					esb_ota_handle_query_info();
+					break;
+
+				case ESB_PONG_FLAG_OTA_ABORT:
+					LOG_WRN("Executing remote command: OTA_ABORT");
+					esb_ota_handle_abort();
+					break;
+
+				case ESB_PONG_FLAG_OTA_SUPPRESS:
+					LOG_INF("Executing remote command: OTA_SUPPRESS (reducing poll rate)");
+					connection_set_ota_suppressed(true);
+					break;
+
+				case ESB_PONG_FLAG_OTA_UNSUPPRESS:
+					LOG_INF("Executing remote command: OTA_UNSUPPRESS (resuming normal rate)");
+					connection_set_ota_suppressed(false);
 					break;
 
 				default:
