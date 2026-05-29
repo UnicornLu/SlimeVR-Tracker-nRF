@@ -24,6 +24,7 @@
 #include "system/system.h"
 #include "system/power.h"
 #include "system/test_mode.h"
+#include "system/esb_ota.h"
 #include "system/watchdog.h"
 #include "util.h"
 #include "connection/connection.h"
@@ -57,6 +58,11 @@ static sensor_debug_state_t debug_state = {
 	.enabled = false,
 	.output_every_n = 4  // Default: output every 4 accel samples
 };
+
+// Set to 1 to temporarily enable the extra Qdev/Qout debug line
+#ifndef SENSOR_DEBUG_QDEV_QOUT
+#define SENSOR_DEBUG_QDEV_QOUT 0
+#endif
 
 #if CONFIG_SENSOR_RANGE_STATS
 // Sensor range tracking state - records min/max values during runtime (not persisted)
@@ -110,7 +116,11 @@ static uint8_t sensor_mag_dev_reg = 0xFF;
 static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // vector to hold quaternion
 static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // vector to hold quaternion
 
-static float q3[4] = {SENSOR_QUATERNION_CORRECTION}; // correction quaternion
+static float sensor_to_device_quat[4] = {SENSOR_QUATERNION_CORRECTION};
+static float sensor_vector_to_device_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+#if !SENSOR_QUATERNION_OUTPUT_BIAS_IS_IDENTITY
+static float reported_output_bias_quat[4] = {SENSOR_QUATERNION_OUTPUT_BIAS};
+#endif
 
 static float last_lin_a[3] = {0}; // vector to hold last linear accelerometer
 
@@ -236,6 +246,43 @@ LOG_MODULE_REGISTER(sensor, LOG_LEVEL_DBG);
 #else
 LOG_MODULE_REGISTER(sensor, LOG_LEVEL_INF);
 #endif
+
+static inline void sensor_compute_device_quat(const float *fused_quat, float *device_quat)
+{
+	q_multiply(fused_quat, sensor_to_device_quat, device_quat);
+}
+
+static inline void sensor_compute_reported_quat(const float *device_quat, float *reported_quat)
+{
+#if SENSOR_QUATERNION_OUTPUT_BIAS_IS_IDENTITY
+	memcpy(reported_quat, device_quat, sizeof(float) * 4);
+#else
+	q_multiply(reported_output_bias_quat, device_quat, reported_quat);
+#endif
+}
+
+static inline void sensor_update_frame_transform_cache(void)
+{
+	// Orientation uses Qdevice = Qfused * Qcorr. For active vector rotation from
+	// sensor frame into device frame, we need the inverse of that basis correction.
+	q_conj(sensor_to_device_quat, sensor_vector_to_device_quat);
+}
+
+static inline void sensor_compute_device_and_reported_quat(
+	const float *fused_quat,
+	float *device_quat,
+	float *reported_quat)
+{
+	sensor_compute_device_quat(fused_quat, device_quat);
+	sensor_compute_reported_quat(device_quat, reported_quat);
+}
+
+static inline void sensor_rotate_sensor_vector_to_device_frame(
+	const float *sensor_vector,
+	float *device_vector)
+{
+	v_rotate(sensor_vector, sensor_vector_to_device_quat, device_vector);
+}
 
 static int sensor_scan(void);
 static int sensor_init(void);
@@ -868,9 +915,9 @@ static enum sensor_sensor_timeout sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU;
 static void sensor_update_sensor_state(void)
 {
 	bool calibrating = get_status(SYS_STATUS_CALIBRATION_RUNNING);
-	bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.005) : q_epsilon(q, last_q, 0.05); // TODO: Probably okay to use the constantly updating last_q?
+	bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.004) : q_epsilon(q, last_q, 0.05); // TODO: Probably okay to use the constantly updating last_q?
 	bool in_test_mode = test_mode_get();
-	if (!in_test_mode && !calibrating && resting)
+	if (!in_test_mode && !calibrating && !esb_ota_is_active() && !connection_get_ota_suppressed() && resting)
 	{
 		int64_t last_data_delta = k_uptime_get() - last_data_time;
 		if (sensor_mode < SENSOR_SENSOR_MODE_LOW_POWER && last_data_delta > CONFIG_SENSOR_LP_TIMEOUT) // No motion in lp timeout
@@ -928,6 +975,7 @@ static void sensor_update_sensor_state(void)
 int sensor_init(void)
 {
 	int err;
+	sensor_update_frame_transform_cache();
 	// TODO: on any errors set main_ok false and skip (make functions return nonzero)
 	if (mag_available && mag_enabled) // shutdown magnetometer first only when enabled
 	{
@@ -1077,7 +1125,8 @@ int sensor_init(void)
 			(uint8_t)sensor_imu_id,
 			(uint8_t)sensor_mag_id
 		);
-		LOG_INF("Data collection mode: metadata sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
+		connection_send_raw_calibration();
+		LOG_INF("Data collection mode: metadata + calibration sent (gyro %.0fdps, accel %.0fg, gyro ODR %.0fHz)",
 			(double)gyro_actual_range, (double)accel_actual_range,
 			1.0 / (double)gyro_actual_time);
 	}
@@ -1092,6 +1141,11 @@ static int64_t last_status_time = 0;
 static int64_t max_loop_time = 0;
 
 static bool last_data_collection_state = false;
+
+/* Raw gyro quaternion accumulator for data collection.
+ * Integrates raw gyro (no bias correction) so offline VQF can re-estimate bias.
+ * Reset when data collection starts. */
+static float raw_gyr_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
 #if DEBUG
 static int64_t last_acquisition_time = INT64_MAX;
@@ -1203,6 +1257,11 @@ void sensor_loop(void)
 			bool dc_active = connection_get_data_collection();
 			if (dc_active && !last_data_collection_state) {
 				sys_interface_resume();
+				/* Reset raw gyro quaternion accumulator */
+				raw_gyr_quat[0] = 1.0f;
+				raw_gyr_quat[1] = 0.0f;
+				raw_gyr_quat[2] = 0.0f;
+				raw_gyr_quat[3] = 0.0f;
 				connection_send_raw_metadata(
 					gyro_actual_range,
 					accel_actual_range,
@@ -1212,7 +1271,8 @@ void sensor_loop(void)
 					(uint8_t)sensor_imu_id,
 					(uint8_t)sensor_mag_id
 				);
-				LOG_INF("Data collection activated: metadata sent");
+				connection_send_raw_calibration();
+				LOG_INF("Data collection activated: metadata + calibration sent");
 			} else if (dc_active && connection_raw_metadata_resend_due()) {
 				connection_send_raw_metadata(
 					gyro_actual_range,
@@ -1223,6 +1283,7 @@ void sensor_loop(void)
 					(uint8_t)sensor_imu_id,
 					(uint8_t)sensor_mag_id
 				);
+				connection_send_raw_calibration();
 			}
 			last_data_collection_state = dc_active;
 
@@ -1392,7 +1453,32 @@ void sensor_loop(void)
 				if (raw_g[0] != 0 || raw_g[1] != 0 || raw_g[2] != 0) {
 					struct raw_imu_sample raw_sample;
 					if (dc_active) {
-						memcpy(raw_sample.gyro, raw_g, sizeof(raw_sample.gyro));
+						/* Integrate raw gyro into quaternion accumulator.
+						 * raw_g is in deg/s; convert to rad/s for integration. */
+						float g_rad[3] = {
+							raw_g[0] * (float)(M_PI / 180.0f),
+							raw_g[1] * (float)(M_PI / 180.0f),
+							raw_g[2] * (float)(M_PI / 180.0f)
+						};
+						float gyr_norm = sqrtf(g_rad[0]*g_rad[0] + g_rad[1]*g_rad[1] + g_rad[2]*g_rad[2]);
+						if (gyr_norm > 1e-6f) {
+							float angle = gyr_norm * gyro_actual_time;
+							float ha = angle * 0.5f;
+							float s = sinf(ha) / gyr_norm;
+							float step[4] = {cosf(ha), s*g_rad[0], s*g_rad[1], s*g_rad[2]};
+							/* q_new = q_old * step */
+							float q0 = raw_gyr_quat[0]*step[0] - raw_gyr_quat[1]*step[1] - raw_gyr_quat[2]*step[2] - raw_gyr_quat[3]*step[3];
+							float q1 = raw_gyr_quat[0]*step[1] + raw_gyr_quat[1]*step[0] + raw_gyr_quat[2]*step[3] - raw_gyr_quat[3]*step[2];
+							float q2 = raw_gyr_quat[0]*step[2] - raw_gyr_quat[1]*step[3] + raw_gyr_quat[2]*step[0] + raw_gyr_quat[3]*step[1];
+							float q3 = raw_gyr_quat[0]*step[3] + raw_gyr_quat[1]*step[2] - raw_gyr_quat[2]*step[1] + raw_gyr_quat[3]*step[0];
+							float inv_norm = 1.0f / sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+							raw_gyr_quat[0] = q0 * inv_norm;
+							raw_gyr_quat[1] = q1 * inv_norm;
+							raw_gyr_quat[2] = q2 * inv_norm;
+							raw_gyr_quat[3] = q3 * inv_norm;
+						}
+
+						memcpy(raw_sample.gyr_quat, raw_gyr_quat, sizeof(raw_sample.gyr_quat));
 						memcpy(raw_sample.accel, raw_collect_a, sizeof(raw_sample.accel));
 						raw_sample.temp_c = raw_collect_temp_c;
 						connection_queue_raw_sample(&raw_sample);
@@ -1712,8 +1798,9 @@ void sensor_loop(void)
 #endif
 				}
 
-				v_rotate(m, q3, m); // magnetic field in local device frame, no other transformation will be done
-				connection_update_sensor_mag(m);
+				float mag_device[3];
+				sensor_rotate_sensor_vector_to_device_frame(m, mag_device);
+				connection_update_sensor_mag(mag_device);
 			}
 
 			// Copy average acceleration for this frame
@@ -1935,6 +2022,14 @@ void sensor_loop(void)
 					printk("     VQF: Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f]\n",
 						(double)q[0], (double)q[1], (double)q[2], (double)q[3],
 						(double)lin_a[0], (double)lin_a[1], (double)lin_a[2]);
+#if SENSOR_DEBUG_QDEV_QOUT
+					float debug_device_quat[4];
+					float debug_reported_quat[4];
+					sensor_compute_device_and_reported_quat(q, debug_device_quat, debug_reported_quat);
+					printk("     Qdev[%.3f,%.3f,%.3f,%.3f] Qout[%.3f,%.3f,%.3f,%.3f]\n",
+						(double)debug_device_quat[0], (double)debug_device_quat[1], (double)debug_device_quat[2], (double)debug_device_quat[3],
+						(double)debug_reported_quat[0], (double)debug_reported_quat[1], (double)debug_reported_quat[2], (double)debug_reported_quat[3]);
+#endif
 					printk("     Rest:%c RestDev[G:%.3f,A:%.3f] Bias[%.3f,%.3f,%.3f]°/s Sigma:%.3f°/s Delta:%.2f°\n",
 						vqf_info.rest_detected ? 'Y' : 'N',
 						(double)vqf_info.rest_deviations[0], (double)vqf_info.rest_deviations[1],
@@ -1980,6 +2075,14 @@ void sensor_loop(void)
 					printk("     Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f]\n",
 						(double)q[0], (double)q[1], (double)q[2], (double)q[3],
 						(double)lin_a[0], (double)lin_a[1], (double)lin_a[2]);
+#if SENSOR_DEBUG_QDEV_QOUT
+					float debug_device_quat[4];
+					float debug_reported_quat[4];
+					sensor_compute_device_and_reported_quat(q, debug_device_quat, debug_reported_quat);
+					printk("     Qdev[%.3f,%.3f,%.3f,%.3f] Qout[%.3f,%.3f,%.3f,%.3f]\n",
+						(double)debug_device_quat[0], (double)debug_device_quat[1], (double)debug_device_quat[2], (double)debug_device_quat[3],
+						(double)debug_reported_quat[0], (double)debug_reported_quat[1], (double)debug_reported_quat[2], (double)debug_reported_quat[3]);
+#endif
 #endif
 				}
 			}
@@ -1998,15 +2101,16 @@ void sensor_loop(void)
 			{
 				memcpy(last_q, q, sizeof(q));
 				memcpy(last_lin_a, lin_a, sizeof(lin_a));
-				float q_offset[4];
-				q_multiply(q, q3, q_offset); // quaternion in device orientation, connection will change format from wxyz to xyzw
-				v_rotate(lin_a, q3, lin_a); // linear acceleration in local device frame, no other transformation will be done
+				float device_quat[4];
+				float reported_quat[4];
+				sensor_compute_device_and_reported_quat(q, device_quat, reported_quat);
+				sensor_rotate_sensor_vector_to_device_frame(lin_a, lin_a);
 
 				if (!send_quat_data && !send_lin_accel_data) {
 					memset(lin_a, 0, sizeof(lin_a)); // zero out linear acceleration when no motion detected
 				}
 
-				connection_update_sensor_data(q_offset, lin_a, sensor_data_time);
+				connection_update_sensor_data(reported_quat, lin_a, sensor_data_time);
 				last_sensor_send_time = now;
 
 				if (!resting) {

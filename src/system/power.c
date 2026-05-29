@@ -7,6 +7,7 @@
 #include "system.h"
 #include "led.h"
 #include "connection/esb.h"
+#include "system/esb_ota.h"
 #include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
@@ -367,6 +368,11 @@ void sys_request_system_reboot(bool immediate)
 static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what does the system do?
 {
 	LOG_INF("IMU wake up requested");
+	/* Block sleep during OTA (active or suppressed) */
+	if (esb_ota_is_active() || connection_get_ota_suppressed()) {
+		LOG_INF("IMU wake up blocked by OTA");
+		return;
+	}
 #if IMU_INT_EXISTS
 #if CONFIG_DELAY_SLEEP_ON_STATUS
 	if (!force && (!esb_ready() || !status_ready())) // Wait for esb to pair in case the user is still trying to pair the device
@@ -416,6 +422,11 @@ static void sys_WOM(bool force) // TODO: if IMU interrupt does not exist what do
 static void sys_system_off(void) // TODO: add timeout
 {
 	LOG_INF("System off requested");
+	/* Block shutdown during OTA (active or suppressed) */
+	if (esb_ota_is_active() || connection_get_ota_suppressed()) {
+		LOG_INF("System off blocked by OTA");
+		return;
+	}
 	configure_system_off(); // Common subsystem shutdown and prepare sense pins
 	sensor_calibration_online_mag_cold_start();
 #if CONFIG_SENSOR_USE_TCAL
@@ -590,6 +601,7 @@ static void power_thread(void)
 {
 	static bool boot_success_checked = false;
 	static bool watchdog_registered = false;
+	static bool ota_gpregret_logged = false;
 
 	/* Register power thread with watchdog (watchdog is initialized via SYS_INIT) */
 	if (!watchdog_registered) {
@@ -599,6 +611,15 @@ static void power_thread(void)
 
 	while (1)
 	{
+		/* Log OTA RAM engine GPREGRET once, after USB console is ready (~5s) */
+		if (!ota_gpregret_logged && k_uptime_get() > 5000) {
+			ota_gpregret_logged = true;
+			uint8_t gp = watchdog_get_ota_gpregret();
+			if (gp >= 0xD0 && gp <= 0xDE) {
+				LOG_WRN("OTA RAM engine GPREGRET=0x%02X (last stage before reset)", gp);
+			}
+		}
+
 		/* After 60 seconds of successful operation, mark boot as successful.
 		 * This is long enough to ensure the system is truly stable before
 		 * clearing the WDT reset counter, allowing multiple WDT resets to
