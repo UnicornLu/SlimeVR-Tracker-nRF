@@ -7,11 +7,16 @@ on:
     branches:
       - main
       - dev
+    tags:
+      - "*"
   create:
+  release:
+    types:
+      - published
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.ref }}
+  group: ${{ github.event.pull_request.head.sha || github.ref }}
   cancel-in-progress: true
 
 permissions: write-all
@@ -35,9 +40,15 @@ jobs:
         with:
           path: zephyr-workspace/SlimeNRF-CI
           submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: 📟 Generate CI Variables
         id: generate-vars
+        env:
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           WEST_FILE="west.yml"
 
@@ -58,10 +69,17 @@ jobs:
           SDK_REVISION=$(grep -A5 "name: sdk-nrf" "$WEST_FILE" | grep "revision:" | sed 's/.*revision: *//')
           SDK_COMMIT=$(git ls-remote "$SDK_URL" "$SDK_REVISION" | awk '{print $1}')
 
-          REPO="$GITHUB_REPOSITORY"
-          REPO_URL="https://github.com/$GITHUB_REPOSITORY.git"
-          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
-          REPO_COMMIT="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            REPO="$PR_HEAD_REPO"
+            REPO_URL="$PR_HEAD_REPO_URL"
+            BRANCH="$PR_HEAD_REF"
+            REPO_COMMIT="$PR_HEAD_SHA"
+          else
+            REPO="$GITHUB_REPOSITORY"
+            REPO_URL="https://github.com/$GITHUB_REPOSITORY.git"
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            REPO_COMMIT="$GITHUB_SHA"
+          fi
 
           echo "sdk-hash=$SDK_COMMIT" >> "$GITHUB_OUTPUT"
           echo "sdk-revision=$SDK_REVISION" >> "$GITHUB_OUTPUT"
@@ -159,13 +177,16 @@ jobs:
       - name: 📥 Clone Repository
         id: clone-repository
         if: steps.cache-repository.outputs.cache-hit != 'true'
+        env:
+          REPO_URL: ${{ steps.generate-vars.outputs.repo-url }}
+          REPO_HASH: ${{ steps.generate-vars.outputs.repo-hash }}
         run: |
           cd zephyr-workspace
           rm -rf SlimeVR-Tracker-nRF
 
-          git clone --filter=blob:none --no-checkout "${{ steps.generate-vars.outputs.repo-url }}" SlimeVR-Tracker-nRF
-          git -C SlimeVR-Tracker-nRF fetch origin "${{ steps.generate-vars.outputs.branch }}"
-          git -C SlimeVR-Tracker-nRF checkout "${{ steps.generate-vars.outputs.repo-hash }}"
+          git clone --filter=blob:none --no-checkout "$REPO_URL" SlimeVR-Tracker-nRF
+          git -C SlimeVR-Tracker-nRF fetch --depth=1 origin "$REPO_HASH"
+          git -C SlimeVR-Tracker-nRF checkout "$REPO_HASH"
           git -C SlimeVR-Tracker-nRF submodule update --init --recursive --depth 1
 
   build:
@@ -179,12 +200,12 @@ jobs:
                   {boardname: "xiao_ble/nrf52840/sense", filename: "SlimeNRF_XIAO_Sense_Tracker"},
                   {boardname: "promicro_uf2/nrf52840/i2c", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_I2C"},
                   {boardname: "promicro_uf2/nrf52840/spi", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_SPI"},
-                  {boardname: "promicro_uf2/nrf52840/spi", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_SPI_SD", with_softdevice: true},
+                  # {boardname: "promicro_uf2/nrf52840/spi", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_SPI_SD", with_softdevice: true},
                   {boardname: "promicro_uf2/nrf52840/default_spi", filename: "SlimeNRF_ProMicro_Tracker_SPI"},
                   {boardname: "promicro_uf2/nrf52840/default_i2c", filename: "SlimeNRF_ProMicro_Tracker_I2C"},
                   {boardname: "promicro_uf2/nrf52840/chrysalis", filename: "SlimeNRF_ProMicro_Chrysalis_Tracker"},
                   {boardname: "styria_mini_uf2/nrf52840/spi", filename: "Styria_Mini_Tracker"},
-                  {boardname: "styria_mini_uf2/nrf52840/spi", filename: "Styria_Mini_Tracker_SD", with_softdevice: true},
+                  # {boardname: "styria_mini_uf2/nrf52840/spi", filename: "Styria_Mini_Tracker_SD", with_softdevice: true},
                   {boardname: "foxsnacklite_uf2/nrf52840", filename: "FoxApplication_FoxSnackLite_Tracker"},
                   {boardname: "mochi_uf2/nrf52833", filename: "Mochi_Tracker"},
                   {boardname: "dawn_tracker_mini_uf2/nrf52833", filename: "Dawn_Tracker_Mini"},
@@ -200,6 +221,7 @@ jobs:
         with:
           path: zephyr-workspace/SlimeNRF-CI
           submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: 🧰 Cache + Install Apt Dependencies
         id: restore-apt
@@ -332,3 +354,45 @@ jobs:
           if-no-files-found: warn
           path: |
             zephyr-workspace/Releases/${{ matrix.boards.filename }}*
+
+  publish-release:
+    needs: build
+    if: >-
+      ${{
+        needs.build.result == 'success'
+        && (
+          github.event_name == 'release'
+          || github.ref_type == 'tag'
+          || (github.event_name == 'create' && github.event.ref_type == 'tag')
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name || github.event.ref }}
+    steps:
+      - name: 📥 Download Firmware Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-artifacts
+
+      - name: Prefer UF2 over same-named HEX assets
+        run: |
+          while IFS= read -r -d '' hex_file; do
+            uf2_file="${hex_file%.hex}.uf2"
+            if [ -f "$uf2_file" ]; then
+              echo "Skipping HEX because UF2 exists: $hex_file"
+              rm "$hex_file"
+            fi
+          done < <(find release-artifacts -type f -name '*.hex' -print0)
+
+      - name: 🚀 Upload Artifacts to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          fail_on_unmatched_files: true
+          files: |
+            release-artifacts/**/*.hex
+            release-artifacts/**/*.uf2

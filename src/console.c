@@ -4,14 +4,18 @@
 #include "system/test_mode.h"
 #include "sensor/sensor.h"
 #include "sensor/calibration.h"
+#if CONFIG_VQF_BENCH
 #include "sensor/fusion/vqf/vqf.h"
+#endif
 #include "connection/esb.h"
 #include "connection/tdma.h"
 #include "build_defines.h"
 #include "zephyr/sys/printk.h"
 
-#if CONFIG_USB_DEVICE_STACK
-#define USB DT_NODELABEL(usbd)
+#define USB_EXISTS 0
+#if CONFIG_USB_DEVICE_STACK_NEXT
+#undef USB_EXISTS
+#define USB DT_NODELABEL(zephyr_udc0)
 #define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
 #endif
 
@@ -28,8 +32,6 @@
 #include <zephyr/sys/reboot.h>
 
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
@@ -55,6 +57,13 @@ static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(mag), okay)
 #define SENSOR_MAG_EXISTS true
 #endif
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+#define SENS_CAL_DEFAULT_REVOLUTIONS CONFIG_SENSOR_SENS_REV
+#define SENS_CAL_MAX_REVOLUTIONS     100
+#endif
+
+#define CONSOLE_BUTTON_EXISTS DT_NODE_HAS_PROP(DT_ALIAS(sw0), gpios)
 
 static const char *meows[] = {
 	"Mew", "Meww", "Meow", "Meow meow", "Mrrrp", "Mrrf", "Mreow", "Mrrrow", "Mrrr", "Purr",
@@ -94,10 +103,10 @@ void console_thread_abort(void)
 static void print_board(void)
 {
 #if USB_EXISTS
-	printk(CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT "\n");
+	printk(CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT "\n");
 #endif
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
 	printk("\nBoard: " CONFIG_BOARD "\n");
 	printk("SOC: " CONFIG_SOC "\n");
@@ -251,6 +260,12 @@ static void print_sens_calibration_info(void)
 			(double)deg_x,
 			(double)deg_y,
 			(double)deg_z
+		);
+		printk(
+			"Gyroscope sensitivity scale: %.5f %.5f %.5f\n",
+			(double)scale_x,
+			(double)scale_y,
+			(double)scale_z
 		);
 	} else {
 		printk("Gyroscope sensitivity: Retained data unavailable.\n");
@@ -447,6 +462,48 @@ static void print_meow(void)
 	printk("%s%s%s\n", meows[meow], meow_punctuations[punctuation], meow_suffixes[suffix]);
 }
 
+static void print_button_help(void)
+{
+	printk("Button Functions (current build):\n");
+#if CONSOLE_BUTTON_EXISTS
+	printk("  Short press (1x):          Reboot (blocked in test mode)\n");
+#if CONFIG_USER_EXTRA_ACTIONS
+	printk("  Quick press (2x):          Calibrate sensor ZRO\n");
+	printk("  Quick press (3x):          Reset active pairing\n");
+#if DFU_EXISTS
+#if defined(CONFIG_BOARD_STYRIA_MINI_UF2)
+	printk("  Quick press (6x/7x):       Enter DFU bootloader\n");
+#else
+	printk("  Quick press (4x/5x):       Enter DFU bootloader\n");
+#endif
+#if ADAFRUIT_BOOTLOADER
+	printk("  Quick press (8x/9x):       Enter OTA DFU (BLE) if flashed SD (softdevice) firmware\n");
+#else
+	printk("  Quick press (8x/9x):       Enter DFU bootloader\n");
+#endif
+#endif
+#if USER_SHUTDOWN_ENABLED
+	printk("  Hold (~1s):                Power off; keep holding ~5s to cancel\n");
+#else
+	printk("  Hold (~1s):                Reboot; keep holding ~5s to cancel\n");
+#endif
+#else
+#if USER_SHUTDOWN_ENABLED
+	printk("  Hold (~1s):                Power off; keep holding ~5s to reset pairing\n");
+#else
+	printk("  Hold (~1s):                Reboot; keep holding ~5s to reset pairing\n");
+#endif
+#endif
+#if USB_EXISTS && DFU_EXISTS
+	printk("  Hold while USB connects:   Enter DFU bootloader\n");
+#endif
+	printk("  During OTA:                Button actions are blocked\n");
+#else
+	printk("  No sw0 button is defined for this board\n");
+#endif
+	printk("\n");
+}
+
 static void print_help(void)
 {
 	printk("\n=== Available Commands ===\n\n");
@@ -467,6 +524,7 @@ static void print_help(void)
 	printk("  mag cal                    Start magnetometer calibration\n");
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 	printk("  sens <x>,<y>,<z>           Set gyro sensitivity (deg diff over %u rev)\n", (int)CONFIG_SENSOR_SENS_REV);
+	printk("  sens auto <x|y|z> [rev]    Auto-calibrate gyro sensitivity by spinning (default %u rev)\n", SENS_CAL_DEFAULT_REVOLUTIONS);
 	printk("  sens reset                 Reset gyro sensitivity calibration\n");
 #endif
 #if CONFIG_SENSOR_USE_TCAL
@@ -522,6 +580,7 @@ static void print_help(void)
 	printk("  reset bat                  Reset battery tracker\n");
 	printk("  reset all                  Clear all settings\n");
 	printk("\n");
+	print_button_help();
 }
 
 // --- Command Implementations ---
@@ -586,6 +645,79 @@ void cmd_sens_reset(void)
 	} else {
 		printk("Error: Retained data not available.\n");
 	}
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_sens_auto_request(uint8_t axis, uint16_t revolutions)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (axis >= 3) {
+		printk("Error: Invalid sensitivity calibration axis %u.\n", axis);
+		return;
+	}
+
+	if (revolutions == 0) {
+		revolutions = SENS_CAL_DEFAULT_REVOLUTIONS;
+	}
+
+	if (revolutions > SENS_CAL_MAX_REVOLUTIONS) {
+		printk("Error: Invalid revolutions %u. Use 1 to %u.\n", revolutions, SENS_CAL_MAX_REVOLUTIONS);
+		return;
+	}
+
+	char axis_char = "XYZ"[axis];
+	if (sensor_request_calibration_sens(axis, revolutions) != 0) {
+		printk("Error: Calibration busy or parameters invalid.\n");
+		return;
+	}
+
+	printk("Gyro sensitivity auto-calibration started on %c axis (%u rev).\n", axis_char, revolutions);
+	printk("  1. Hold the tracker still until the LED flashes.\n");
+	printk("  2. While flashing, spin it %u full turns about the %c axis, then stop.\n", revolutions, axis_char);
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_sens_auto(const char *axis_str, const char *rev_str)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	// Axis is a single character; the command parser has already lowercased it.
+	if (axis_str == NULL || axis_str[0] == '\0' || axis_str[1] != '\0') {
+		printk("Error: Specify a single axis. Use: 'sens auto <x|y|z> [revolutions]'.\n");
+		return;
+	}
+
+	uint8_t axis;
+	switch (axis_str[0]) {
+	case 'x':
+		axis = 0;
+		break;
+	case 'y':
+		axis = 1;
+		break;
+	case 'z':
+		axis = 2;
+		break;
+	default:
+		printk("Error: Invalid axis '%s'. Use x, y, or z.\n", axis_str);
+		return;
+	}
+
+	uint16_t revolutions = SENS_CAL_DEFAULT_REVOLUTIONS;
+	if (rev_str != NULL) {
+		char *endptr;
+		long value = strtol(rev_str, &endptr, 10);
+		if (*endptr != '\0' || value < 1 || value > SENS_CAL_MAX_REVOLUTIONS) {
+			printk("Error: Invalid revolutions '%s'. Use 1 to %u.\n", rev_str, SENS_CAL_MAX_REVOLUTIONS);
+			return;
+		}
+		revolutions = (uint16_t)value;
+	}
+
+	cmd_sens_auto_request(axis, revolutions);
 #else
 	printk("Error: Sensitivity calibration not enabled.\n");
 #endif
@@ -684,13 +816,12 @@ static void console_thread(void)
 		k_msleep(100);
 	}
 
-	printk("*** " CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT " ***\n");
+	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
 #endif
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
-	// Print help on startup
-	print_help();
+	printk("Type 'help' to show available commands.\n");
 
 	uint8_t command_info[] = "info";
 	uint8_t command_uptime[] = "uptime";
@@ -791,7 +922,19 @@ static void console_thread(void)
 		else if (memcmp(line, command_sens, sizeof(command_sens)) == 0) {
 			// check if there are any arguments at all.
 			if (arg == NULL) {
-				printk("Error: Missing arguments. Use 'sens <x>,<y>,<z>' or 'sens reset'.\n");
+				printk("Error: Missing arguments. Use 'sens <x>,<y>,<z>', 'sens auto <x|y|z> [rev]', or 'sens reset'.\n");
+			}
+			// check if this is the auto-calibration subcommand
+			else if (strncmp((char *)arg, "auto", 4) == 0 && (arg[4] == '\0' || arg[4] == ' ')) {
+				strtok((char *)arg, " "); // consume "auto"
+				char *axis_str = strtok(NULL, " ");
+				char *rev_str = strtok(NULL, " ");
+				char *extra_str = strtok(NULL, " ");
+				if (extra_str != NULL) {
+					printk("Error: Too many arguments. Use: 'sens auto <x|y|z> [revolutions]'.\n");
+				} else {
+					cmd_sens_auto(axis_str, rev_str);
+				}
 			}
 			// check if the argument is "reset"
 			else if (strcmp((char *)arg, "reset") == 0) {
@@ -812,10 +955,10 @@ static void console_thread(void)
 					token = strtok(NULL, ",");
 				}
 
-				if (token_count == 3) {
+				if (token_count == 3 && token == NULL) {
 					cmd_sens_set(values[0], values[1], values[2]);
 				} else {
-					printk("Error: Invalid format. Use: 'sens <x>,<y>,<z>' or 'sens reset'.\n");
+					printk("Error: Invalid format. Use: 'sens <x>,<y>,<z>', 'sens auto <x|y|z> [rev]', or 'sens reset'.\n");
 					printk("Example: sens 10.5,-2.1,15.0\n");
 				}
 			}
