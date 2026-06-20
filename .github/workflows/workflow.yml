@@ -7,11 +7,16 @@ on:
     branches:
       - main
       - dev
+    tags:
+      - "*"
   create:
+  release:
+    types:
+      - published
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.ref }}
+  group: ${{ github.event.pull_request.head.sha || github.ref }}
   cancel-in-progress: true
 
 permissions: write-all
@@ -29,7 +34,56 @@ jobs:
         with:
           path: zephyr-workspace/SlimeNRF-CI
           submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+      - name: 📟 Generate CI Variables
+        id: generate-vars
+        env:
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          WEST_FILE="west.yml"
+
+          if [ -f "$WEST_FILE" ]; then
+            echo "Found west.yml in the root directory"
+          elif [ -f "zephyr-workspace/$WEST_FILE" ]; then
+            WEST_FILE="zephyr-workspace/$WEST_FILE"
+            echo "Found west.yml in zephyr-workspace"
+          elif [ -f "zephyr-workspace/SlimeNRF-CI/$WEST_FILE" ]; then
+            WEST_FILE="zephyr-workspace/SlimeNRF-CI/$WEST_FILE"
+            echo "Found west.yml in zephyr-workspace/SlimeNRF-CI"
+          else
+            echo "Error: west.yml not found!" >&2
+            exit 1
+          fi
+
+          SDK_URL=$(grep -A5 "name: sdk-nrf" "$WEST_FILE" | grep "url:" | sed 's/.*url: *//')
+          SDK_REVISION=$(grep -A5 "name: sdk-nrf" "$WEST_FILE" | grep "revision:" | sed 's/.*revision: *//')
+          SDK_COMMIT=$(git ls-remote "$SDK_URL" "$SDK_REVISION" | awk '{print $1}')
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            REPO="$PR_HEAD_REPO"
+            REPO_URL="$PR_HEAD_REPO_URL"
+            BRANCH="$PR_HEAD_REF"
+            REPO_COMMIT="$PR_HEAD_SHA"
+          else
+            REPO="$GITHUB_REPOSITORY"
+            REPO_URL="https://github.com/$GITHUB_REPOSITORY.git"
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            REPO_COMMIT="$GITHUB_SHA"
+          fi
+
+          echo "sdk-hash=$SDK_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "sdk-revision=$SDK_REVISION" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "repo-url=$REPO_URL" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "repo-hash=$REPO_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: 🧰 Cache + Install Apt Dependencies
+        id: cache-apt
       - name: 🧰 Cache + Install apt Dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
@@ -104,12 +158,52 @@ jobs:
           cd zephyr-workspace
           ~/.venv/bin/pip install -r zephyr/scripts/requirements.txt
 
+      - name: 📦 Cache Repository
+        id: cache-repository
+        uses: actions/cache@v5
+        with:
+          path: zephyr-workspace/SlimeVR-Tracker-nRF
+          key: firmware-${{ steps.generate-vars.outputs.repo-hash }}
+
+      - name: 📥 Clone Repository
+        id: clone-repository
+        if: steps.cache-repository.outputs.cache-hit != 'true'
+        env:
+          REPO_URL: ${{ steps.generate-vars.outputs.repo-url }}
+          REPO_HASH: ${{ steps.generate-vars.outputs.repo-hash }}
+        run: |
+          cd zephyr-workspace
+          rm -rf SlimeVR-Tracker-nRF
+
+          git clone --filter=blob:none --no-checkout "$REPO_URL" SlimeVR-Tracker-nRF
+          git -C SlimeVR-Tracker-nRF fetch --depth=1 origin "$REPO_HASH"
+          git -C SlimeVR-Tracker-nRF checkout "$REPO_HASH"
+          git -C SlimeVR-Tracker-nRF submodule update --init --recursive --depth 1
+
   build:
     needs: setup
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
+        boards: [
+                  {boardname: "xiao_ble/nrf52840", filename: "SlimeNRF_XIAO_Tracker"},
+                  {boardname: "xiao_ble/nrf52840/sense", filename: "SlimeNRF_XIAO_Sense_Tracker"},
+                  {boardname: "promicro_uf2/nrf52840/i2c", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_I2C"},
+                  {boardname: "promicro_uf2/nrf52840/spi", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_SPI"},
+                  # {boardname: "promicro_uf2/nrf52840/spi", filename: "SlimeNRF_ProMicro_StackedSmol_Tracker_SPI_SD", with_softdevice: true},
+                  {boardname: "promicro_uf2/nrf52840/default_spi", filename: "SlimeNRF_ProMicro_Tracker_SPI"},
+                  {boardname: "promicro_uf2/nrf52840/default_i2c", filename: "SlimeNRF_ProMicro_Tracker_I2C"},
+                  {boardname: "promicro_uf2/nrf52840/chrysalis", filename: "SlimeNRF_ProMicro_Chrysalis_Tracker"},
+                  {boardname: "styria_mini_uf2/nrf52840/spi", filename: "Styria_Mini_Tracker"},
+                  # {boardname: "styria_mini_uf2/nrf52840/spi", filename: "Styria_Mini_Tracker_SD", with_softdevice: true},
+                  {boardname: "foxsnacklite_uf2/nrf52840", filename: "FoxApplication_FoxSnackLite_Tracker"},
+                  {boardname: "mochi_uf2/nrf52833", filename: "Mochi_Tracker"},
+                  {boardname: "dawn_tracker_mini_uf2/nrf52833", filename: "Dawn_Tracker_Mini"},
+                  {boardname: "aero_tracker_uf2/nrf52840", filename: "Aero_Tracker"},
+                  {boardname: "kawazu_uf2/nrf52833", filename: "Kawazu_Tracker"},
+                  {boardname: "nini_slimevr_mag_uf2/nrf52833", filename: "NiNi_SlimeVR_MAG_Tracker"},
+                  {boardname: "nekonya_tracker_uf2/nrf52833", filename: "nekonya_tracker_uf2"}
         boards: [                 
                   {boardname: "nini_slimevr_uf2", filename: "nini_slimevr_uf2"},
                   {boardname: "nini_slimevr_mag_uf2", filename: "nini_slimevr_mag_uf2"},
@@ -130,6 +224,7 @@ jobs:
         with:
           path: zephyr-workspace/SlimeNRF-CI
           submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: 🧰 Cache + Install apt Dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
@@ -246,3 +341,45 @@ jobs:
           if-no-files-found: warn
           path: |
             zephyr-workspace/Releases/${{ matrix.boards.filename }}*
+
+  publish-release:
+    needs: build
+    if: >-
+      ${{
+        needs.build.result == 'success'
+        && (
+          github.event_name == 'release'
+          || github.ref_type == 'tag'
+          || (github.event_name == 'create' && github.event.ref_type == 'tag')
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name || github.event.ref }}
+    steps:
+      - name: 📥 Download Firmware Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-artifacts
+
+      - name: Prefer UF2 over same-named HEX assets
+        run: |
+          while IFS= read -r -d '' hex_file; do
+            uf2_file="${hex_file%.hex}.uf2"
+            if [ -f "$uf2_file" ]; then
+              echo "Skipping HEX because UF2 exists: $hex_file"
+              rm "$hex_file"
+            fi
+          done < <(find release-artifacts -type f -name '*.hex' -print0)
+
+      - name: 🚀 Upload Artifacts to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          fail_on_unmatched_files: true
+          files: |
+            release-artifacts/**/*.hex
+            release-artifacts/**/*.uf2

@@ -213,12 +213,12 @@ static bool mag_calibrated; // true if magnetometer calibration data is valid
 // set when mag toggle reboot is pending, prevents sensor_retained_write from saving fusion state
 static bool skip_fusion_save;
 
-#if CONFIG_SENSOR_USE_XIOFUSION
-static const sensor_fusion_t *sensor_fusion = &sensor_fusion_fusion; // TODO: change from server
-int fusion_id = FUSION_FUSION;
-#elif CONFIG_SENSOR_USE_VQF
+#if CONFIG_SENSOR_USE_VQF
 static const sensor_fusion_t *sensor_fusion = &sensor_fusion_vqf; // TODO: change from server
 int fusion_id = FUSION_VQF;
+#elif CONFIG_SENSOR_USE_EQF
+static const sensor_fusion_t *sensor_fusion = &sensor_fusion_eqf;
+int fusion_id = FUSION_EQF;
 #endif
 
 static int sensor_imu_id = -1;
@@ -908,6 +908,7 @@ enum sensor_sensor_timeout {
 };
 
 static enum sensor_sensor_timeout sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU;
+static bool was_ota_suppressed = false;
 
 // Check the IMU gyroscope // TODO: gyro sanity not used
  // TODO: timeouts and power management should be outside sensor! (ie. sleeping/shutdown even if the imu completely errored out)
@@ -917,7 +918,17 @@ static void sensor_update_sensor_state(void)
 	bool calibrating = get_status(SYS_STATUS_CALIBRATION_RUNNING);
 	bool resting = sensor_fusion->get_gyro_sanity() == 0 ? q_epsilon(q, last_q, 0.004) : q_epsilon(q, last_q, 0.05); // TODO: Probably okay to use the constantly updating last_q?
 	bool in_test_mode = test_mode_get();
-	if (!in_test_mode && !calibrating && !esb_ota_is_active() && !connection_get_ota_suppressed() && resting)
+	bool ota_suppressed_now = esb_ota_is_active() || connection_get_ota_suppressed();
+
+	/* Reset activity timer on OTA suppression→unsuppression transition
+	 * to prevent accumulated idle time from immediately triggering sleep
+	 * when suppression lifts between OTA batches. */
+	if (was_ota_suppressed && !ota_suppressed_now) {
+		last_data_time = k_uptime_get();
+	}
+	was_ota_suppressed = ota_suppressed_now;
+
+	if (!in_test_mode && !calibrating && !ota_suppressed_now && resting)
 	{
 		int64_t last_data_delta = k_uptime_get() - last_data_time;
 		if (sensor_mode < SENSOR_SENSOR_MODE_LOW_POWER && last_data_delta > CONFIG_SENSOR_LP_TIMEOUT) // No motion in lp timeout
@@ -1210,7 +1221,9 @@ static void sensor_mag_ref_accumulate(const float m_cal[3],
 	if (mag_ref_count >= MAG_REF_RECOMPUTE_SAMPLES) {
 		float avg_norm = mag_ref_norm_sum / mag_ref_count;
 		float avg_dip = mag_ref_dip_sum / mag_ref_count;
+#if CONFIG_SENSOR_USE_VQF
 		vqf_set_mag_ref(avg_norm, avg_dip);
+#endif
 		mag_ref_recompute_active = false;
 		LOG_INF("Mag ref recomputed from %d samples: norm=%.4f dip=%.1f deg",
 			mag_ref_count, (double)avg_norm,
@@ -1296,7 +1309,7 @@ void sensor_loop(void)
 
 			// Reading IMUs will take between 2.5ms (~7 samples, low noise) - 7ms (~33 samples, low power)
 			// Magneto sample will take ~400us
-			// Fusing data will take between 100us (~7 samples, low noise) - 500us (~33 samples, low power) for xiofusion
+			// Fusing data will take between 100us (~7 samples, low noise) - 500us (~33 samples, low power)
 			// TODO: on any errors set main_ok false and skip (make functions return nonzero)
 
 			// At high speed, use oneshot mode to have synced magnetometer data

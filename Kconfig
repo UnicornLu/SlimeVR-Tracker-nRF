@@ -86,7 +86,8 @@ config USER_EXTRA_ACTIONS
     bool "Multiple press actions"
     help
         Allow user to use multiple presses to calibrate, pair, or enter DFU.
-        By default, pairing is available when holding down sw0 for 5 seconds.
+        When enabled, sw0 long-hold pairing reset is disabled; use the
+        multiple-press pairing action instead.
         By default, DFU is available when holding down sw0 and plugging in a USB cable.
 
 config IGNORE_RESET
@@ -135,6 +136,36 @@ config CONNECTION_TIMEOUT_DELAY
     depends on USER_SHUTDOWN
     help
         Connection timeout duration when receiver is not detected.
+
+choice
+    prompt "Sensor rotation"
+    default SENSOR_ROTATION_90
+
+config SENSOR_ROTATION_0
+    bool "0 degrees"
+
+config SENSOR_ROTATION_90
+    bool "90 degrees"
+
+config SENSOR_ROTATION_180
+    bool "180 degrees"
+
+config SENSOR_ROTATION_270
+    bool "270 degrees"
+
+config SENSOR_ROTATION_0_FLIPPED
+    bool "0 degrees flipped"
+
+config SENSOR_ROTATION_90_FLIPPED
+    bool "90 degrees flipped"
+
+config SENSOR_ROTATION_180_FLIPPED
+    bool "180 degrees flipped"
+
+config SENSOR_ROTATION_270_FLIPPED
+    bool "270 degrees flipped"
+
+endchoice
 
 menu "Sensor power saving"
 
@@ -291,17 +322,19 @@ choice
     help
         Select the sensor fusion method.
 
-config SENSOR_USE_XIOFUSION
-    bool "Use x-io Technologies Fusion"
-    help
-        Use x-io Technologies Fusion for sensor fusion.
-        Based on Madgwick filter.
-
 config SENSOR_USE_VQF
     bool "Use VQF"
     help
         Use VQF for sensor fusion.
         Based on Kalman filter.
+
+config SENSOR_USE_EQF
+    bool "Use EqF"
+    help
+        Use ABC-EqF n=0 (Equivariant Filter) for sensor fusion.
+        Kalman filter on SO(3)×R³ with constant magnetometer trust.
+        Lower heading drift than VQF under low magnetic disturbance,
+        but does not perform as well as the VQF on 6D.
 
 endchoice
 
@@ -313,17 +346,6 @@ config VQF_ADAPTIVE_TAU_ACC
         Enable adaptive tauAcc adjustment based on motion intensity.
         Uses a three-regime strategy (rest / gentle / aggressive) with
         smoothed transitions to avoid Butterworth LP filter transients.
-        This feature is experimental and may affect heading stability.
-
-config VQF_SOFT_MBE_GATE
-    bool "VQF soft motion bias estimation gate (experimental)"
-    default n
-    depends on SENSOR_USE_VQF
-    help
-        Enable quasi-rest detection that reduces VQF bias process noise during
-        long low-energy non-rest periods. This keeps motion bias estimation
-        enabled, but makes bias changes much slower in breathing
-        motion where motion bias estimation can otherwise overcompensate.
         This feature is experimental and may affect heading stability.
 
 config VQF_BENCH
@@ -349,8 +371,13 @@ config SENSOR_USE_SENS_CALIBRATION
     depends on USE_SLIMENRF_CONSOLE
     help
         Use sensitivity calibration for gyroscope.
-        Calibration can be completed by rotating the tracker specified number of times around all axis.
-        Note any resulting yaw drift in degrees and enter these three observed values in the basic console.
+        There are two ways to calibrate from the console:
+        - Manual: rotate the tracker a number of times around each axis, note the
+          resulting yaw drift in degrees, and enter the three observed values with
+          'sens <x>,<y>,<z>'.
+        - Automated: run 'sens auto <x|y|z> [revolutions]' and spin the tracker the
+          requested number of full turns about one axis; the firmware integrates the
+          gyro rate and computes the scale factor for that axis automatically.
 
 config SENSOR_SENS_REV
     int "Number of rotations (rev)"
@@ -435,10 +462,42 @@ config CONNECTION_ENABLE_ACK
 
 config CONNECTION_OVER_HID
     bool "Use HID for data output"
+    depends on USB_DEVICE_STACK_NEXT && USBD_HID_SUPPORT && UART_CONSOLE
     default n
     help
         Use HID if available.
         Otherwise, use ESB only.
+
+config SLIMEVR_USB_DEVICE_VID
+    hex "SlimeVR USB vendor ID"
+    default 0x1209
+    help
+        USB vendor ID used by the SlimeVR USBD_NEXT device.
+
+config SLIMEVR_USB_DEVICE_PID
+    hex "SlimeVR USB product ID"
+    default 0x7692
+    help
+        USB product ID used by the SlimeVR tracker firmware.
+
+config SLIMEVR_USB_DEVICE_MANUFACTURER
+    string "SlimeVR USB manufacturer"
+    default "SlimeVR"
+    help
+        USB manufacturer string and console banner prefix.
+
+config SLIMEVR_USB_DEVICE_PRODUCT
+    string "SlimeVR USB product"
+    default "SlimeNRF Tracker"
+    help
+        USB product string and console banner name.
+
+config SLIMEVR_USB_DEVICE_MAX_POWER
+    int "SlimeVR USB max power"
+    range 0 250
+    default 100
+    help
+        USB bMaxPower value in 2 mA units.
 
 config CLOCK_USE_LFXO
     bool "Use external low-frequency crystal oscillator (LFXO)"

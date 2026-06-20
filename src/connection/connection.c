@@ -216,6 +216,91 @@ static int sub_data_len(uint8_t type)
 	}
 }
 
+static bool connection_hid_output_ready(void)
+{
+#if CONFIG_CONNECTION_OVER_HID
+	return get_status(SYS_STATUS_USB_CONNECTED);
+#else
+	return false;
+#endif
+}
+
+static void fill_normal_packet(uint8_t type, uint8_t data[16])
+{
+	memset(data, 0, 16);
+	data[0] = type;
+	data[1] = tracker_id;
+
+	switch (type) {
+	case 0:
+		fill_sub_info(&data[2]);
+		data[15] = 0;
+		break;
+	case 1:
+		fill_sub_quat_accel(&data[2]);
+		break;
+	case 2:
+		fill_sub_compact_quat(&data[2]);
+		data[15] = 0;
+		break;
+	case 3:
+		fill_sub_status(&data[2]);
+		data[15] = 0;
+		break;
+	case 4:
+		fill_sub_mag(&data[2]);
+		break;
+	case 5:
+		fill_sub_runtime(&data[2]);
+		data[15] = 0;
+		break;
+	default:
+		data[0] = 1;
+		fill_sub_quat_accel(&data[2]);
+		break;
+	}
+}
+
+static void write_normal_packet(const uint8_t data[16])
+{
+#if CONFIG_CONNECTION_OVER_HID
+	if (connection_hid_output_ready()) {
+		hid_write_packet_n(data);
+	}
+#endif
+
+	if (!esb_ready()) {
+		return;
+	}
+
+	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
+
+	memcpy(esb_pkt, data, 16);
+	esb_pkt[16] = packet_sequence++;
+	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+}
+
+#if CONFIG_CONNECTION_OVER_HID
+static void write_hid_packet_type(uint8_t type)
+{
+	if (!connection_hid_output_ready()) {
+		return;
+	}
+
+	uint8_t data[16];
+
+	fill_normal_packet(type, data);
+	hid_write_packet_n(data);
+}
+
+static void write_hid_composite_as_normal_packets(const struct composite_builder *builder)
+{
+	for (int i = 0; i < builder->n; i++) {
+		write_hid_packet_type(builder->types[i]);
+	}
+}
+#endif
+
 static void connection_write_packet_type(uint8_t type)
 {
 	switch (type) {
@@ -300,7 +385,7 @@ void connection_update_sensor_temp(float temp)
 	} else if (temp > 88.5f) {
 		sensor_temp = 255;
 	} else {
-		sensor_temp = ((temp - 25) * 2 + 128.5f); // -38.5 - +88.5 -> 1-255
+		sensor_temp = (uint8_t)((temp - 25) * 2 + 128.5f); // -38.5 - +88.5 -> 1-255
 	}
 }
 
@@ -355,86 +440,51 @@ void connection_update_status(int status)
 
 void connection_write_packet_0() // device info
 {
-	uint8_t data[16] = {0};
-	data[0] = 0;
-	data[1] = tracker_id;
-	fill_sub_info(&data[2]);
-	data[15] = 0; // rssi (supplied by receiver)
+	uint8_t data[16];
 
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	fill_normal_packet(0, data);
+	write_normal_packet(data);
 }
 
 void connection_write_packet_1() // full precision quat and accel
 {
-	uint8_t data[16] = {0};
-	data[0] = 1;
-	data[1] = tracker_id;
-	fill_sub_quat_accel(&data[2]);
+	uint8_t data[16];
 
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	fill_normal_packet(1, data);
+	write_normal_packet(data);
 }
 
 void connection_write_packet_2() // reduced precision quat and accel with battery,
 								 // temp, and rssi
 {
-	uint8_t data[16] = {0};
-	data[0] = 2;
-	data[1] = tracker_id;
-	fill_sub_compact_quat(&data[2]);
-	data[15] = 0; // rssi (supplied by receiver)
+	uint8_t data[16];
 
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	fill_normal_packet(2, data);
+	write_normal_packet(data);
 }
 
 void connection_write_packet_3() // status
 {
-	uint8_t data[16] = {0};
-	data[0] = 3;
-	data[1] = tracker_id;
-	fill_sub_status(&data[2]);
-	data[15] = 0; // rssi (supplied by receiver)
+	uint8_t data[16];
 
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	fill_normal_packet(3, data);
+	write_normal_packet(data);
 }
 
 void connection_write_packet_4() // full precision quat and magnetometer
 {
-	uint8_t data[16] = {0};
-	data[0] = 4;
-	data[1] = tracker_id;
-	fill_sub_mag(&data[2]);
+	uint8_t data[16];
 
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	fill_normal_packet(4, data);
+	write_normal_packet(data);
 }
 
 void connection_write_packet_5() // runtime estimate
 {
-	uint8_t data[16] = {0};
-	data[0] = 5;
-	data[1] = tracker_id;
-	uint64_t runtime_us = k_ticks_to_us_floor64(sys_get_battery_remaining_time_estimate());
-	memcpy(&data[2], &runtime_us, sizeof(runtime_us));
-	data[15] = 0; // rssi (supplied by receiver)
+	uint8_t data[16];
 
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	fill_normal_packet(5, data);
+	write_normal_packet(data);
 }
 
 static int64_t last_info_time = 0;
@@ -481,10 +531,11 @@ static int64_t ota_suppress_start_time = 0;   /* Timestamp when suppress was ena
  * ARQ ring buffer: stores last RAW_RING_SIZE sent packets for retransmission.
  * Indexed by (sequence % RAW_RING_SIZE).
  */
-#define RAW_RING_SIZE 512
+#define RAW_RING_SIZE 256
 #define RAW_PACKET_SIZE 52  /* Fixed raw data packet size (type 0x13 with gyrQuat) */
 static uint8_t raw_ring[RAW_RING_SIZE][RAW_PACKET_SIZE];
 static bool    raw_ring_valid[RAW_RING_SIZE];
+static uint16_t raw_ring_seq[RAW_RING_SIZE];
 
 /*
  * Retransmit queue: filled by ESB event handler when ACK payload carries
@@ -500,6 +551,14 @@ static bool raw_metadata_sent = false;
 static int64_t raw_metadata_last_ms = 0;
 #define RAW_METADATA_RESEND_MS 60000
 
+/* Deferred metadata: sensor thread buffers here, connection thread sends */
+static bool raw_metadata_pending = false;
+static uint8_t raw_metadata_buf[RAW_PACKET_SIZE];
+
+/* Rate limit for meta/cal drip: max 1 packet per interval, interleaved with IMU data */
+#define RAW_META_CAL_DRIP_MS 200
+static int64_t raw_meta_cal_last_ms = 0;
+
 /* Latest mag data for piggybacking onto IMU packets */
 static float latest_mag[3] = {0};
 static bool latest_mag_valid = false;
@@ -507,7 +566,70 @@ static bool latest_mag_valid = false;
 /* Calibration drip-feed state (one packet per connection cycle) */
 static bool raw_cal_pending = false;
 static uint8_t raw_cal_phase = 0;      /* 0=accel, 1=mag, 2=gyro, 3=tcal_state, 4=tcal_points */
-static uint16_t raw_cal_point_idx = 0; /* current TCal point index */
+static uint16_t raw_cal_point_idx = 0; /* current TCal slot index */
+static uint8_t raw_cal_chunk_idx = 0;  /* emitted TCal chunk index */
+
+#if CONFIG_SENSOR_USE_TCAL
+static bool connection_tcal_point_valid(const struct TempCalPoint *point)
+{
+	return point->temp != 0.0f;
+}
+
+static uint16_t connection_tcal_valid_point_count(void)
+{
+	uint16_t count = 0;
+
+	for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+		if (connection_tcal_point_valid(&retained->tempCalPoints[i])) {
+			count++;
+		}
+	}
+
+	return count;
+}
+#endif
+
+static void connection_align_mag_body(const float in[3], float out[3])
+{
+	float mx = in[0];
+	float my = in[1];
+	float mz = in[2];
+	float aligned[3] = {SENSOR_MAGNETOMETER_AXES_ALIGNMENT};
+
+	memcpy(out, aligned, sizeof(aligned));
+}
+
+static void connection_align_mag_BAinv_body(float out[4][3], const float in[4][3])
+{
+	float basis[3][3] = {
+		{1.0f, 0.0f, 0.0f},
+		{0.0f, 1.0f, 0.0f},
+		{0.0f, 0.0f, 1.0f},
+	};
+	float R[3][3];
+
+	for (int col = 0; col < 3; col++) {
+		float aligned[3];
+		connection_align_mag_body(basis[col], aligned);
+		for (int row = 0; row < 3; row++) {
+			R[row][col] = aligned[row];
+		}
+	}
+
+	connection_align_mag_body(in[0], out[0]);
+
+	for (int row = 0; row < 3; row++) {
+		for (int col = 0; col < 3; col++) {
+			float v = 0.0f;
+			for (int i = 0; i < 3; i++) {
+				for (int j = 0; j < 3; j++) {
+					v += R[row][i] * in[i + 1][j] * R[col][j];
+				}
+			}
+			out[row + 1][col] = v;
+		}
+	}
+}
 
 void connection_set_data_collection(bool enable)
 {
@@ -516,6 +638,8 @@ void connection_set_data_collection(bool enable)
 		k_msgq_purge(&raw_imu_msgq);
 		raw_sequence = 0;
 		raw_metadata_sent = false;
+		raw_metadata_pending = false;
+		raw_meta_cal_last_ms = 0;
 		latest_mag_valid = false;
 		raw_cal_pending = false;
 		/* Reset ARQ state */
@@ -569,7 +693,7 @@ void connection_queue_raw_mag(const float mag[3])
 	if (!data_collection_active) return;
 
 	/* Store latest mag for piggybacking onto IMU packets */
-	memcpy(latest_mag, mag, sizeof(latest_mag));
+	connection_align_mag_body(mag, latest_mag);
 	latest_mag_valid = true;
 }
 
@@ -577,20 +701,24 @@ void connection_send_raw_metadata(float gyro_range, float accel_range,
 				  float gyro_odr, float accel_odr,
 				  float mag_odr, uint8_t imu, uint8_t mag)
 {
-	uint8_t buf[RAW_PACKET_SIZE];
-	memset(buf, 0, sizeof(buf));
-	buf[0] = ESB_RAW_META_TYPE;
-	buf[1] = tracker_id;
-	memcpy(&buf[2], &gyro_range, 4);
-	memcpy(&buf[6], &accel_range, 4);
-	memcpy(&buf[10], &gyro_odr, 4);
-	memcpy(&buf[14], &accel_odr, 4);
-	memcpy(&buf[18], &mag_odr, 4);
-	buf[22] = imu;
-	buf[23] = mag;
+	/* Buffer metadata for deferred sending by connection thread.
+	 * Never call esb_write() from sensor thread — avoids
+	 * cross-thread ESB TX FIFO contention with raw data flow. */
+	memset(raw_metadata_buf, 0, sizeof(raw_metadata_buf));
+	raw_metadata_buf[0] = ESB_RAW_META_TYPE;
+	raw_metadata_buf[1] = tracker_id;
+	memcpy(&raw_metadata_buf[2], &gyro_range, 4);
+	memcpy(&raw_metadata_buf[6], &accel_range, 4);
+	memcpy(&raw_metadata_buf[10], &gyro_odr, 4);
+	memcpy(&raw_metadata_buf[14], &accel_odr, 4);
+	memcpy(&raw_metadata_buf[18], &mag_odr, 4);
+	raw_metadata_buf[22] = imu;
+	raw_metadata_buf[23] = mag;
 
-	esb_write(buf, false, RAW_PACKET_SIZE);
-	raw_metadata_sent = true;
+	raw_metadata_pending = true;
+	/* Reset 60s resend timer now so sensor loop won't re-trigger
+	 * connection_raw_metadata_resend_due() before connection thread
+	 * actually sends the buffered metadata. */
 	raw_metadata_last_ms = k_uptime_get();
 }
 
@@ -601,6 +729,7 @@ void connection_send_raw_calibration(void)
 	 */
 	raw_cal_phase = 0;
 	raw_cal_point_idx = 0;
+	raw_cal_chunk_idx = 0;
 	raw_cal_pending = true;
 }
 
@@ -625,12 +754,15 @@ static bool connection_cal_drip_send(void)
 		raw_cal_phase = 1;
 		return true;
 
-	case 1: /* Mag calibration */
+	case 1: { /* Mag calibration */
 		buf[2] = RAW_CAL_SUB_MAG;
-		memcpy(&buf[3], retained->magBAinv, sizeof(retained->magBAinv));
+		float mag_body_BAinv[4][3];
+		connection_align_mag_BAinv_body(mag_body_BAinv, retained->magBAinv);
+		memcpy(&buf[3], mag_body_BAinv, sizeof(mag_body_BAinv));
 		esb_write(buf, false, RAW_PACKET_SIZE);
 		raw_cal_phase = 2;
 		return true;
+	}
 
 	case 2: /* Gyro calibration */
 		buf[2] = RAW_CAL_SUB_GYRO;
@@ -648,7 +780,7 @@ static bool connection_cal_drip_send(void)
 	case 3: { /* T-Cal state */
 		buf[2] = RAW_CAL_SUB_TCAL;
 		buf[3] = retained->tcal_enabled ? 1 : 0;
-		uint16_t npoints = retained->tempCalState.count;
+		uint16_t npoints = connection_tcal_valid_point_count();
 		memcpy(&buf[4], &npoints, 2);
 		float temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
 		float temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
@@ -659,6 +791,7 @@ static bool connection_cal_drip_send(void)
 		if (npoints > 0) {
 			raw_cal_phase = 4;
 			raw_cal_point_idx = 0;
+			raw_cal_chunk_idx = 0;
 		} else {
 			raw_cal_pending = false;
 		}
@@ -666,24 +799,36 @@ static bool connection_cal_drip_send(void)
 	}
 
 	case 4: { /* T-Cal points (2 per packet) */
-		uint16_t count = retained->tempCalState.count;
-		uint16_t i = raw_cal_point_idx;
-		if (i >= count) {
+		uint16_t total_count = connection_tcal_valid_point_count();
+		if (raw_cal_point_idx >= TCAL_BUFFER_SIZE || total_count == 0) {
 			raw_cal_pending = false;
 			return false;
 		}
+
 		buf[2] = RAW_CAL_SUB_TCAL_POINTS;
-		buf[3] = (uint8_t)(i / 2); /* chunk_idx */
-		memcpy(&buf[4], &count, 2);
-		uint8_t n = (i + 1 < count) ? 2 : 1;
-		buf[6] = n;
-		memcpy(&buf[7], &retained->tempCalPoints[i], 16);
-		if (n == 2) {
-			memcpy(&buf[23], &retained->tempCalPoints[i + 1], 16);
+		buf[3] = raw_cal_chunk_idx;
+		memcpy(&buf[4], &total_count, 2);
+		uint8_t n = 0;
+		while (raw_cal_point_idx < TCAL_BUFFER_SIZE && n < 2) {
+			const struct TempCalPoint *point = &retained->tempCalPoints[raw_cal_point_idx++];
+
+			if (!connection_tcal_point_valid(point)) {
+				continue;
+			}
+
+			memcpy(&buf[7 + n * 16], point, sizeof(*point));
+			n++;
 		}
+
+		if (n == 0) {
+			raw_cal_pending = false;
+			return false;
+		}
+
+		buf[6] = n;
 		esb_write(buf, false, RAW_PACKET_SIZE);
-		raw_cal_point_idx += 2;
-		if (raw_cal_point_idx >= count) {
+		raw_cal_chunk_idx++;
+		if (raw_cal_point_idx >= TCAL_BUFFER_SIZE) {
 			raw_cal_pending = false;
 		}
 		return true;
@@ -707,19 +852,12 @@ bool connection_process_raw_data(void)
 	if (!data_collection_active)
 		return false;
 
-	/* Send metadata once when data collection starts */
-	if (!raw_metadata_sent) {
-		/* Metadata will be sent by sensor_loop after it detects
-		 * data_collection_active. Skip until it's sent. */
-		return false;
-	}
-
 	/* Priority 1: Process retransmit requests from ARQ ACK payloads */
 	if (raw_retx_count > 0) {
 		uint16_t seq = raw_retx_queue[0];
 		uint16_t idx = seq % RAW_RING_SIZE;
 
-		if (raw_ring_valid[idx]) {
+		if (raw_ring_valid[idx] && raw_ring_seq[idx] == seq) {
 			/* Retransmit from ring buffer */
 			esb_write(raw_ring[idx], false, RAW_PACKET_SIZE);
 			raw_retx_total++;
@@ -735,7 +873,33 @@ bool connection_process_raw_data(void)
 		return true;
 	}
 
-	/* Priority 2: Send new IMU sample */
+	/* Priority 2: Deferred metadata and calibration drip.
+	 * Rate-limited to 1 packet per RAW_META_CAL_DRIP_MS so meta/cal
+	 * never bursts the ESB TX FIFO when interleaved with IMU data.
+	 * Metadata is buffered by sensor thread and sent here to avoid
+	 * cross-thread esb_write() contention. */
+	if (raw_metadata_pending || raw_cal_pending) {
+		int64_t now = k_uptime_get();
+		if (now - raw_meta_cal_last_ms >= RAW_META_CAL_DRIP_MS) {
+			if (raw_metadata_pending) {
+				esb_write(raw_metadata_buf, false, RAW_PACKET_SIZE);
+				raw_metadata_pending = false;
+				raw_metadata_sent = true;
+				raw_metadata_last_ms = now;
+			} else {
+				connection_cal_drip_send();
+				k_usleep(600);
+			}
+			raw_meta_cal_last_ms = now;
+			return true;
+		}
+		/* Throttled — fall through to IMU data if metadata already sent */
+	}
+
+	/* Wait for metadata before sending data */
+	if (!raw_metadata_sent) return false;
+
+	/* Priority 3: Send new IMU sample */
 	struct raw_imu_queued sample;
 	if (k_msgq_get(&raw_imu_msgq, &sample, K_NO_WAIT) == 0) {
 		uint8_t buf[RAW_PACKET_SIZE];
@@ -773,15 +937,11 @@ bool connection_process_raw_data(void)
 		/* Save to ring buffer for potential retransmission */
 		uint16_t ring_idx = seq % RAW_RING_SIZE;
 		memcpy(raw_ring[ring_idx], buf, RAW_PACKET_SIZE);
+		raw_ring_seq[ring_idx] = seq;
 		raw_ring_valid[ring_idx] = true;
 
 		esb_write(buf, false, RAW_PACKET_SIZE);
 		return true;
-	}
-
-	/* Priority 3: Drip-feed calibration packets when idle */
-	if (raw_cal_pending) {
-		return connection_cal_drip_send();
 	}
 
 	return false;
@@ -866,10 +1026,16 @@ static bool composite_try_add_due(struct composite_builder *builder, uint8_t typ
 
 static void send_composite_or_single(const struct composite_builder *builder, uint8_t fallback_type)
 {
-	if (builder->n > 1)
-		send_composite(builder->types, builder->n);
-	else
+	if (builder->n > 1) {
+		if (esb_ready()) {
+			send_composite(builder->types, builder->n);
+		}
+#if CONFIG_CONNECTION_OVER_HID
+		write_hid_composite_as_normal_packets(builder);
+#endif
+	} else {
 		connection_write_packet_type(fallback_type);
+	}
 }
 
 void connection_thread(void)
@@ -881,6 +1047,8 @@ void connection_thread(void)
 		int64_t now = k_uptime_get();
 
 		watchdog_feed(WDT_CHANNEL_CONNECTION);
+		bool radio_ready = esb_ready();
+		bool hid_ready = connection_hid_output_ready();
 
 		/* Adaptive PING interval based on connection health */
 		if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
@@ -889,11 +1057,12 @@ void connection_thread(void)
 			ping_interval_ms = PING_INTERVAL_MS;
 		}
 
-		if (!esb_ready()) {
+		if (!radio_ready && !hid_ready) {
 			k_msleep(100);
 			continue;
 		}
 
+		if (radio_ready) {
 		/*
 		 * Process OTA packets queued from ESB ISR (safe in thread context).
 		 * Must run before esb_ota_is_active() check since BEGIN activates OTA.
@@ -985,13 +1154,13 @@ void connection_thread(void)
 
 		/* Raw data has priority over fusion data to minimize latency */
 		if (connection_process_raw_data()) {
-			// k_usleep(300); /* Brief delay for ESB TX completion */
 			continue;
 		}
+		} // end of radio_ready block
 
 		/* During data collection, throttle fusion data
 		 * to leave radio bandwidth for raw data. */
-		if (data_collection_active) {
+		if (radio_ready && data_collection_active) {
 			static int64_t last_fusion_dc_time;
 			if (now - last_fusion_dc_time < 9) {
 				k_usleep(300);
