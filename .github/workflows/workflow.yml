@@ -7,7 +7,6 @@ on:
     branches:
       - main
       - dev
-      - refix
     tags:
       - "*"
   create:
@@ -24,14 +23,20 @@ permissions: write-all
 
 env:
   ZEPHYR_SDK_VERSION: "0.17.4"
-  PYTHONUTF8: "1"
-  PYTHONIOENCODING: "utf-8"
 
 jobs:
   setup:
     runs-on: ubuntu-latest
+    outputs:
+      sdk-hash: ${{ steps.generate-vars.outputs.sdk-hash }}
+      sdk-revision: ${{ steps.generate-vars.outputs.sdk-revision }}
+      repo: ${{ steps.generate-vars.outputs.repo }}
+      repo-url: ${{ steps.generate-vars.outputs.repo-url }}
+      branch: ${{ steps.generate-vars.outputs.branch }}
+      repo-hash: ${{ steps.generate-vars.outputs.repo-hash }}
     steps:
-      - uses: actions/checkout@v5
+      - name: 💻 Checkout Repository
+        uses: actions/checkout@v6
         with:
           path: zephyr-workspace/SlimeNRF-CI
           submodules: recursive
@@ -85,7 +90,6 @@ jobs:
 
       - name: 🧰 Cache + Install Apt Dependencies
         id: cache-apt
-      - name: 🧰 Cache + Install apt Dependencies
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
           packages: >-
@@ -96,12 +100,13 @@ jobs:
 
       - name: 📦 Cache Zephyr SDK
         id: cache-sdk
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
           key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
 
       - name: 🪁 Install Zephyr SDK
+        id: install-sdk
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${{ env.ZEPHYR_SDK_VERSION }}/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz
@@ -110,7 +115,7 @@ jobs:
 
       - name: 📦 Cache West Workspace
         id: cache-west
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             zephyr-workspace/.west
@@ -120,22 +125,24 @@ jobs:
             zephyr-workspace/nrfxlib
             zephyr-workspace/bootloader
             zephyr-workspace/tools
-          key: west-workspace-${{ hashFiles('zephyr-workspace/SlimeNRF-CI/west.yml') }}
+          key: west-workspace-${{ steps.generate-vars.outputs.sdk-hash }}
 
       - name: 📦 Cache Python venv
         id: cache-venv
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.venv
-          key: venv-${{ hashFiles('zephyr-workspace/SlimeNRF-CI/west.yml') }}
+          key: venv-${{ env.ZEPHYR_SDK_VERSION }}
 
       - name: 🐍 Setup Python venv + West
+        id: setup-venv
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           python3 -m venv ~/.venv
           ~/.venv/bin/pip install west ninja
 
       - name: ♻️ Initialize Zephyr Workspace
+        id: init-west
         run: |
           echo "$HOME/.venv/bin" >> $GITHUB_PATH
           export PATH="$HOME/.venv/bin:$PATH"
@@ -146,14 +153,15 @@ jobs:
           west update --narrow -o=--depth=1
           west zephyr-export
 
-      - name: 📦 Cache pip requirements
+      - name: 📦 Cache PIP Requirements
         id: cache-pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.venv
-          key: venv-pip-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements.txt') }}
+          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements.txt') }}
 
       - name: 🐍 Install Zephyr Python Requirements
+        id: install-pip
         if: steps.cache-pip.outputs.cache-hit != 'true'
         run: |
           cd zephyr-workspace
@@ -203,13 +211,15 @@ jobs:
                 ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - name: 💻 Checkout Repository
+        uses: actions/checkout@v6
         with:
           path: zephyr-workspace/SlimeNRF-CI
           submodules: recursive
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: 🧰 Cache + Install apt Dependencies
+      - name: 🧰 Cache + Install Apt Dependencies
+        id: restore-apt
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
           packages: >-
@@ -219,18 +229,21 @@ jobs:
           version: 1.0
 
       - name: 📦 Restore Zephyr SDK
-        uses: actions/cache/restore@v4
+        id: restore-sdk
+        uses: actions/cache/restore@v5
         with:
           path: ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
           key: zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}
           fail-on-cache-miss: true
 
       - name: 🪁 Register Zephyr SDK
+        id: register-sdk
         run: |
           ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
 
       - name: 📦 Restore West Workspace
-        uses: actions/cache/restore@v4
+        id: restore-west
+        uses: actions/cache/restore@v5
         with:
           path: |
             zephyr-workspace/.west
@@ -240,27 +253,38 @@ jobs:
             zephyr-workspace/nrfxlib
             zephyr-workspace/bootloader
             zephyr-workspace/tools
-          key: west-workspace-${{ hashFiles('zephyr-workspace/SlimeNRF-CI/west.yml') }}
+          key: west-workspace-${{ needs.setup.outputs.sdk-hash }}
           fail-on-cache-miss: true
 
       - name: 📦 Restore Python venv
-        uses: actions/cache/restore@v4
+        id: restore-venv
+        uses: actions/cache/restore@v5
         with:
           path: ~/.venv
-          key: venv-pip-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements.txt') }}
+          key: venv-pip-${{ env.ZEPHYR_SDK_VERSION }}-${{ hashFiles('zephyr-workspace/zephyr/scripts/requirements.txt') }}
           restore-keys: |
             venv-pip-
             venv-
           fail-on-cache-miss: true
 
       - name: ♻️ Register Zephyr Workspace
+        id: register-west
         run: |
           echo "$HOME/.venv/bin" >> $GITHUB_PATH
           export PATH="$HOME/.venv/bin:$PATH"
           cd zephyr-workspace
           west zephyr-export
+
+      - name: 📦 Restore Repository
+        id: restore-repository
+        uses: actions/cache/restore@v5
+        with:
+          path: zephyr-workspace/SlimeVR-Tracker-nRF
+          key: firmware-${{ needs.setup.outputs.repo-hash }}
+          fail-on-cache-miss: true
+
       - name: 🔨 Build SlimeVR-Tracker-nRF - ${{ matrix.boards.boardname }}
-        if: always()
+        id: build-firmware
         run: |
           cd zephyr-workspace
           sudo rm -rf Releases
@@ -317,8 +341,9 @@ jobs:
           fi
 
       - name: 💾 Upload Artifact - ${{ matrix.boards.boardname }}
-        if: always()
-        uses: actions/upload-artifact@v5
+        id: upload-artifact
+        if: ${{ steps.build-firmware.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.boards.filename }}
           if-no-files-found: warn
