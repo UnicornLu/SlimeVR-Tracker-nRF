@@ -16,6 +16,7 @@
 #include <hal/nrf_gpio.h>
 
 #include "system.h"
+#include "battery_tracker.h"
 #include "build_defines.h"
 
 static struct nvs_fs fs;
@@ -193,6 +194,7 @@ static int sys_retained_init(void)
 		sys_read(MAIN_MAG_BIAS_ID, &retained->magBAinv, sizeof(retained->magBAinv));
 		sys_read(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, sizeof(retained->accBAinv));
 		sys_read(BATT_STATS_CURVE_ID, &retained->battery_pptt_curve, sizeof(retained->battery_pptt_curve));
+		sys_migrate_battery_curve();
 		sys_read(MAIN_GYRO_SENS_ID, &retained->gyroSensScale, sizeof(retained->gyroSensScale));
 		// If gyroSensScale was never set in NVS (all zeros), restore default values
 		if (retained->gyroSensScale[0] == 0.0f &&
@@ -217,6 +219,7 @@ static int sys_retained_init(void)
 		ram_retention_valid = true;
 		// Still need to init NVS for later sys_read/sys_write calls (e.g., battery_tracker)
 		sys_nvs_init();
+		sys_migrate_battery_curve();
 	}
 	return 0;
 }
@@ -479,10 +482,14 @@ static void button_thread(void)
 				press_time = 0;
 				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
 				set_status(SYS_STATUS_BUTTON_PRESSED, false);
-			} else if (sys_user_shutdown()) // held for 5 seconds, reset pairing
+			} else if (sys_user_shutdown())
 			{
+#if CONFIG_USER_EXTRA_ACTIONS
+				LOG_INF("Button hold timeout, shutdown canceled");
+#else
 				LOG_INF("Pairing requested");
 				esb_reset_pair();
+#endif
 				press_time = 0;
 				set_status(SYS_STATUS_BUTTON_PRESSED, false); // TODO: is needed?
 			}

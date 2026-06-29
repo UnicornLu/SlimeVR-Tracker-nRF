@@ -139,18 +139,22 @@ endif()
 
 # NORDIC SDK APP START
 FILE(GLOB_RECURSE app_sources src/*.c)
+if(NOT CONFIG_CONNECTION_OVER_HID)
+  list(FILTER app_sources EXCLUDE REGEX ".*/hid\\.c$")
+endif()
 target_sources(app PRIVATE ${app_sources})
 
 # NORDIC SDK APP END
 
-FILE(GLOB_RECURSE files Fusion/Fusion/*.c)
-target_sources(app PRIVATE ${files})
-
 FILE(GLOB_RECURSE files vqf-c/src/*.c)
 target_sources(app PRIVATE ${files})
+set_property(
+  SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/vqf-c/src/vqf.c
+  APPEND PROPERTY COMPILE_OPTIONS
+  -Wno-double-promotion
+)
 
 target_include_directories(app PRIVATE src)
-target_include_directories(app PRIVATE Fusion/Fusion)
 target_include_directories(app PRIVATE vqf-c/src)
 
 # Force recompile for updated build timestamp

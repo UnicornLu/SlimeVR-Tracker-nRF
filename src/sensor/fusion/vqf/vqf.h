@@ -28,6 +28,8 @@
 #include "sensor/sensor.h"
 
 void vqf_update_sensor_ids(int imu);
+void vqf_set_mag_enabled(bool enabled);
+void vqf_set_heading_hold_frame(const float correction_q[4]);
 
 void vqf_init(float g_time, float a_time, float m_time);
 void vqf_load(const void *data);
@@ -107,15 +109,6 @@ typedef struct {
     // Adaptive tauAcc state
     float tau_acc;             // current tauAcc value (seconds)
     float motion_intensity;    // motion intensity estimate [0, 1]
-#endif
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-    // Soft MBE gate state
-    float soft_mbe_scale;      // bias process-noise scale (1 = normal)
-    float soft_mbe_quasi_t;    // accumulated low-energy non-rest time (seconds)
-    float soft_mbe_margin_t;   // remaining active margin time (seconds)
-    float soft_mbe_gyr_norm;   // smoothed gyro norm (°/s)
-    float soft_mbe_acc_dev;    // smoothed |norm(acc)-1g| (g)
-    float soft_mbe_lin_acc;    // smoothed linear acceleration norm (g)
 #endif
     // Rest detection diagnostics (cumulative since boot/init)
     uint32_t rest_enter_count;     // number of transitions to rest

@@ -63,6 +63,9 @@ static void lsm_ext_stop_continuous(void);
 // Set during ext_setup() for device scanning, cleared by lsm_init() for normal operation.
 static bool ext_scanning_mode = true;
 
+#define LSM6DSV_SHUB_XLDA_TIMEOUT_MS 80
+#define LSM6DSV_SHUB_OP_TIMEOUT_MS 20
+
 int lsm_init(float clock_rate, float accel_time, float gyro_time, float *accel_actual_time, float *gyro_actual_time)
 {
 	// setup interface for SPI
@@ -89,31 +92,31 @@ int lsm_init(float clock_rate, float accel_time, float gyro_time, float *accel_a
 	// Store chip type for data order handling
 	chip_who_am_i = who_am_i;
 
-	// Power on sensors first by setting power mode and ODR (following ICM45686 pattern)
-	// OP_MODE_XL_HP (000) = high-performance mode (default, valid for all ODRs 7.5Hz-7.68kHz)
-	// OP_MODE_G_HP (000) = high-performance mode (default, valid for all ODRs 7.5Hz-7.68kHz)
-	// Using 15Hz initially to power on sensors with minimal current
-	LOG_INF("Powering on sensors in high-performance mode...");
-	uint8_t ctrl1_val = (OP_MODE_XL_HP << 4) | ODR_15Hz;
-	uint8_t ctrl2_val = (OP_MODE_G_HP << 4) | ODR_15Hz;
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL1, ctrl1_val); // accel HP mode, 15Hz
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL2, ctrl2_val); // gyro HP mode, 15Hz
+	// Leave WOM without a soft reset. Clear wake routing and FIFO state, then
+	// start accel/gyro at the target ODR while the remaining configuration runs.
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_INT1_CTRL, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_MD1_CFG, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FUNCTIONS_ENABLE, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FIFO_CTRL3, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FIFO_CTRL4, LSM6DSV_FIFO_MODE_BYPASS);
 
-	// Read back to verify
-	uint8_t ctrl1_readback = 0, ctrl2_readback = 0;
-	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL1, &ctrl1_readback);
-	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_CTRL2, &ctrl2_readback);
-	LOG_INF("CTRL1 write=0x%02X readback=0x%02X, CTRL2 write=0x%02X readback=0x%02X",
-		ctrl1_val, ctrl1_readback, ctrl2_val, ctrl2_readback);
+	// Re-enable SHUB_PU_EN if sensor hub (ext interface) was configured during scan.
+	uint8_t if_cfg = 0x18; // INT H_LACTIVE active low, PP_OD open-drain
+	if (sensor_interface_ext_get() != NULL)
+		if_cfg |= 0x40; // SHUB_PU_EN: enable internal pull-up for auxiliary I2C
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_IF_CFG, if_cfg);
 
-	if (err)
-		LOG_ERR("Communication error during power-on");
+	int8_t internal_freq_fine;
+	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_INTERNAL_FREQ_FINE, &internal_freq_fine); // affects ODR
+	freq_scale = 1.0f + 0.0013f * (float)internal_freq_fine;
+	LOG_INF("INTERNAL_FREQ_FINE = %d, freq_scale = %.6f", internal_freq_fine, (double)freq_scale);
 
-	// Wait for gyroscope startup AFTER powering on (Ton = 30ms typical, 45ms max)
-	LOG_INF("Waiting for gyroscope startup (30ms)...");
-	k_msleep(30);
+	last_accel_mode = 0xff;
+	last_gyro_mode = 0xff;
+	last_accel_odr = 0xff;
+	last_gyro_odr = 0xff;
+	err |= lsm_update_odr(accel_time, gyro_time, accel_actual_time, gyro_actual_time);
 
-	// Now configure FS and other settings after sensors are powered and stable
 	// Configure gyro FS + LPF1 bandwidth in CTRL6
 	// LPF1_G_BW[2:0] (bits [6:4]): 010 = ~ODR/4 bandwidth (Table 63)
 	// FS_G[3:0] (bits [3:0]): gyro full-scale selection
@@ -146,24 +149,6 @@ int lsm_init(float clock_rate, float accel_time, float gyro_time, float *accel_a
 
 	if (err)
 		LOG_ERR("Communication error during FS configuration");
-
-	last_accel_odr = 0xff; // reset last odr to force update
-	last_gyro_odr = 0xff; // reset last odr to force update
-	// Re-enable SHUB_PU_EN if sensor hub (ext interface) was configured during scan.
-	// The pre-init shutdown reset clears IF_CFG, so restore auxiliary I2C pull-ups here.
-	uint8_t if_cfg = 0x18; // INT H_LACTIVE active low, PP_OD open-drain
-	if (sensor_interface_ext_get() != NULL)
-		if_cfg |= 0x40; // SHUB_PU_EN: enable internal pull-up for auxiliary I2C
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_IF_CFG, if_cfg);
-
-	// Read internal frequency calibration
-	int8_t internal_freq_fine;
-	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_INTERNAL_FREQ_FINE, &internal_freq_fine); // affects ODR
-	freq_scale = 1.0f + 0.0013f * (float)internal_freq_fine;
-	LOG_INF("INTERNAL_FREQ_FINE = %d, freq_scale = %.6f", internal_freq_fine, (double)freq_scale);
-
-	// Update to target ODR
-	err |= lsm_update_odr(accel_time, gyro_time, accel_actual_time, gyro_actual_time);
 
 	// Enable FIFO in continuous mode
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FIFO_CTRL4, LSM6DSV_FIFO_MODE_CONTINUOUS);
@@ -657,17 +642,18 @@ int lsm_ext_write(const uint8_t addr, const uint8_t *buf, uint32_t num_bytes)
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_SLV0_ADD, slv0, 3);
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_DATAWRITE_SLV0, buf[1]);
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_MASTER_CONFIG, 0x44); // WRITE_ONCE(0x40) + MASTER_ON(0x04)
-	// Wait for transaction: write is triggered on accel XLDA, needs up to 67ms at 15Hz ODR
+	// Wait for transaction: one-shot starts on accel XLDA, which can take up to
+	// 67ms when the accel is still at the 15Hz startup ODR.
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FUNC_CFG_ACCESS, 0x00); // switch to normal registers
 	uint8_t tmp;
 	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_OUTX_H_A, &tmp); // clear current XLDA
 	uint8_t status = 0;
-	int64_t timeout = k_uptime_get() + 10;
+	int64_t timeout = k_uptime_get() + LSM6DSV_SHUB_XLDA_TIMEOUT_MS;
 	while (!(status & 0x01) && k_uptime_get() < timeout) // wait for new XLDA
 		err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_STATUS_REG, &status);
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FUNC_CFG_ACCESS, 0x40); // switch to sensor hub registers
 	status = 0;
-	timeout = k_uptime_get() + 10;
+	timeout = k_uptime_get() + LSM6DSV_SHUB_OP_TIMEOUT_MS;
 	while (!(status & 0x80) && k_uptime_get() < timeout) // WR_ONCE_DONE
 		err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_STATUS_MASTER, &status);
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_MASTER_CONFIG, 0x00); // disable I2C master
@@ -718,16 +704,17 @@ int lsm_ext_write_read(const uint8_t addr, const void *write_buf, size_t num_wri
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_MASTER_CONFIG, 0x44); // WRITE_ONCE(0x40) + MASTER_ON(0x04)
 	// Wait for transaction (AN5922 One-shot read routine):
 	// START_CONFIG=0: sensor hub triggers on accel/gyro data-ready
-	// lsm_ext_setup() ensures accel is running at >=15Hz before scan
+	// lsm_ext_setup() uses 480Hz for scan, but runtime one-shot reads may run
+	// at the configured accel ODR.
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_FUNC_CFG_ACCESS, 0x00); // switch to normal registers
 	uint8_t tmp;
 	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_OUTX_H_A, &tmp); // clear current XLDA by reading accel data
 	uint8_t status = 0;
-	int64_t timeout = k_uptime_get() + 10; // 10ms timeout
+	int64_t timeout = k_uptime_get() + LSM6DSV_SHUB_XLDA_TIMEOUT_MS;
 	while (!(status & 0x01) && k_uptime_get() < timeout) // wait for new XLDA (accelerometer data ready)
 		err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_STATUS_REG, &status);
 	status = 0;
-	timeout = k_uptime_get() + 10;
+	timeout = k_uptime_get() + LSM6DSV_SHUB_OP_TIMEOUT_MS;
 	while (!(status & 0x01) && k_uptime_get() < timeout) // SENS_HUB_ENDOP (bit 0)
 		err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSV_STATUS_MASTER_MAINPAGE, &status);
 	// Read data

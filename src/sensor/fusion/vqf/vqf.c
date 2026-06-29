@@ -23,6 +23,7 @@
 #include "util.h"
 
 #include <math.h>
+#include <stddef.h>
 #if defined(CONFIG_VQF_BENCH)
 #include <zephyr/kernel.h>
 #endif
@@ -38,7 +39,32 @@
 #include "retained.h" // for BUILD_ASSERT on fusion_data size
 
 #ifndef DEG_TO_RAD
-#define DEG_TO_RAD (M_PI / 180.0f)
+#define DEG_TO_RAD 0.01745329251994329577f  /* (float)(M_PI / 180.0) */
+#endif
+
+#ifndef RAD_TO_DEG
+#define RAD_TO_DEG 57.29577951308232087680f  /* (float)(180.0 / M_PI) */
+#endif
+
+#define VQF_PI 3.14159265358979323846f
+
+#ifndef VQF_NO_MAG_HEADING_HOLD_ENTER_S
+#define VQF_NO_MAG_HEADING_HOLD_ENTER_S 0.6f
+#endif
+#ifndef VQF_NO_MAG_HEADING_HOLD_ENTER_DEV
+#define VQF_NO_MAG_HEADING_HOLD_ENTER_DEV 0.8f
+#endif
+#ifndef VQF_NO_MAG_HEADING_HOLD_EXIT_DEV
+#define VQF_NO_MAG_HEADING_HOLD_EXIT_DEV 1.5f
+#endif
+#ifndef VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD
+#define VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD 0.0018f
+#endif
+#ifndef VQF_NO_MAG_HEADING_HOLD_RESET_S
+#define VQF_NO_MAG_HEADING_HOLD_RESET_S 2.0f
+#endif
+#ifndef VQF_NO_MAG_HEADING_HOLD_MAX_CORR_DPS
+#define VQF_NO_MAG_HEADING_HOLD_MAX_CORR_DPS 1.00f
 #endif
 
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
@@ -47,48 +73,39 @@
  * Three-regime adaptive tauAcc strategy:
  *
  * 1. REST (VQF rest detection active):
- *    tauAcc = TAU_ACC_REST.
- *    At true rest the accelerometer perfectly reflects gravity,
- *    so a small tau enables fast inclination convergence while
- *    the rest bias estimator handles gyro drift.
+ *    tauAcc = TAU_ACC_REST (moderate).
+ *    At rest the accelerometer cleanly reflects gravity and the rest
+ *    bias estimator handles gyro drift, so a moderate tau provides
+ *    stable inclination without needing fast correction.
  *
  * 2. GENTLE MOTION (accel close to gravity, low linear acceleration):
- *    tauAcc = TAU_ACC_GENTLE (high).
- *    Micro-movements (breathing, subtle swaying) contaminate the
- *    accelerometer slightly.  A high tau avoids these perturbations
- *    being coupled into heading via the bias estimator R-matrix.
+ *    tauAcc = TAU_ACC_GENTLE (low).
+ *    Slow orientation changes (rolling, tilting) must be tracked
+ *    quickly.  A low tau enables fast inclination correction so the
+ *    acc LP filter keeps up with the actual gravity direction,
+ *    preventing heading drift from stale inclination estimates.
  *
  * 3. AGGRESSIVE MOTION (significant linear acceleration):
- *    tauAcc = TAU_ACC_AGGRESSIVE (lower).
- *    Active deliberate motion—fast inclination correction helps
- *    prevent pitch/roll drift from coupling into heading.
+ *    tauAcc = TAU_ACC_AGGRESSIVE (higher).
+ *    Centripetal / dynamic accelerations corrupt the gravity estimate.
+ *    A higher tau rejects these transients at the cost of slower
+ *    inclination tracking.
  *
  * The accel deviation |‖a‖ - g| drives a [0,1] motion_intensity
  * with fast-attack / slow-release dynamics.  During motion, tauAcc
- * is linearly interpolated from GENTLE (0) to AGGRESSIVE (1).
- * When rest is detected, TAU_ACC_REST overrides.
+ * is linearly interpolated from GENTLE (intensity=0) to AGGRESSIVE
+ * (intensity=1).  When rest is detected, TAU_ACC_REST overrides.
  */
-#define ADAPTIVE_TAU_ACC_REST       7.6f   /* tauAcc when at rest (seconds) */
-#define ADAPTIVE_TAU_ACC_GENTLE     1.0f   /* tauAcc during gentle motion (seconds) */
-#define ADAPTIVE_TAU_ACC_AGGRESSIVE 8.5f   /* tauAcc under aggressive motion (seconds) */
-#define ADAPTIVE_TAU_ACC_LEVELS     10     /* quantization levels */
+#define ADAPTIVE_TAU_ACC_REST       3.0f   /* tauAcc when at rest (seconds) */
+#define ADAPTIVE_TAU_ACC_GENTLE     2.0f   /* tauAcc during gentle motion (seconds) */
+#define ADAPTIVE_TAU_ACC_AGGRESSIVE 4.3f   /* tauAcc under aggressive motion (seconds) */
+#define ADAPTIVE_TAU_ACC_LEVELS     5     /* quantization levels */
 #define ADAPTIVE_ACC_DEV_TH         2.0f   /* accel deviation threshold (m/s²) */
-#define ADAPTIVE_ATTACK_ALPHA       0.27f  /* fast attack coefficient (per sample) */
-#define ADAPTIVE_RELEASE_ALPHA      0.39f  /* slow release coefficient (per sample) */
-#define TAU_SMOOTH_ALPHA_DOWN       0.21f   /* tauAcc decrease smoothing (per sample) */
+#define ADAPTIVE_ATTACK_ALPHA       0.4f   /* attack coefficient: fast increase (per sample) */
+#define ADAPTIVE_RELEASE_ALPHA      0.2f   /* release coefficient: slow decrease (per sample) */
+#define TAU_SMOOTH_ALPHA_DOWN       0.21f  /* tauAcc decrease smoothing (per sample) */
 #define TAU_SMOOTH_ALPHA_UP         0.21f  /* tauAcc increase smoothing (per sample) */
 #endif /* CONFIG_VQF_ADAPTIVE_TAU_ACC */
-
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-/* ---------- Soft motion-bias-estimation gate configuration ---------- */
-#define SOFT_MBE_GYRO_TH_RAD_S       (6.0f * DEG_TO_RAD)
-#define SOFT_MBE_ACC_DEV_TH          (0.009f * CONST_EARTH_GRAVITY)
-#define SOFT_MBE_LIN_ACC_TH          (0.075f * CONST_EARTH_GRAVITY)
-#define SOFT_MBE_SMOOTH_T            10.0f
-#define SOFT_MBE_MIN_QUASI_T         45.0f
-#define SOFT_MBE_MARGIN_T            4.0f
-#define SOFT_MBE_BIAS_NOISE_SCALE    0.001733f
-#endif /* CONFIG_VQF_SOFT_MBE_GATE */
 
 static uint8_t imu_id;
 
@@ -139,17 +156,6 @@ static float current_tau_level = -1; /* current quantized level (-1 = unset) */
 static float smoothed_tau;           /* smoothed tauAcc for gradual transitions */
 #endif
 
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-static float soft_mbe_latest_gyr_norm;
-static float soft_mbe_gyr_norm_lp;
-static float soft_mbe_acc_dev_lp;
-static float soft_mbe_lin_acc_lp;
-static float soft_mbe_quasi_t;
-static float soft_mbe_margin_t;
-static float soft_mbe_scale = 1.0f;
-static float soft_mbe_base_bias_v;
-#endif
-
 /* Rest detection diagnostics */
 static uint32_t rest_enter_count;
 static uint32_t rest_exit_count;
@@ -158,6 +164,15 @@ static float rest_last_enter_time;   /* uptime when last rest started */
 static float rest_last_duration_s;
 static float uptime_s;
 static bool prev_rest_detected;
+
+static bool vqf_mag_enabled = true;
+static bool no_mag_heading_hold_active;
+static bool no_mag_heading_hold_target_valid;
+static float no_mag_heading_hold_rest_s;
+static float no_mag_heading_hold_unsteady_s;
+static float no_mag_heading_hold_target;
+static uint8_t no_mag_heading_hold_axis = 2;
+static vqf_real_t no_mag_heading_hold_frame[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
 /* Circular rest event log */
 #define REST_EVENT_LOG_SIZE 5
@@ -169,100 +184,226 @@ static uint8_t rest_event_idx;  /* next write position */
 static uint8_t rest_event_total; /* total events (up to log size) */
 
 
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-static inline float vqf_square_f(float v)
-{
-	return v * v;
-}
-
-static void soft_mbe_apply_bias_noise_scale(float scale)
-{
-	if (scale < 1e-6f)
-		scale = 1e-6f;
-
-	soft_mbe_scale = scale;
-	coeffs.biasV = soft_mbe_base_bias_v * scale;
-
-	float sigma_motion = params.biasSigmaMotion * 100.0f;
-	float p_motion = sigma_motion * sigma_motion;
-	coeffs.biasMotionW = vqf_square_f(p_motion) / coeffs.biasV + p_motion;
-	coeffs.biasVerticalW = coeffs.biasMotionW /
-		fmaxf(params.biasVerticalForgettingFactor, 1e-10f);
-
-	float sigma_rest = params.biasSigmaRest * 100.0f;
-	float p_rest = sigma_rest * sigma_rest;
-	coeffs.biasRestW = vqf_square_f(p_rest) / coeffs.biasV + p_rest;
-}
-
-static void soft_mbe_reset(void)
-{
-	soft_mbe_latest_gyr_norm = 0.0f;
-	soft_mbe_gyr_norm_lp = 0.0f;
-	soft_mbe_acc_dev_lp = 0.0f;
-	soft_mbe_lin_acc_lp = 0.0f;
-	soft_mbe_quasi_t = 0.0f;
-	soft_mbe_margin_t = 0.0f;
-	soft_mbe_scale = 1.0f;
-	soft_mbe_base_bias_v = coeffs.biasV;
-}
-
-static void soft_mbe_update_gyro_norm(const float g_rad[3])
-{
-	soft_mbe_latest_gyr_norm = sqrtf(g_rad[0] * g_rad[0] +
-					       g_rad[1] * g_rad[1] +
-					       g_rad[2] * g_rad[2]);
-}
-
-static void soft_mbe_pre_accel_update(const float a_m_s2[3])
-{
-	float dt = coeffs.accTs;
-	float alpha = dt / (SOFT_MBE_SMOOTH_T + dt);
-
-	float a_norm = sqrtf(a_m_s2[0] * a_m_s2[0] +
-				   a_m_s2[1] * a_m_s2[1] +
-				   a_m_s2[2] * a_m_s2[2]);
-	float acc_dev = fabsf(a_norm - CONST_EARTH_GRAVITY);
-
-	float q[4];
-	getQuat6D(&state, q);
-	float gravity_body[3];
-	gravity_body[0] = 2.0f * (q[1] * q[3] - q[0] * q[2]) * CONST_EARTH_GRAVITY;
-	gravity_body[1] = 2.0f * (q[2] * q[3] + q[0] * q[1]) * CONST_EARTH_GRAVITY;
-	gravity_body[2] = 2.0f * (q[0] * q[0] - 0.5f + q[3] * q[3]) * CONST_EARTH_GRAVITY;
-	float lin_x = a_m_s2[0] - gravity_body[0];
-	float lin_y = a_m_s2[1] - gravity_body[1];
-	float lin_z = a_m_s2[2] - gravity_body[2];
-	float lin_acc = sqrtf(lin_x * lin_x + lin_y * lin_y + lin_z * lin_z);
-
-	soft_mbe_gyr_norm_lp += alpha * (soft_mbe_latest_gyr_norm - soft_mbe_gyr_norm_lp);
-	soft_mbe_acc_dev_lp += alpha * (acc_dev - soft_mbe_acc_dev_lp);
-	soft_mbe_lin_acc_lp += alpha * (lin_acc - soft_mbe_lin_acc_lp);
-
-	bool low_energy = !state.restDetected &&
-		soft_mbe_gyr_norm_lp <= SOFT_MBE_GYRO_TH_RAD_S &&
-		soft_mbe_acc_dev_lp <= SOFT_MBE_ACC_DEV_TH &&
-		soft_mbe_lin_acc_lp <= SOFT_MBE_LIN_ACC_TH;
-
-	if (low_energy) {
-		soft_mbe_quasi_t += dt;
-		if (soft_mbe_quasi_t >= SOFT_MBE_MIN_QUASI_T) {
-			soft_mbe_margin_t = SOFT_MBE_MARGIN_T;
-		}
-	} else {
-		soft_mbe_quasi_t = 0.0f;
-		if (soft_mbe_margin_t > 0.0f) {
-			soft_mbe_margin_t = fmaxf(soft_mbe_margin_t - dt, 0.0f);
-		}
-	}
-
-	float scale = soft_mbe_margin_t > 0.0f ? SOFT_MBE_BIAS_NOISE_SCALE : 1.0f;
-	soft_mbe_apply_bias_noise_scale(scale);
-}
-#endif /* CONFIG_VQF_SOFT_MBE_GATE */
+static void vqf_reset_no_mag_heading_hold(void);
 
 void vqf_update_sensor_ids(int imu)
 {
 	imu_id = imu;
+}
+
+void vqf_set_mag_enabled(bool enabled)
+{
+	vqf_mag_enabled = enabled;
+	vqf_reset_no_mag_heading_hold();
+}
+
+void vqf_set_heading_hold_frame(const float correction_q[4])
+{
+	if (correction_q == NULL) {
+		no_mag_heading_hold_frame[0] = 1.0f;
+		no_mag_heading_hold_frame[1] = 0.0f;
+		no_mag_heading_hold_frame[2] = 0.0f;
+		no_mag_heading_hold_frame[3] = 0.0f;
+	} else {
+		for (int i = 0; i < 4; i++)
+			no_mag_heading_hold_frame[i] = correction_q[i];
+	}
+	vqf_reset_no_mag_heading_hold();
+}
+
+static float vqf_wrap_angle(float angle)
+{
+	while (angle > VQF_PI)
+		angle -= 2.0f * VQF_PI;
+	while (angle < -VQF_PI)
+		angle += 2.0f * VQF_PI;
+	return angle;
+}
+
+static void vqf_quat_multiply(const vqf_real_t a[4], const vqf_real_t b[4], vqf_real_t out[4])
+{
+	vqf_real_t w = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+	vqf_real_t x = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+	vqf_real_t y = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+	vqf_real_t z = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+	out[0] = w;
+	out[1] = x;
+	out[2] = y;
+	out[3] = z;
+}
+
+static void vqf_apply_heading_hold_frame(const vqf_real_t q[4], vqf_real_t out[4])
+{
+	vqf_quat_multiply(q, no_mag_heading_hold_frame, out);
+}
+
+static void vqf_quat_rotated_axis(const vqf_real_t q[4], uint8_t axis, float out[3])
+{
+	float w = q[0];
+	float x = q[1];
+	float y = q[2];
+	float z = q[3];
+
+	switch (axis) {
+	case 0:
+		out[0] = 1.0f - 2.0f * (y * y + z * z);
+		out[1] = 2.0f * (x * y + w * z);
+		out[2] = 2.0f * (x * z - w * y);
+		break;
+	case 1:
+		out[0] = 2.0f * (x * y - w * z);
+		out[1] = 1.0f - 2.0f * (x * x + z * z);
+		out[2] = 2.0f * (y * z + w * x);
+		break;
+	default:
+		out[0] = 2.0f * (x * z + w * y);
+		out[1] = 2.0f * (y * z - w * x);
+		out[2] = 1.0f - 2.0f * (x * x + y * y);
+		break;
+	}
+}
+
+static float vqf_heading_from_axis(const vqf_real_t q[4], uint8_t axis)
+{
+	float axis_world[3];
+	vqf_quat_rotated_axis(q, axis, axis_world);
+	return atan2f(axis_world[1], axis_world[0]);
+}
+
+static uint8_t vqf_select_heading_axis(const vqf_real_t q[4])
+{
+	uint8_t best_axis = 2;
+	float best_horizontal_sq = -1.0f;
+
+	for (uint8_t axis = 0; axis < 3; axis++) {
+		float axis_world[3];
+		vqf_quat_rotated_axis(q, axis, axis_world);
+		float horizontal_sq = axis_world[0] * axis_world[0] + axis_world[1] * axis_world[1];
+		if (horizontal_sq > best_horizontal_sq) {
+			best_horizontal_sq = horizontal_sq;
+			best_axis = axis;
+		}
+	}
+
+	return best_axis;
+}
+
+static float vqf_max_rest_deviation(void)
+{
+	vqf_real_t deviations[2];
+	getRelativeRestDeviations(&params, &state, deviations);
+	return fmaxf(deviations[0], deviations[1]);
+}
+
+static float vqf_rest_gyr_lp_norm(void)
+{
+	return sqrtf(
+		state.restLastGyrLp[0] * state.restLastGyrLp[0] +
+		state.restLastGyrLp[1] * state.restLastGyrLp[1] +
+		state.restLastGyrLp[2] * state.restLastGyrLp[2]);
+}
+
+static float vqf_accel_dt_from_timestamp(uint64_t timestamp_us)
+{
+	if (state.lastAccTsUs != 0 && timestamp_us > state.lastAccTsUs) {
+		uint64_t diff = timestamp_us - state.lastAccTsUs;
+		if (diff > 0 && diff <= 10000000ULL)
+			return (float)diff / 1e6f;
+	}
+	return coeffs.accTs;
+}
+
+static void vqf_reset_no_mag_heading_hold(void)
+{
+	no_mag_heading_hold_active = false;
+	no_mag_heading_hold_target_valid = false;
+	no_mag_heading_hold_rest_s = 0.0f;
+	no_mag_heading_hold_unsteady_s = 0.0f;
+	no_mag_heading_hold_target = 0.0f;
+	no_mag_heading_hold_axis = 2;
+}
+
+static void vqf_capture_no_mag_heading_hold_target(void)
+{
+	vqf_real_t quat[4];
+	vqf_real_t heading_quat[4];
+	getQuat9D(&state, quat);
+	vqf_apply_heading_hold_frame(quat, heading_quat);
+	no_mag_heading_hold_axis = vqf_select_heading_axis(heading_quat);
+	no_mag_heading_hold_target = vqf_heading_from_axis(heading_quat, no_mag_heading_hold_axis);
+	no_mag_heading_hold_target_valid = true;
+}
+
+static void vqf_update_no_mag_heading_hold(float dt)
+{
+	if (vqf_mag_enabled) {
+		vqf_reset_no_mag_heading_hold();
+		return;
+	}
+
+	float rest_dev = vqf_max_rest_deviation();
+	float rest_gyr_lp_norm = vqf_rest_gyr_lp_norm();
+	float enter_gyr_lp_norm = params.biasClip * DEG_TO_RAD * 0.5f;
+	float exit_gyr_lp_norm = params.biasClip * DEG_TO_RAD * 0.8f;
+
+	if (state.restDetected) {
+		vqf_reset_no_mag_heading_hold();
+		return;
+	}
+
+	bool near_static = rest_dev <= VQF_NO_MAG_HEADING_HOLD_ENTER_DEV
+		&& rest_gyr_lp_norm <= enter_gyr_lp_norm;
+	bool unsteady = rest_dev > VQF_NO_MAG_HEADING_HOLD_EXIT_DEV
+		|| rest_gyr_lp_norm > exit_gyr_lp_norm;
+	if (near_static) {
+		no_mag_heading_hold_rest_s += dt;
+		no_mag_heading_hold_unsteady_s = 0.0f;
+	} else if (!no_mag_heading_hold_active) {
+		no_mag_heading_hold_rest_s = 0.0f;
+		if (unsteady && no_mag_heading_hold_target_valid) {
+			no_mag_heading_hold_unsteady_s += dt;
+			if (no_mag_heading_hold_unsteady_s >= VQF_NO_MAG_HEADING_HOLD_RESET_S)
+				vqf_reset_no_mag_heading_hold();
+		} else {
+			no_mag_heading_hold_unsteady_s = 0.0f;
+		}
+	} else if (unsteady) {
+		no_mag_heading_hold_unsteady_s += dt;
+		if (no_mag_heading_hold_unsteady_s >= VQF_NO_MAG_HEADING_HOLD_RESET_S) {
+			vqf_reset_no_mag_heading_hold();
+			return;
+		}
+	} else {
+		no_mag_heading_hold_unsteady_s = 0.0f;
+	}
+
+	if (!no_mag_heading_hold_active) {
+		if (no_mag_heading_hold_rest_s < VQF_NO_MAG_HEADING_HOLD_ENTER_S)
+			return;
+
+		if (!no_mag_heading_hold_target_valid)
+			vqf_capture_no_mag_heading_hold_target();
+		no_mag_heading_hold_active = true;
+	}
+
+	if (unsteady)
+		return;
+
+	vqf_real_t quat9d[4];
+	vqf_real_t heading_quat[4];
+	getQuat9D(&state, quat9d);
+	vqf_apply_heading_hold_frame(quat9d, heading_quat);
+	float error = vqf_wrap_angle(
+		no_mag_heading_hold_target - vqf_heading_from_axis(heading_quat, no_mag_heading_hold_axis));
+	float abs_error = fabsf(error);
+
+	if (abs_error > VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD) {
+		float correction = error - copysignf(VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD, error);
+		float max_correction = VQF_NO_MAG_HEADING_HOLD_MAX_CORR_DPS * DEG_TO_RAD * dt;
+		if (fabsf(correction) > max_correction)
+			correction = copysignf(max_correction, correction);
+		state.delta = vqf_wrap_angle(state.delta + correction);
+	}
 }
 
 static void set_params()
@@ -282,9 +423,9 @@ static void set_params()
 	params.restThGyr = 0.68f;
 	params.restThAcc = 0.21f;
 	params.magDistRejectionEnabled = true;
-	params.tauMag = 9.0f;
+	params.tauMag = 6.0f;
 	params.magCurrentTau = 0.50f;
-	params.magNormTh = 0.09f;
+	params.magNormTh = 0.08f;
 	params.magDipTh = 6.0f;
 	params.magRefTau = 15.0f;
 	params.magNewTime = 12.0f;
@@ -304,9 +445,6 @@ void vqf_init(float g_time, float a_time, float m_time)
 	current_tau_level = -1.0f;
 	smoothed_tau = params.tauAcc;
 #endif
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	soft_mbe_reset();
-#endif
 	rest_enter_count = 0;
 	rest_exit_count = 0;
 	rest_total_s = 0;
@@ -316,6 +454,7 @@ void vqf_init(float g_time, float a_time, float m_time)
 	prev_rest_detected = false;
 	rest_event_idx = 0;
 	rest_event_total = 0;
+	vqf_reset_no_mag_heading_hold();
 }
 
 void vqf_load(const void *data)
@@ -330,9 +469,6 @@ void vqf_load(const void *data)
 	current_tau_level = -1.0f;
 	smoothed_tau = params.tauAcc;
 #endif
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	soft_mbe_reset();
-#endif
 	rest_enter_count = 0;
 	rest_exit_count = 0;
 	rest_total_s = 0;
@@ -342,6 +478,7 @@ void vqf_load(const void *data)
 	prev_rest_detected = false;
 	rest_event_idx = 0;
 	rest_event_total = 0;
+	vqf_reset_no_mag_heading_hold();
 }
 
 void vqf_save(void *data)
@@ -349,14 +486,7 @@ void vqf_save(void *data)
 	BUILD_ASSERT(VQF_MEM_SIZE <= sizeof(((struct retained_data *)0)->fusion_data),
 		     "VQF state+coeffs exceeds fusion_data buffer in retained memory");
 	memcpy(data, &state, sizeof(state));
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	float saved_scale = soft_mbe_scale;
-	soft_mbe_apply_bias_noise_scale(1.0f);
 	memcpy((uint8_t *)data + sizeof(state), &coeffs, sizeof(coeffs));
-	soft_mbe_apply_bias_noise_scale(saved_scale);
-#else
-	memcpy((uint8_t *)data + sizeof(state), &coeffs, sizeof(coeffs));
-#endif
 }
 
 void vqf_update_gyro(float *g, float time)
@@ -366,9 +496,6 @@ void vqf_update_gyro(float *g, float time)
 	// g is in deg/s, convert to rad/s
 	for (int i = 0; i < 3; i++)
 		g_rad[i] = g[i] * DEG_TO_RAD;
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	soft_mbe_update_gyro_norm(g_rad);
-#endif
 	updateGyr(&params, &state, &coeffs, g_rad);
 }
 
@@ -377,9 +504,6 @@ void vqf_update_gyro_ts(float *g, uint64_t timestamp_us)
 	float g_rad[3] = {0};
 	for (int i = 0; i < 3; i++)
 		g_rad[i] = g[i] * DEG_TO_RAD;
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	soft_mbe_update_gyro_norm(g_rad);
-#endif
 	updateGyrTs(&params, &state, &coeffs, g_rad, timestamp_us);
 }
 
@@ -401,7 +525,8 @@ static void vqf_pre_accel_update(const float a_m_s2[3])
 	float a_dev = fabsf(a_norm - CONST_EARTH_GRAVITY);
 	float alpha_inst = fminf(a_dev / ADAPTIVE_ACC_DEV_TH, 1.0f);
 
-	/* Attack-release envelope: fast increase, slow decrease */
+	/* Attack-release envelope: fast increase (detect motion quickly),
+	 * slow decrease (sustain elevated tau after motion stops) */
 	if (alpha_inst > motion_intensity) {
 		motion_intensity += ADAPTIVE_ATTACK_ALPHA * (alpha_inst - motion_intensity);
 	} else {
@@ -463,9 +588,8 @@ static void vqf_pre_accel_update(const float a_m_s2[3])
  * @brief Track rest detection transitions and accumulate diagnostics.
  * Called after each accelerometer update (which runs rest detection).
  */
-static void vqf_track_rest_diag(void)
+static void vqf_track_rest_diag(float dt)
 {
-	float dt = coeffs.accTs;
 	uptime_s += dt;
 
 	bool cur = state.restDetected;
@@ -506,15 +630,14 @@ void vqf_update_accel(float *a, float time)
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 	vqf_pre_accel_update(a_m_s2);
 #endif
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	soft_mbe_pre_accel_update(a_m_s2);
-#endif
 	updateAcc(&params, &state, &coeffs, a_m_s2);
-	vqf_track_rest_diag();
+	vqf_update_no_mag_heading_hold(coeffs.accTs);
+	vqf_track_rest_diag(coeffs.accTs);
 }
 
 void vqf_update_accel_ts(float *a, uint64_t timestamp_us)
 {
+	float dt = vqf_accel_dt_from_timestamp(timestamp_us);
 	float a_m_s2[3] = {0};
 	for (int i = 0; i < 3; i++)
 		a_m_s2[i] = a[i] * CONST_EARTH_GRAVITY;
@@ -523,11 +646,9 @@ void vqf_update_accel_ts(float *a, uint64_t timestamp_us)
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 	vqf_pre_accel_update(a_m_s2);
 #endif
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	soft_mbe_pre_accel_update(a_m_s2);
-#endif
 	updateAccTs(&params, &state, &coeffs, a_m_s2, timestamp_us);
-	vqf_track_rest_diag();
+	vqf_update_no_mag_heading_hold(dt);
+	vqf_track_rest_diag(dt);
 }
 
 void vqf_update_mag(float *m, float time)
@@ -569,7 +690,7 @@ void vqf_get_gyro_bias(float *g_off)
 	getBiasEstimate(&state, &coeffs, g_off);
 	// VQF internal unit is rad/s, fusion interface expects deg/s
 	for (int i = 0; i < 3; i++)
-		g_off[i] *= 180.0f / M_PI;
+		g_off[i] *= RAD_TO_DEG;
 }
 
 void vqf_set_gyro_bias(float *g_off)
@@ -699,35 +820,26 @@ void vqf_get_debug_info(vqf_debug_info_t *info)
 
 	// Convert bias from rad/s to °/s
 	for (int i = 0; i < 3; i++) {
-		info->bias[i] *= 180.0f / M_PI;
+		info->bias[i] *= RAD_TO_DEG;
 	}
-	info->bias_sigma *= 180.0f / M_PI;
+	info->bias_sigma *= RAD_TO_DEG;
 
 	// Convert rad-based angles to degrees
-	info->delta *= 180.0f / M_PI;
-	info->mag_ref_dip *= 180.0f / M_PI;
-	info->mag_dip *= 180.0f / M_PI;
-	info->mag_dis_angle *= 180.0f / M_PI;
+	info->delta *= RAD_TO_DEG;
+	info->mag_ref_dip *= RAD_TO_DEG;
+	info->mag_dip *= RAD_TO_DEG;
+	info->mag_dis_angle *= RAD_TO_DEG;
 
 	// Convert angular rates from rad/s to °/s
-	info->mag_corr_rate *= 180.0f / M_PI;
+	info->mag_corr_rate *= RAD_TO_DEG;
 
 	// Convert candidate dip from rad to degrees
-	info->mag_candidate_dip *= 180.0f / M_PI;
+	info->mag_candidate_dip *= RAD_TO_DEG;
 
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 	// Adaptive tauAcc state
 	info->tau_acc = params.tauAcc;
 	info->motion_intensity = motion_intensity;
-#endif
-#if IS_ENABLED(CONFIG_VQF_SOFT_MBE_GATE)
-	// Soft MBE gate state
-	info->soft_mbe_scale = soft_mbe_scale;
-	info->soft_mbe_quasi_t = soft_mbe_quasi_t;
-	info->soft_mbe_margin_t = soft_mbe_margin_t;
-	info->soft_mbe_gyr_norm = soft_mbe_gyr_norm_lp * 180.0f / M_PI;
-	info->soft_mbe_acc_dev = soft_mbe_acc_dev_lp / CONST_EARTH_GRAVITY;
-	info->soft_mbe_lin_acc = soft_mbe_lin_acc_lp / CONST_EARTH_GRAVITY;
 #endif
 
 	// Rest detection diagnostics
