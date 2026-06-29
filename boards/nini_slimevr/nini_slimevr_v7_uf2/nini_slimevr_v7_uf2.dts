@@ -138,7 +138,7 @@
 		int0-gpios = <&gpio0 3 0>;
 		chg-gpios = <&gpio0 11 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		stby-gpios = <&gpio0 5 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		pwr-gpios = <&gpio1 9 0>;
+		pwr-gpios = <&gpio1 9 GPIO_OPEN_SOURCE>;
 		/* clk-gpios = <&gpio0 2 GPIO_OPEN_DRAIN>; */
 	};
 };
@@ -160,7 +160,13 @@
 };
 
 &gpio1 {
-    status = "okay";
+	status = "okay";
+	/* Keep LDO CE low when the application is not actively driving it. */
+	sensor_ldo_en: sensor-ldo-en {
+		gpio-hog;
+		gpios = <9 GPIO_PULL_DOWN>;
+		input;
+	};
 };
 
 zephyr_udc0: &usbd {

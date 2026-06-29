@@ -141,6 +141,11 @@ static void sys_gpio_power_set(uint32_t psel, uint32_t flags, bool enable)
 	const nrf_gpio_pin_pull_t pull = enable ?
 		NRF_GPIO_PIN_NOPULL : gpio_inactive_pull_from_dt_flags(flags, output_high);
 
+	if (output_high) {
+		nrf_gpio_pin_set(psel);
+	} else {
+		nrf_gpio_pin_clear(psel);
+	}
 	nrf_gpio_cfg(psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
 		     pull, gpio_drive_from_dt_flags(flags), NRF_GPIO_PIN_NOSENSE);
 	if (output_high) {
