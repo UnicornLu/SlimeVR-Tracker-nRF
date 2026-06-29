@@ -50,6 +50,19 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
 
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+static nrf_gpio_pin_drive_t gpio_drive_from_dt_flags(uint32_t flags)
+{
+	if (flags & GPIO_OPEN_DRAIN) {
+		return NRF_GPIO_PIN_S0D1;
+	}
+	if (flags & GPIO_OPEN_SOURCE) {
+		return NRF_GPIO_PIN_D0S1;
+	}
+	return NRF_GPIO_PIN_S0S1;
+}
+#endif
+
 int main(void)
 {
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
@@ -60,9 +73,11 @@ int main(void)
 #endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
 	uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
-	const bool pwr_active_low = (DT_GPIO_FLAGS(ZEPHYR_USER_NODE, pwr_gpios) & GPIO_ACTIVE_LOW) != 0;
+	const uint32_t pwr_flags = DT_GPIO_FLAGS(ZEPHYR_USER_NODE, pwr_gpios);
+	const bool pwr_active_low = (pwr_flags & GPIO_ACTIVE_LOW) != 0;
 	nrf_gpio_cfg(pwr_psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
-		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0D1, NRF_GPIO_PIN_NOSENSE);
+		     NRF_GPIO_PIN_NOPULL, gpio_drive_from_dt_flags(pwr_flags),
+		     NRF_GPIO_PIN_NOSENSE);
 	if (pwr_active_low) {
 		nrf_gpio_pin_clear(pwr_psel);
 	} else {

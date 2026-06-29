@@ -109,31 +109,51 @@ static const struct gpio_dt_spec clk __attribute__((unused)) = GPIO_DT_SPEC_GET(
 
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
 
-/* LDO EN via open drain: sink low / release (do not use cfg_default — enables pull-up). */
-static void sys_gpio_ldo_en_set(uint32_t psel, bool enable)
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios) || DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
+/* GPIO-backed power enables must preserve the devicetree drive semantics. */
+static nrf_gpio_pin_drive_t gpio_drive_from_dt_flags(uint32_t flags)
 {
-	const bool active_low = (DT_GPIO_FLAGS(ZEPHYR_USER_NODE, pwr_gpios) & GPIO_ACTIVE_LOW) != 0;
-	const bool drive_on = active_low ? !enable : enable;
+	if (flags & GPIO_OPEN_DRAIN) {
+		return NRF_GPIO_PIN_S0D1;
+	}
+	if (flags & GPIO_OPEN_SOURCE) {
+		return NRF_GPIO_PIN_D0S1;
+	}
+	return NRF_GPIO_PIN_S0S1;
+}
+
+static nrf_gpio_pin_pull_t gpio_inactive_pull_from_dt_flags(uint32_t flags, bool output_high)
+{
+	if ((flags & GPIO_OPEN_SOURCE) && !output_high) {
+		return NRF_GPIO_PIN_PULLDOWN;
+	}
+	if ((flags & GPIO_OPEN_DRAIN) && output_high) {
+		return NRF_GPIO_PIN_PULLUP;
+	}
+	return NRF_GPIO_PIN_NOPULL;
+}
+
+static void sys_gpio_power_set(uint32_t psel, uint32_t flags, bool enable)
+{
+	const bool active_low = (flags & GPIO_ACTIVE_LOW) != 0;
+	const bool output_high = active_low ? !enable : enable;
+	const nrf_gpio_pin_pull_t pull = enable ?
+		NRF_GPIO_PIN_NOPULL : gpio_inactive_pull_from_dt_flags(flags, output_high);
 
 	nrf_gpio_cfg(psel, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT,
-		     NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0D1, NRF_GPIO_PIN_NOSENSE);
-	if (drive_on) {
+		     pull, gpio_drive_from_dt_flags(flags), NRF_GPIO_PIN_NOSENSE);
+	if (output_high) {
 		nrf_gpio_pin_set(psel);
 	} else {
 		nrf_gpio_pin_clear(psel);
 	}
 }
 
-static void sys_gpio_ldo_en_disable(uint32_t psel)
+static void sys_gpio_power_disable(uint32_t psel, uint32_t flags)
 {
-	sys_gpio_ldo_en_set(psel, false);
+	sys_gpio_power_set(psel, flags, false);
 }
-
-/* nRF loses GPIO config in System OFF; pulldown until entry helps only briefly. */
-static void sys_gpio_ldo_en_prepare_system_off(uint32_t psel)
-{
-	nrf_gpio_cfg_input(psel, NRF_GPIO_PIN_PULLDOWN);
-}
+#endif
 
 static void sys_disconnect_interface_pins(void)
 {
@@ -451,15 +471,16 @@ static void sys_system_off(void) // TODO: add timeout
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
 	{
 		uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
-		sys_gpio_ldo_en_disable(pwr_psel);
+		uint32_t pwr_flags = DT_GPIO_FLAGS(ZEPHYR_USER_NODE, pwr_gpios);
+		sys_gpio_power_disable(pwr_psel, pwr_flags);
 		k_busy_wait(10000);
-		sys_gpio_ldo_en_prepare_system_off(pwr_psel);
 		LOG_INF("LDO EN off before System OFF, PSEL %u, gpio read=%u", pwr_psel,
 			nrf_gpio_pin_read(pwr_psel));
 	}
 #endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
-	sys_gpio_ldo_en_disable(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, vcc_gpios));
+	sys_gpio_power_disable(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, vcc_gpios),
+		DT_GPIO_FLAGS(ZEPHYR_USER_NODE, vcc_gpios));
 #endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
 	uint32_t gnd_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, gnd_gpios);
