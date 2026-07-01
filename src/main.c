@@ -65,8 +65,19 @@ static void enable_sensor_power(void)
 #endif
 }
 
+static void disable_sensor_power(void)
+{
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_set_dt(&pwr, 0);
+#endif
+}
+
 int main(void)
 {
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+	disable_sensor_power();
+#endif
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
 	gpio_pin_configure_dt(&gnd, GPIO_OUTPUT_ACTIVE);
 	gpio_pin_set_dt(&gnd, 0);
