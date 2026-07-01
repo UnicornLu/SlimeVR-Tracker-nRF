@@ -162,6 +162,7 @@ static void force_power_gpio_low(void)
 	(void)gpio_pin_set_raw(pwr.port, pwr.pin, 0);
 	nrf_gpio_cfg_output(pwr_psel);
 	nrf_gpio_pin_clear(pwr_psel);
+	LOG_INF("Final power GPIO output low, raw read: %d", gpio_pin_get_raw(pwr.port, pwr.pin));
 #endif
 }
 
@@ -169,7 +170,10 @@ static void hold_power_gpio_off_for_system_off(void)
 {
 #if PWR_EXISTS
 	nrf_gpio_pin_clear(pwr_psel);
-	nrf_gpio_cfg_input(pwr_psel, NRF_GPIO_PIN_PULLDOWN);
+	int ret = gpio_pin_configure(pwr.port, pwr.pin, GPIO_INPUT | GPIO_PULL_DOWN);
+	if (ret)
+		LOG_ERR("Failed to configure final power GPIO pulldown: %d", ret);
+	LOG_INF("Final power GPIO pulldown, raw read: %d", gpio_pin_get_raw(pwr.port, pwr.pin));
 #endif
 }
 
@@ -491,6 +495,7 @@ static void sys_system_off(void) // TODO: add timeout
 	wait_for_logging();
 	force_power_gpio_low();
 	hold_power_gpio_off_for_system_off();
+	wait_for_logging();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
