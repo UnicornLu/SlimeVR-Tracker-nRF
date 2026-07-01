@@ -57,15 +57,19 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
 
+static void enable_sensor_power(void)
+{
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_ACTIVE);
+	gpio_pin_set_dt(&pwr, 1);
+#endif
+}
+
 int main(void)
 {
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
 	gpio_pin_configure_dt(&gnd, GPIO_OUTPUT_ACTIVE);
 	gpio_pin_set_dt(&gnd, 0);
-#endif
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
-	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_ACTIVE);
-	gpio_pin_set_dt(&pwr, 1);
 #endif
 #if IGNORE_RESET && BUTTON_EXISTS
 	bool reset_pin_reset = false;
@@ -110,6 +114,7 @@ int main(void)
 #if USER_SHUTDOWN_ENABLED
 		if (k_uptime_get() < 50 && booting_from_shutdown) { // debounce
 			sys_request_system_off(false);
+			return 0;
 		}
 #endif
 		if (k_uptime_get() <= 5000) {
@@ -156,9 +161,12 @@ int main(void)
 
 	if (reset_mode == 0 && !booting_from_shutdown && !charging && !charged
 		&& !plugged) { // Reset mode user shutdown, only if unplugged and undocked
-		sys_user_shutdown();
+		if (!sys_user_shutdown())
+			return 0;
 	}
 #endif
+
+	enable_sensor_power();
 
 	if (!booting_from_shutdown) { // ONESHOT_POWERON automatically sets LED off
 		k_usleep(60);
