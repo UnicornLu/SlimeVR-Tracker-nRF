@@ -177,6 +177,14 @@ static void hold_power_gpio_off_for_system_off(void)
 #endif
 }
 
+static void enter_system_off_direct(void)
+{
+	nrf_power_system_off(NRF_POWER);
+	while (1) {
+		k_cpu_idle();
+	}
+}
+
 void sys_interface_suspend(void)
 {
 #if DT_NODE_HAS_STATUS_OKAY(DT_PARENT(DT_NODELABEL(imu_spi)))
@@ -499,7 +507,7 @@ static void sys_system_off(void) // TODO: add timeout
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
-	sys_poweroff();
+	enter_system_off_direct();
 }
 
 static void sys_system_reboot(void) // TODO: add timeout
