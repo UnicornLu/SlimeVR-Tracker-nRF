@@ -165,6 +165,14 @@ static void force_power_gpio_low(void)
 #endif
 }
 
+static void hold_power_gpio_off_for_system_off(void)
+{
+#if PWR_EXISTS
+	nrf_gpio_pin_clear(pwr_psel);
+	nrf_gpio_cfg_input(pwr_psel, NRF_GPIO_PIN_PULLDOWN);
+#endif
+}
+
 void sys_interface_suspend(void)
 {
 #if DT_NODE_HAS_STATUS_OKAY(DT_PARENT(DT_NODELABEL(imu_spi)))
@@ -482,6 +490,7 @@ static void sys_system_off(void) // TODO: add timeout
 	// retained_update();
 	wait_for_logging();
 	force_power_gpio_low();
+	hold_power_gpio_off_for_system_off();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
