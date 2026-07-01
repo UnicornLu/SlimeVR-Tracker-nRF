@@ -115,6 +115,14 @@ static const struct gpio_dt_spec vcc = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, vcc_gp
 #endif
 
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
+#define NINI_PWR_PSEL NRF_GPIO_PIN_MAP(1, 9)
+
+static void force_nini_p109_low(const char *tag)
+{
+	nrf_gpio_cfg_output(NINI_PWR_PSEL);
+	nrf_gpio_pin_clear(NINI_PWR_PSEL);
+	LOG_INF("%s: forced P1.09 low, read: %d", tag, nrf_gpio_pin_read(NINI_PWR_PSEL));
+}
 
 static void sys_disconnect_interface_pins(void)
 {
@@ -147,6 +155,9 @@ static void sys_disconnect_interface_pins(void)
 	nrf_gpio_cfg_output(pwr_psel);
 	nrf_gpio_pin_clear(pwr_psel);
 	LOG_INF("Set power GPIO low, raw read: %d", gpio_pin_get_raw(pwr.port, pwr.pin));
+#else
+	LOG_WRN("Power GPIO not compiled in; forcing board P1.09 directly");
+	force_nini_p109_low("sys_disconnect_interface_pins");
 #endif
 #if VCC_EXISTS
 	LOG_INF("VCC GPIO pin: %s.%u", vcc.port->name, vcc.pin);
@@ -501,6 +512,7 @@ static void sys_system_off(void) // TODO: add timeout
 	sys_update_battery_tracker(current_battery_pptt, device_plugged);
 	// retained_update();
 	wait_for_logging();
+	force_nini_p109_low("before system off");
 	force_power_gpio_low();
 	hold_power_gpio_off_for_system_off();
 	wait_for_logging();
