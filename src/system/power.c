@@ -91,6 +91,7 @@ static const struct gpio_dt_spec ldo_en = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, ldo
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
 #define PWR_EXISTS true
 static const struct gpio_dt_spec pwr = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, pwr_gpios);
+static const uint32_t pwr_psel = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, pwr_gpios);
 #else
 #pragma message "Power GPIO does not exist"
 #endif
@@ -136,15 +137,31 @@ static void sys_disconnect_interface_pins(void)
 	what to do about boards that use ext_vcc? it is not expected to leave on during WOM
 */
 #if PWR_EXISTS
-	LOG_INF("Power GPIO pin: %s.%u", pwr.port->name, pwr.pin);
-	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_INACTIVE);
-	gpio_pin_set_dt(&pwr, 0);
-	LOG_INF("Set power GPIO inactive");
+	LOG_INF("Power GPIO pin: %s.%u (psel %u)", pwr.port->name, pwr.pin, pwr_psel);
+	int ret = gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_INACTIVE);
+	if (ret)
+		LOG_ERR("Failed to configure power GPIO inactive: %d", ret);
+	ret = gpio_pin_set_raw(pwr.port, pwr.pin, 0);
+	if (ret)
+		LOG_ERR("Failed to set power GPIO low: %d", ret);
+	nrf_gpio_cfg_output(pwr_psel);
+	nrf_gpio_pin_clear(pwr_psel);
+	LOG_INF("Set power GPIO low, raw read: %d", gpio_pin_get_raw(pwr.port, pwr.pin));
 #endif
 #if VCC_EXISTS
 	LOG_INF("VCC GPIO pin: %s.%u", vcc.port->name, vcc.pin);
 	gpio_pin_configure(vcc.port, vcc.pin, GPIO_DISCONNECTED);
 	LOG_INF("Disconnected VCC GPIO");
+#endif
+}
+
+static void force_power_gpio_low(void)
+{
+#if PWR_EXISTS
+	(void)gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_INACTIVE);
+	(void)gpio_pin_set_raw(pwr.port, pwr.pin, 0);
+	nrf_gpio_cfg_output(pwr_psel);
+	nrf_gpio_pin_clear(pwr_psel);
 #endif
 }
 
@@ -464,6 +481,7 @@ static void sys_system_off(void) // TODO: add timeout
 	sys_update_battery_tracker(current_battery_pptt, device_plugged);
 	// retained_update();
 	wait_for_logging();
+	force_power_gpio_low();
 #if ADAFRUIT_BOOTLOADER // if using Adafruit bootloader, always skip dfu for next boot
 	(*dbl_reset_mem) = DFU_DBL_RESET_APP; // Skip DFU
 #endif
