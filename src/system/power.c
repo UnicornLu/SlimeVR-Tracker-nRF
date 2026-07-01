@@ -136,12 +136,13 @@ static void sys_disconnect_interface_pins(void)
 	what to do about boards that use ext_vcc? it is not expected to leave on during WOM
 */
 #if PWR_EXISTS
-	LOG_INF("Power GPIO pin: %u", pwr.pin);
-	gpio_pin_configure(pwr.port, pwr.pin, GPIO_DISCONNECTED);
-	LOG_INF("Disconnected power GPIO");
+	LOG_INF("Power GPIO pin: %s.%u", pwr.port->name, pwr.pin);
+	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_set_dt(&pwr, 0);
+	LOG_INF("Set power GPIO inactive");
 #endif
 #if VCC_EXISTS
-	LOG_INF("VCC GPIO pin: %u", vcc.pin);
+	LOG_INF("VCC GPIO pin: %s.%u", vcc.port->name, vcc.pin);
 	gpio_pin_configure(vcc.port, vcc.pin, GPIO_DISCONNECTED);
 	LOG_INF("Disconnected VCC GPIO");
 #endif
