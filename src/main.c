@@ -73,13 +73,26 @@ int main(void)
 #endif
 #if IGNORE_RESET && BUTTON_EXISTS
 	bool reset_pin_reset = false;
+	bool system_off_reset = false;
 #else
 #ifdef NRF_RESET
-	bool reset_pin_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_RESETPIN_Msk;
-	NRF_RESET->RESETREAS = NRF_RESET->RESETREAS; // Clear RESETREAS
+	uint32_t reset_reason = NRF_RESET->RESETREAS;
+	bool reset_pin_reset = reset_reason & RESET_RESETREAS_RESETPIN_Msk;
+#if defined(RESET_RESETREAS_OFF_Msk)
+	bool system_off_reset = reset_reason & RESET_RESETREAS_OFF_Msk;
 #else
-	bool reset_pin_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk;
-	NRF_POWER->RESETREAS = NRF_POWER->RESETREAS; // Clear RESETREAS
+	bool system_off_reset = false;
+#endif
+	NRF_RESET->RESETREAS = reset_reason; // Clear RESETREAS
+#else
+	uint32_t reset_reason = NRF_POWER->RESETREAS;
+	bool reset_pin_reset = reset_reason & POWER_RESETREAS_RESETPIN_Msk;
+#if defined(POWER_RESETREAS_OFF_Msk)
+	bool system_off_reset = reset_reason & POWER_RESETREAS_OFF_Msk;
+#else
+	bool system_off_reset = false;
+#endif
+	NRF_POWER->RESETREAS = reset_reason; // Clear RESETREAS
 #endif
 #endif
 
@@ -87,7 +100,12 @@ int main(void)
 
 	uint8_t reboot_counter = reboot_counter_read();
 	bool booting_from_shutdown
-		= !reboot_counter && (reset_pin_reset || button_read()); // 0 means from user shutdown or failed ram validation
+		= !reboot_counter && (reset_pin_reset || system_off_reset || button_read()); // 0 means from user shutdown or failed ram validation
+
+	if (!reboot_counter && system_off_reset && !button_read()) {
+		sys_request_system_off(false);
+		return 0;
+	}
 
 	/* if button is not held after booting from shutdown, power off again
 	 * if button press is normal, continue boot
