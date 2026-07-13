@@ -1325,11 +1325,8 @@ int sensor_init(void)
 
 	// Setup fusion
 	sensor_retained_read(); // TODO: useless
-	if (fusion_id == FUSION_VQF) {
+	if (fusion_id == FUSION_VQF)
 		vqf_update_sensor_ids(sensor_imu_id);
-		vqf_set_heading_hold_frame(sensor_to_device_quat);
-		vqf_set_mag_enabled(mag_available && mag_enabled);
-	}
 	if (retained->fusion_id == fusion_id) // Check if the retained fusion data is valid and matches the selected fusion
 	{ // Load state if the data is valid (fusion was initialized before)
 		sensor_fusion->load(retained->fusion_data);
@@ -1448,7 +1445,7 @@ static uint32_t mag_vqf_updates_since_status = 0;
  *
  * Triggered by sensor_mag_ref_reset(); does NOT run on startup.
  */
-#define MAG_REF_RECOMPUTE_SAMPLES 50
+#define MAG_REF_RECOMPUTE_SAMPLES 100
 #define MAG_REF_ACCEL_TOL 0.3f
 
 static bool mag_ref_recompute_active;
@@ -2585,8 +2582,6 @@ void main_imu_restart(void)
 #if CONFIG_SENSOR_USE_VQF
 		float saved_ref_norm, saved_ref_dip;
 		vqf_get_mag_ref(&saved_ref_norm, &saved_ref_dip);
-		vqf_set_heading_hold_frame(sensor_to_device_quat);
-		vqf_set_mag_enabled(mag_available && mag_enabled);
 #endif
 		sensor_fusion->init(fusion_gyro_time, fusion_accel_time, fusion_mag_time);
 #if CONFIG_SENSOR_USE_VQF
