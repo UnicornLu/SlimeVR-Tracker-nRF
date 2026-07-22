@@ -241,6 +241,41 @@ config ACTIVE_TIMEOUT_DELAY
     help
         Activity timeout duration when triggered.
 
+config DYNAMIC_ACTIVE_TIMEOUT
+    bool "Adapt activity timeout after wake-on-motion"
+    default y
+    depends on USE_ACTIVE_TIMEOUT && SLEEP_ON_ACTIVE_TIMEOUT
+    help
+        Shorten the activity timeout after low-activity wake-on-motion cycles.
+        Meaningful activity restores ACTIVE_TIMEOUT_DELAY.
+
+config ACTIVE_TIMEOUT_IDLE_WAKE_DELAY
+    int "Low-activity wake timeout (ms)"
+    default 90000
+    range 1000 3600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_REPEAT_WAKE_DELAY
+    int "Repeated low-activity wake timeout (ms)"
+    default 60000
+    range 1000 3600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_REPEAT_WAKE_COUNT
+    int "Low-activity wakes before shortest timeout"
+    default 2
+    range 1 255
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_MEANINGFUL_MOTION_MS
+    int "Weighted motion score needed to restore normal timeout"
+    default 25000
+    range 1000 600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+    help
+        Integer motion score threshold. Strong motion adds three points per
+        millisecond, moderate motion adds one, and weak motion subtracts one.
+
 config DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
     bool "Disable Sensor GPIOs on shutdown"
     default y
@@ -286,15 +321,27 @@ config SENSOR_GYRO_ODR
         A lower rate is recommended for IMUs with poor gyrometer rate noise density. (Ex. BMI270, LSM6DS3TR-C)
 
 config SENSOR_GYRO_OVERSAMPLING
-    int "Gyroscope oversampling factor"
+    int "Gyroscope Δq-merge factor (INT_merge)"
     default 1
     range 1 16
     help
-        Number of gyroscope samples to average before fusion.
-        Set to 1 to disable oversampling.
-        For example, set SENSOR_GYRO_ODR=1600 and SENSOR_GYRO_OVERSAMPLING=4
-        to achieve effective 400Hz with noise reduction from 4x oversampling.
-        The effective gyro rate for fusion will be ODR / oversampling factor.
+        Number of high-rate gyroscope samples to merge via quaternion increments
+        (Δq product / INT_merge) before one fusion gyro update.
+        Preserves coning that plain ω averaging destroys.
+        Pipeline per sample: firmware compensation (TCal/ZRO/D_offset + sens)
+        first, then Δq built with frozen fusion residual bias, then one
+        update_gyro of the equivalent rate (fusion bias re-added so the
+        filter's internal subtract matches N×update_gyro strapdown).
+        Set to 1 to disable (one fusion update per gyro sample).
+        Example: SENSOR_GYRO_ODR=1600 and SENSOR_GYRO_OVERSAMPLING=4 →
+        1600 Hz strapdown Δq merged into one 400 Hz fusion gyro step.
+        Effective fusion gyro rate = ODR / oversampling factor.
+        On I2C IMU hosts, firmware forces N=1 and requests chip ODR at that
+        fusion rate (I2C cannot sustain hi-res FIFO at high ODR). SPI unchanged.
+        Raw data-collection gyrQuat TX uses the same N: uncalibrated Δq
+        every N chip samples; raw meta gyro_odr advertises that TX/fusion
+        rate, with chip Hz in the trailing fields.
+        Accelerometer oversampling (if enabled) stays separate and still averages.
 
 config SENSOR_ACCEL_OVERSAMPLING
     int "Accelerometer oversampling factor"
@@ -326,15 +373,8 @@ config SENSOR_MAG_ODR
     default 200
     help
         Requested magnetometer output data rate in Hz.
+        Fixed at magnetometer init for the session (nearest supported continuous rate).
         Common values: 100, 200. Higher rates may not be supported by all sensors.
-
-config SENSOR_MAG_FIXED_ODR
-    bool "Use fixed magnetometer ODR"
-    default y
-    help
-        If enabled, use a fixed magnetometer ODR instead of dynamic adjustment.
-        This ensures VQF fusion receives consistent timing information.
-        When disabled, ODR is dynamically adjusted based on gyroscope speed.
 
 choice
 	prompt "Sensor fusion"
@@ -553,5 +593,7 @@ config CLOCK_CONTROL_NRF_K32SRC_RC_CALIBRATION
     bool "Enable RC oscillator calibration for K32SRC"
     default y if CLOCK_USE_LF_SYNTH && CONNECTION_TDMA
     default n
+
+rsource "Kconfig.sensors_drivers"
 
 source "Kconfig.zephyr"

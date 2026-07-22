@@ -46,6 +46,8 @@ void clocks_request_start(uint32_t delay_us);
 void clocks_request_stop(uint32_t delay_us);
 int esb_initialize(bool);
 void esb_deinitialize(void);
+/* Quiesce TX then re-init PTX (channel/NVS already applied in esb_initialize). */
+int esb_reinitialize(void);
 
 void esb_set_addr_discovery(void);
 void esb_set_addr_paired(void);
@@ -117,13 +119,18 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
 
 // Raw data collection packet types
-#define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
-#define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
+// DEPRECATED on tracker: ESB_RAW_IMU/MAG unused; live TX is ESB_RAW_IMU_QUAT_TYPE.
+// Kept for wire-format docs / receiver + analyzer compatibility.
+#define ESB_RAW_IMU_TYPE    0x10  // DEPRECATED: legacy raw IMU (float)
+#define ESB_RAW_MAG_TYPE    0x11  // DEPRECATED: reserved raw mag
 #define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
-#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (52 bytes, packet-loss resistant)
+#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (packet-loss resistant)
 #define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
 
-// ESB_RAW_CAL_TYPE sub-types (byte[2] of 0x14 packet)
+// ACK payload marker for raw-data ARQ retransmit requests (receiver → tracker)
+#define RAW_ARQ_MARKER 0xAA
+
+// ESB_RAW_CAL_TYPE sub-types (byte[2])
 #define RAW_CAL_SUB_ACCEL   0x01  // Accel calibration: accBAinv[4][3] (48 bytes)
 #define RAW_CAL_SUB_MAG     0x02  // Mag calibration: magBAinv[4][3] (48 bytes)
 #define RAW_CAL_SUB_GYRO    0x03  // Gyro cal: gyroBias[3] + gyroSensScale[3] (24 bytes)
