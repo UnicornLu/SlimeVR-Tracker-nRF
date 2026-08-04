@@ -20,29 +20,12 @@
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 	THE SOFTWARE.
 */
-#ifndef SLIMENRF_FUSION
-#define SLIMENRF_FUSION
+#ifndef SLIMENRF_CAL_SENS_H
+#define SLIMENRF_CAL_SENS_H
 
-#include "sensor/sensor.h"
-
-void fusion_init(float g_time, float a_time, float m_time);
-void fusion_load(const void* data);
-void fusion_save(void* data);
-
-void fusion_update_gyro(float* g, float time);
-void fusion_update_accel(float* a, float time);
-void fusion_update_mag(float* m, float time);
-void fusion_update(float* g, float* a, float* m, float time);
-
-void fusion_get_gyro_bias(float* g_off);
-void fusion_set_gyro_bias(float* g_off);
-
-void fusion_update_gyro_sanity(float* g, float* m);
-int fusion_get_gyro_sanity(void);
-
-void fusion_get_lin_a(float* lin_a);
-void fusion_get_quat(float* q);
-
-extern const sensor_fusion_t sensor_fusion_fusion;
-
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+/* Gyro sensitivity / scale calibration (from calibration.c). */
+void sensor_calibrate_sens(void);
 #endif
+
+#endif /* SLIMENRF_CAL_SENS_H */

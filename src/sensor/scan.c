@@ -25,7 +25,8 @@
 #include <zephyr/drivers/i2c.h>
 
 #define SCAN_ADDR_START 8
-#define SCAN_ADDR_STOP 119
+/* Include high 7-bit addrs (e.g. QMC6309 0x7C); 0x7F is "ignored" sentinel elsewhere. */
+#define SCAN_ADDR_STOP 0x7E
 
 LOG_MODULE_REGISTER(sensor_scan, LOG_LEVEL_INF);
 
@@ -67,7 +68,7 @@ int sensor_scan_i2c(struct i2c_dt_spec *i2c_dev, uint8_t *i2c_dev_reg, int dev_a
 			// The first read on ICM-45686 can fail, so perform a dummy read on each address first
 			/* AN-000364
 			 * In I2C mode, after chip power-up, the host should perform one retry
-			 * on the very first I2C transaction if it receives a NACK 
+			 * on the very first I2C transaction if it receives a NACK
 			 */
 			uint8_t dummy;
 			i2c_reg_read_byte(dev, addr, 0x00, &dummy);
@@ -80,20 +81,31 @@ int sensor_scan_i2c(struct i2c_dt_spec *i2c_dev, uint8_t *i2c_dev_reg, int dev_a
 				uint8_t reg = dev_reg[reg_index + k];
 				if (*i2c_dev_reg == 0xFF || *i2c_dev_reg == reg)
 				{
-					uint8_t id;
+					uint8_t id = 0;
+					int err;
 					LOG_DBG("Scanning register: 0x%02X", reg);
 					if (reg == 0x40 && addr >= 0x10 && addr <= 0x13) // edge case for BMM150
 					{
-						int err = i2c_reg_write_byte(dev, addr, 0x4B, 0x01); // BMM150 cannot read chip id without power control enabled
+						err = i2c_reg_write_byte(dev, addr, 0x4B, 0x01); // BMM150 cannot read chip id without power control enabled
 						if (err)
 							break;
 						LOG_DBG("Power up BMM150");
 						k_msleep(2); // BMM150 start-up
 					}
-					int err = i2c_reg_read_byte(dev, addr, reg, &id);
+					if (reg == 0x00 && addr >= 0x14 && addr <= 0x17) // edge case for BMM350
+					{
+						uint8_t buf[3] = {0};
+						err = i2c_burst_read(dev, addr, reg, buf, 3); // BMM350 has two dummy bytes on read
+						id = buf[2];
+					}
+					else
+					{
+						err = i2c_reg_read_byte(dev, addr, reg, &id);
+					}
 					LOG_DBG("Read value: 0x%02X", id);
-					if (err)
+					if (err) {
 						break;
+					}
 					for (int l = 0; l < id_cnt; l++)
 					{
 						if (id == dev_id[id_ind + l])

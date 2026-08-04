@@ -194,6 +194,10 @@ static uint8_t get_server_constant_imu_id(int id)
 		return SVR_IMU_ICM20948;
 	case IMU_ICM42688:
 		return SVR_IMU_ICM42688;
+	case IMU_ICM42686:
+		// currently just report as 42688 since it's close enough and doesn't have a server constant yet
+		// todo: add a proper constant for it in the server and update this
+		return SVR_IMU_ICM42688;
 	case IMU_ICM45686:
 		return SVR_IMU_ICM45686;
 	case IMU_ICM45688:

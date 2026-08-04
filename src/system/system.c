@@ -1,9 +1,10 @@
 #include "globals.h"
 #include "test_mode.h"
 #include "sensor/sensor.h"
-#include "sensor/calibration.h"
+#include "sensor/calibration/calibration.h"
 #include "connection/connection.h"
 #include "connection/esb.h"
+#include "system/esb_ota.h"
 #include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
@@ -15,6 +16,7 @@
 #include <hal/nrf_gpio.h>
 
 #include "system.h"
+#include "battery_tracker.h"
 #include "build_defines.h"
 
 static struct nvs_fs fs;
@@ -22,6 +24,7 @@ static struct nvs_fs fs;
 #define NVS_PARTITION storage_partition
 #define NVS_PARTITION_DEVICE FIXED_PARTITION_DEVICE(NVS_PARTITION)
 #define NVS_PARTITION_OFFSET FIXED_PARTITION_OFFSET(NVS_PARTITION)
+#define NVS_PARTITION_SIZE FIXED_PARTITION_SIZE(NVS_PARTITION)
 
 LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 
@@ -35,7 +38,7 @@ K_THREAD_DEFINE(
 	NULL,
 	NULL,
 	NULL,
-	6,
+	BUTTON_THREAD_PRIORITY,
 	0,
 	0
 ); // TODO: stack increased because of reboot request (to 512) and sensor scan (to 1024)
@@ -77,7 +80,7 @@ static const struct pwm_dt_spec clk_out = PWM_DT_SPEC_GET(CLKOUT_NODE);
 static const struct pwm_dt_spec clk_out = {0};
 #endif
 
-#define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
 #define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
 #define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
 
@@ -191,11 +194,11 @@ static int sys_retained_init(void)
 		sys_read(MAIN_MAG_BIAS_ID, &retained->magBAinv, sizeof(retained->magBAinv));
 		sys_read(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, sizeof(retained->accBAinv));
 		sys_read(BATT_STATS_CURVE_ID, &retained->battery_pptt_curve, sizeof(retained->battery_pptt_curve));
+		sys_migrate_battery_curve();
 		sys_read(MAIN_GYRO_SENS_ID, &retained->gyroSensScale, sizeof(retained->gyroSensScale));
 		// If gyroSensScale was never set in NVS (all zeros), restore default values
-		if (retained->gyroSensScale[0] == 0.0f &&
-		    retained->gyroSensScale[1] == 0.0f &&
-		    retained->gyroSensScale[2] == 0.0f) {
+		if (retained->gyroSensScale[0] == 0.0f && retained->gyroSensScale[1] == 0.0f
+			&& retained->gyroSensScale[2] == 0.0f) {
 			retained->gyroSensScale[0] = 1.0f;
 			retained->gyroSensScale[1] = 1.0f;
 			retained->gyroSensScale[2] = 1.0f;
@@ -206,15 +209,39 @@ static int sys_retained_init(void)
 		sys_read(MAIN_GYRO_TCAL_COEFFS_ID, &retained->tempCalCoeffs, sizeof(retained->tempCalCoeffs));
 		// tempCalCorrectionOffset is retained for compatibility only; no longer used.
 		sys_read(MAIN_GYRO_TCAL_STATE_ID, &retained->tempCalState, sizeof(retained->tempCalState));
+		/*
+		 * TCAL_ENABLED_ID:
+		 * - Present: honor stored flag
+		 * - ENOENT: default on (apply still ZRO-fallback until enough points)
+		 * Blind sys_read would zero → look explicitly disabled.
+		 */
+		{
+			bool tcal_en = true;
+			int tcal_en_err = nvs_read(&fs, TCAL_ENABLED_ID, &tcal_en, sizeof(tcal_en));
+			if (tcal_en_err >= 0) {
+				retained->tcal_enabled = tcal_en;
+			} else {
+				retained->tcal_enabled = true;
+			}
+		}
 #endif
 		sys_read(RF_CHANNEL_ID, &retained->rf_channel, sizeof(retained->rf_channel));
 		sys_read(MAG_ENABLED_ID, &retained->mag_enabled, sizeof(retained->mag_enabled));
+		sys_read(
+			MAG_ONLINE_CALIBRATION_ID,
+			&retained->mag_online_calibration_mode,
+			sizeof(retained->mag_online_calibration_mode)
+		);
+		if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
+			retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
+		}
 		retained_update();
 	} else {
 		LOG_INF("Validated RAM");
 		ram_retention_valid = true;
 		// Still need to init NVS for later sys_read/sys_write calls (e.g., battery_tracker)
 		sys_nvs_init();
+		sys_migrate_battery_curve();
 	}
 	return 0;
 }
@@ -245,7 +272,102 @@ void reboot_counter_write(uint8_t reboot_counter)
 	retained_update();
 }
 
-// write to retained and nvs
+/* Deferred NVS slots for warm-durable IDs (coalesced until sys_flush_warm). */
+#define WARM_DIRTY_MAX 8
+struct warm_dirty_slot {
+	uint16_t id;
+	void *ptr;
+	size_t len;
+};
+static struct warm_dirty_slot warm_dirty[WARM_DIRTY_MAX];
+static uint8_t warm_dirty_count;
+
+void sys_flush_warm(void);
+
+static void warm_dirty_clear_id(uint16_t id)
+{
+	for (uint8_t i = 0; i < warm_dirty_count;) {
+		if (warm_dirty[i].id != id) {
+			i++;
+			continue;
+		}
+		warm_dirty[i] = warm_dirty[warm_dirty_count - 1];
+		warm_dirty_count--;
+	}
+}
+
+static void warm_dirty_mark(uint16_t id, void *ptr, size_t len)
+{
+	if (!ptr || len == 0) {
+		return;
+	}
+	for (uint8_t i = 0; i < warm_dirty_count; i++) {
+		if (warm_dirty[i].id == id) {
+			warm_dirty[i].ptr = ptr;
+			warm_dirty[i].len = len;
+			return;
+		}
+	}
+	if (warm_dirty_count >= WARM_DIRTY_MAX) {
+		LOG_ERR("Warm dirty table full, forcing flush before mark ID %u", id);
+		sys_flush_warm();
+		if (warm_dirty_count >= WARM_DIRTY_MAX) {
+			LOG_ERR("Warm dirty table still full after flush, dropping ID %u", id);
+			return;
+		}
+	}
+	warm_dirty[warm_dirty_count++] = (struct warm_dirty_slot){
+		.id = id,
+		.ptr = ptr,
+		.len = len,
+	};
+}
+
+bool sys_warm_is_dirty(void)
+{
+	return warm_dirty_count > 0;
+}
+
+void sys_write_warm(uint16_t id, void *retained_ptr, const void *data, size_t len)
+{
+	if (!retained_ptr) {
+		LOG_ERR("sys_write_warm: retained_ptr required for ID %u", id);
+		return;
+	}
+	if (data && retained_ptr != data) {
+		memcpy(retained_ptr, data, len);
+	}
+	warm_dirty_mark(id, retained_ptr, len);
+	retained_update();
+}
+
+void sys_flush_warm(void)
+{
+	if (warm_dirty_count == 0) {
+		return;
+	}
+	if (!sys_nvs_init()) {
+		LOG_ERR("sys_flush_warm: NVS init failed, keeping %u dirty IDs", warm_dirty_count);
+		return;
+	}
+
+	LOG_INF("Flushing %u warm NVS ID(s)", warm_dirty_count);
+	for (uint8_t i = 0; i < warm_dirty_count; i++) {
+		int err = nvs_write(&fs, warm_dirty[i].id, warm_dirty[i].ptr, warm_dirty[i].len);
+		if (err < 0) {
+			LOG_ERR("sys_flush_warm: NVS write ID %u failed: %d", warm_dirty[i].id, err);
+			/* Keep remaining dirty; drop only successfully written prefix next time. */
+			if (i > 0) {
+				memmove(&warm_dirty[0], &warm_dirty[i], (warm_dirty_count - i) * sizeof(warm_dirty[0]));
+			}
+			warm_dirty_count -= i;
+			return;
+		}
+	}
+	warm_dirty_count = 0;
+}
+
+// write to retained and nvs (cold / eager)
 void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 {
 	if (!sys_nvs_init()) {
@@ -262,8 +384,14 @@ void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 	int err = nvs_write(&fs, id, data, len);
 	if (err < 0) {
 		LOG_ERR("Failed to write to NVS, error: %d", err);
+		/* RAM already updated; seal CRC so soft-reset trusts retained. */
+		if (retained_ptr) {
+			retained_update();
+		}
 		return;
 	}
+	/* Eager NVS write supersedes any deferred warm copy of this ID. */
+	warm_dirty_clear_id(id);
 	if (retained_ptr) {
 		retained_update();
 	}
@@ -271,9 +399,10 @@ void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 
 void sys_read(uint16_t id, void *data, size_t len)
 {
+	memset(data, 0, len);
+
 	if (!sys_nvs_init()) {
 		LOG_ERR("sys_read: NVS init failed, cannot read ID %d", id);
-		memset(data, 0, len);
 		return;
 	}
 	int err = nvs_read(&fs, id, data, len);
@@ -285,8 +414,10 @@ void sys_read(uint16_t id, void *data, size_t len)
 			LOG_ERR("Failed to read from NVS, error: %d", err);
 			LOG_WRN("Read data set to zero");
 		}
-		memset(data, 0, len);
 		return;
+	}
+	if ((size_t)err < len) {
+		LOG_WRN("Short NVS read for ID %d: got %d bytes, expected %zu", id, err, len);
 	}
 }
 
@@ -305,6 +436,7 @@ void sys_clear(void)
 	printk("Resetting NVS and retained\n");
 
 	sys_nvs_init();
+	warm_dirty_count = 0;
 	memset(retained, 0, sizeof(*retained));
 	nvs_clear(&fs);
 	nvs_init = false;
@@ -318,6 +450,18 @@ void sys_clear(void)
 	retained_update();
 
 	LOG_INF("NVS and retained reset");
+}
+
+void sys_nvs_stats(void)
+{
+	if (!sys_nvs_init()) {
+		printk("NVS init failed\n");
+		return;
+	}
+
+	printk("Storage partition: %u bytes\n", NVS_PARTITION_SIZE);
+	printk("Allocated NVS: %u * %u = %u bytes\n", fs.sector_size, fs.sector_count, fs.sector_size * fs.sector_count);
+	printk("NVS free: %d bytes, max item: %d bytes\n", nvs_calc_free_space(&fs), nvs_sector_max_data_size(&fs));
 }
 
 // return 0 if clock applied, -1 if failed (because there is no clk_en or clk_out)
@@ -422,10 +566,15 @@ static void button_thread(void)
 			last_press = k_uptime_get();
 			set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_HIGHEST);
 		}
+		/* Block all button actions during OTA (active or suppressed) */
+		bool ota_busy = esb_ota_is_active() || connection_get_ota_suppressed();
 		if (last_press && k_uptime_get() - last_press > 1000) {
 			LOG_INF("Button was pressed %d times", num_presses);
 			last_press = 0;
-			if (num_presses == 1) {
+			if (ota_busy) {
+				LOG_INF("Button action blocked by OTA");
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+			} else if (num_presses == 1) {
 				if (test_mode_get()) {
 					LOG_INF("Button reboot blocked by test mode");
 				} else {
@@ -433,7 +582,9 @@ static void button_thread(void)
 				}
 			}
 #if CONFIG_USER_EXTRA_ACTIONS // TODO: extra actions are default until server can send commands to trackers
-			sys_reset_mode(num_presses - 1);
+			if (!ota_busy) {
+				sys_reset_mode(num_presses - 1);
+			}
 #endif
 			num_presses = 0;
 			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
@@ -441,14 +592,21 @@ static void button_thread(void)
 		}
 		if (press_time && k_uptime_get() - press_time > 1000 && button_read()) // Button is being held
 		{
-			if (sys_user_shutdown()) // held for 5 seconds, reset pairing
-			{
+			if (ota_busy) {
+				LOG_INF("Button hold blocked by OTA");
+				press_time = 0;
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+				set_status(SYS_STATUS_BUTTON_PRESSED, false);
+			} else if (sys_user_shutdown()) {
+#if CONFIG_USER_EXTRA_ACTIONS
+				LOG_INF("Button hold timeout, shutdown canceled");
+#else
 				LOG_INF("Pairing requested");
 				esb_reset_pair();
+#endif
 				press_time = 0;
 				set_status(SYS_STATUS_BUTTON_PRESSED, false); // TODO: is needed?
-			}
-			else // shutting down or rebooting
+			} else                                            // shutting down or rebooting
 			{
 				k_thread_abort(button_thread_id);
 			}

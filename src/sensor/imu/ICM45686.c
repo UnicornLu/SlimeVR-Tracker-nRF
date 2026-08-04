@@ -261,6 +261,12 @@ int icm45_init(float clock_rate, float accel_time, float gyro_time, float *accel
 		return -1;
 	}
 
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_CONFIG3, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_FIFO_CONFIG0, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_TMST_WOM_CONFIG, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_CONFIG0, 0x00);
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_CONFIG1, 0x00);
+
 	if (clock_rate > 0)
 	{
 		clock_scale = clock_rate / clock_reference;
@@ -276,7 +282,6 @@ int icm45_init(float clock_rate, float accel_time, float gyro_time, float *accel
 	ireg_buf[1] = ICM45686_IPREG_BAR_REG_59;
 	ireg_buf[2] = 0xB6 & ~0x92; // disable internal pull resistors for AP pins (pin 7, 1, 14)
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
-	// Re-enable I2CM mode after the pre-init shutdown reset (if ext was configured during scan)
 	ireg_buf[1] = ICM45686_IPREG_BAR_REG_60;
 	ireg_buf[2] = ICM45686_BIT_AUX1_I2CM_MODE; // I2CM mode only, no internal pull-ups
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3);
@@ -290,22 +295,6 @@ int icm45_init(float clock_rate, float accel_time, float gyro_time, float *accel
 	ireg_buf[2] = 0x02; // set big endian
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
 
-
-	// Power on sensors first (PWR_MGMT0 only)
-	uint8_t pwr_mgmt = GYRO_MODE_LN << 2 | ACCEL_MODE_LN; // Both in Low Noise mode
-	LOG_INF("PWR_MGMT0 write = 0x%02X (powering on sensors)", pwr_mgmt);
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_PWR_MGMT0, pwr_mgmt);
-
-	// Wait for gyro startup BEFORE configuring ODR
-	LOG_INF("Waiting 50ms for gyroscope startup...");
-	k_msleep(30); // datasheet minimum (30ms)
-
-	// Check sensor status
-	uint8_t status = 0;
-	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_STATUS0, &status);
-	LOG_INF("INT1_STATUS0 after startup = 0x%02X", status);
-
-	// Now configure ODR after sensors are fully powered on
 	last_accel_odr = 0xff; // reset last odr
 	last_gyro_odr = 0xff; // reset last odr
 	err |= icm45_update_odr(accel_time, gyro_time, accel_actual_time, gyro_actual_time);
@@ -439,12 +428,17 @@ int icm45_update_odr(float accel_time, float gyro_time, float *accel_actual_time
 	}
 	gyro_time /= clock_scale; // scale clock
 
-	if (last_accel_odr == ACCEL_ODR && last_gyro_odr == GYRO_ODR) // if both were already configured
-		return 1;
+	if (last_accel_odr == ACCEL_ODR && last_gyro_odr == GYRO_ODR) {
+		*accel_actual_time = accel_time;
+		*gyro_actual_time = gyro_time;
+		return 0; /* already configured — success for err|= callers */
+	}
 
+	uint8_t prev_accel_odr = last_accel_odr;
+	uint8_t prev_gyro_odr = last_gyro_odr;
 	int err = 0;
 	// only if the power mode has changed
-	if (last_accel_odr == 0xff || last_gyro_odr == 0xff || (last_accel_odr == 0 ? 0 : 1) != (ACCEL_ODR == 0 ? 0 : 1) || (last_gyro_odr == 0 ? 0 : 1) != (GYRO_ODR == 0 ? 0 : 1))
+	if (prev_accel_odr == 0xff || prev_gyro_odr == 0xff || (prev_accel_odr == 0 ? 0 : 1) != (ACCEL_ODR == 0 ? 0 : 1) || (prev_gyro_odr == 0 ? 0 : 1) != (GYRO_ODR == 0 ? 0 : 1))
 	{ // TODO: can't tell difference between gyro off and gyro standby
 		uint8_t pwr_mgmt = GYRO_MODE << 2 | ACCEL_MODE;
 		LOG_INF("PWR_MGMT0 write = 0x%02X (GYRO_MODE=%d, ACCEL_MODE=%d)", pwr_mgmt, GYRO_MODE, ACCEL_MODE);
@@ -455,8 +449,6 @@ int icm45_update_odr(float accel_time, float gyro_time, float *accel_actual_time
 		err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_PWR_MGMT0, &pwr_mgmt_readback);
 		LOG_INF("PWR_MGMT0 readback = 0x%02X", pwr_mgmt_readback);
 	}
-	last_accel_odr = ACCEL_ODR;
-	last_gyro_odr = GYRO_ODR;
 
 	uint8_t accel_config = ACCEL_UI_FS_SEL << 4 | ACCEL_ODR;
 	uint8_t gyro_config = GYRO_UI_FS_SEL << 4 | GYRO_ODR;
@@ -470,9 +462,13 @@ int icm45_update_odr(float accel_time, float gyro_time, float *accel_actual_time
 	err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_GYRO_CONFIG0, &gyro_config_readback);
 	LOG_INF("ACCEL_CONFIG0 readback = 0x%02X, GYRO_CONFIG0 readback = 0x%02X",
 		accel_config_readback, gyro_config_readback);
-	if (err)
+	if (err) {
 		LOG_ERR("Communication error");
+		return err;
+	}
 
+	last_accel_odr = ACCEL_ODR;
+	last_gyro_odr = GYRO_ODR;
 	*accel_actual_time = accel_time;
 	*gyro_actual_time = gyro_time;
 
@@ -646,9 +642,9 @@ uint8_t icm45_setup_WOM(void) // TODO: check if working
 //	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 3); // write buffer
 	ireg_buf[0] = ICM45686_IPREG_TOP1;
 	ireg_buf[1] = ICM45686_ACCEL_WOM_X_THR;
-	ireg_buf[2] = 0x08; // set wake thresholds // 8 x 3.9 mg is ~31.20 mg
-	ireg_buf[3] = 0x08; // set wake thresholds
-	ireg_buf[4] = 0x08; // set wake thresholds
+	ireg_buf[2] = 0x07; // set wake thresholds // 7 x 3.9 mg is ~27.3 mg
+	ireg_buf[3] = 0x07; // set wake thresholds
+	ireg_buf[4] = 0x07; // set wake thresholds
 	err |= ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM45686_IREG_ADDR_15_8, ireg_buf, 5); // write buffer
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_TMST_WOM_CONFIG, 0x14); // enable WOM, enable WOM interrupt
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM45686_INT1_CONFIG1, 0x0E); // route WOM interrupt
@@ -718,7 +714,8 @@ retry_write:
 	err |= icm45_bank_write_byte(ICM45686_IPREG_TOP1, ICM45686_I2CM_CONTROL,
 								 ICM45686_I2CM_CONTROL_RESTART_EN | ICM45686_I2CM_CONTROL_GO);
 
-	// Wait for I2C transaction (Fast mode 400kHz: ~25us per byte + overhead)
+	// Short pre-delay before polling. Completion is still guarded by
+	// I2CM_STATUS below, so slower-than-nominal AUX I2C is handled there.
 	k_busy_wait(30 * (num_bytes + 2));
 
 	status = 0;
@@ -789,7 +786,8 @@ int icm45_ext_write_read(const uint8_t addr, const void *write_buf, size_t num_w
 
 	// Fast path: if a pre-triggered I2CM read matches, just read cached RD_DATA.
 	// The I2C transaction was triggered at the end of the previous call and has
-	// completed in the background during FIFO processing (~6ms >> ~300us I2C).
+	// completed in the background during FIFO processing. If it is still
+	// running, BUSY/DONE checks below keep the cached read from racing it.
 	if (ext_continuous_active && addr == ext_cont_addr &&
 	    sub_addr == ext_cont_sub && num_read == ext_cont_len)
 	{
@@ -854,7 +852,8 @@ retry_read:
 	err |= icm45_bank_write_byte(ICM45686_IPREG_TOP1, ICM45686_I2CM_CONTROL,
 								 ICM45686_I2CM_CONTROL_RESTART_EN | ICM45686_I2CM_CONTROL_GO);
 
-	// Wait for I2C transaction (Fast mode 400kHz: ~25us per byte + overhead)
+	// Short pre-delay before polling. Completion is still guarded by
+	// I2CM_STATUS below, so slower-than-nominal AUX I2C is handled there.
 	k_busy_wait(25 * num_read + 80);
 
 	status = 0;
@@ -897,8 +896,8 @@ retry_read:
 
 	// In operational mode, pre-trigger next read for fast subsequent reads.
 	// DEV_PROFILE + COMMAND persist in IPREG_TOP1, so just writing GO is enough.
-	// The I2CM transaction (~300us) completes in the background during FIFO
-	// processing, so next read finds data ready without any wait.
+	// The I2CM transaction completes in the background during FIFO processing.
+	// The next fast-path read still checks BUSY/DONE before using cached data.
 	if (!err && !ext_scanning_mode)
 	{
 		icm45_bank_write_byte(ICM45686_IPREG_TOP1, ICM45686_I2CM_CONTROL,

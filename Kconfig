@@ -86,7 +86,8 @@ config USER_EXTRA_ACTIONS
     bool "Multiple press actions"
     help
         Allow user to use multiple presses to calibrate, pair, or enter DFU.
-        By default, pairing is available when holding down sw0 for 5 seconds.
+        When enabled, sw0 long-hold pairing reset is disabled; use the
+        multiple-press pairing action instead.
         By default, DFU is available when holding down sw0 and plugging in a USB cable.
 
 config IGNORE_RESET
@@ -135,6 +136,36 @@ config CONNECTION_TIMEOUT_DELAY
     depends on USER_SHUTDOWN
     help
         Connection timeout duration when receiver is not detected.
+
+choice
+    prompt "Sensor rotation"
+    default SENSOR_ROTATION_90
+
+config SENSOR_ROTATION_0
+    bool "0 degrees"
+
+config SENSOR_ROTATION_90
+    bool "90 degrees"
+
+config SENSOR_ROTATION_180
+    bool "180 degrees"
+
+config SENSOR_ROTATION_270
+    bool "270 degrees"
+
+config SENSOR_ROTATION_0_FLIPPED
+    bool "0 degrees flipped"
+
+config SENSOR_ROTATION_90_FLIPPED
+    bool "90 degrees flipped"
+
+config SENSOR_ROTATION_180_FLIPPED
+    bool "180 degrees flipped"
+
+config SENSOR_ROTATION_270_FLIPPED
+    bool "270 degrees flipped"
+
+endchoice
 
 menu "Sensor power saving"
 
@@ -210,6 +241,41 @@ config ACTIVE_TIMEOUT_DELAY
     help
         Activity timeout duration when triggered.
 
+config DYNAMIC_ACTIVE_TIMEOUT
+    bool "Adapt activity timeout after wake-on-motion"
+    default y
+    depends on USE_ACTIVE_TIMEOUT && SLEEP_ON_ACTIVE_TIMEOUT
+    help
+        Shorten the activity timeout after low-activity wake-on-motion cycles.
+        Meaningful activity restores ACTIVE_TIMEOUT_DELAY.
+
+config ACTIVE_TIMEOUT_IDLE_WAKE_DELAY
+    int "Low-activity wake timeout (ms)"
+    default 90000
+    range 1000 3600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_REPEAT_WAKE_DELAY
+    int "Repeated low-activity wake timeout (ms)"
+    default 90000
+    range 1000 3600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_REPEAT_WAKE_COUNT
+    int "Low-activity wakes before shortest timeout"
+    default 2
+    range 1 255
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+
+config ACTIVE_TIMEOUT_MEANINGFUL_MOTION_MS
+    int "Weighted motion score needed to restore normal timeout"
+    default 15000
+    range 1000 600000
+    depends on DYNAMIC_ACTIVE_TIMEOUT
+    help
+        Integer motion score threshold. Strong motion adds three points per
+        millisecond, moderate motion adds one, and weak motion subtracts one.
+
 config DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
     bool "Disable Sensor GPIOs on shutdown"
     default y
@@ -217,7 +283,27 @@ config DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
         Disable all sensor related GPIOs when system shutdown.
         May reduce power consumption.
 
+config SENSOR_FAST_WOM_WAKE
+    bool "Fast wake-on-motion sensor resume"
+    default n
+    depends on USE_IMU_WAKE_UP
+    help
+        Mark IMU wake-on-motion poweroff entries so the next boot can use a
+        narrower sensor resume path. Supported IMU drivers may skip their
+        pre-init soft reset after a real WoM wake and rebuild runtime FIFO/ODR
+        state directly from the known WOM configuration.
+
 endmenu
+
+config SENSOR_RETAINED_SCAN_POWER_UP_DELAY_MS
+    int "Sensor scan delay with retained sensor identity (ms)"
+    default 5
+    range 0 50
+    help
+        Delay before probing sensors when retained memory already names the IMU.
+        Cold scans still wait 50 ms, and failed fast scans wait the remaining
+        time before retrying, so this mainly reduces normal wake-from-WOM boot
+        latency without removing the conservative cold-start fallback.
 
 config SENSOR_ACCEL_ODR
     int "Accelerometer output data rate (Hz)"
@@ -235,15 +321,27 @@ config SENSOR_GYRO_ODR
         A lower rate is recommended for IMUs with poor gyrometer rate noise density. (Ex. BMI270, LSM6DS3TR-C)
 
 config SENSOR_GYRO_OVERSAMPLING
-    int "Gyroscope oversampling factor"
+    int "Gyroscope Δq-merge factor (INT_merge)"
     default 1
     range 1 16
     help
-        Number of gyroscope samples to average before fusion.
-        Set to 1 to disable oversampling.
-        For example, set SENSOR_GYRO_ODR=1600 and SENSOR_GYRO_OVERSAMPLING=4
-        to achieve effective 400Hz with noise reduction from 4x oversampling.
-        The effective gyro rate for fusion will be ODR / oversampling factor.
+        Number of high-rate gyroscope samples to merge via quaternion increments
+        (Δq product / INT_merge) before one fusion gyro update.
+        Preserves coning that plain ω averaging destroys.
+        Pipeline per sample: firmware compensation (TCal/ZRO/D_offset + sens)
+        first, then Δq built with frozen fusion residual bias, then one
+        update_gyro of the equivalent rate (fusion bias re-added so the
+        filter's internal subtract matches N×update_gyro strapdown).
+        Set to 1 to disable (one fusion update per gyro sample).
+        Example: SENSOR_GYRO_ODR=1600 and SENSOR_GYRO_OVERSAMPLING=4 →
+        1600 Hz strapdown Δq merged into one 400 Hz fusion gyro step.
+        Effective fusion gyro rate = ODR / oversampling factor.
+        On I2C IMU hosts, firmware forces N=1 and requests chip ODR at that
+        fusion rate (I2C cannot sustain hi-res FIFO at high ODR). SPI unchanged.
+        Raw data-collection gyrQuat TX uses the same N: uncalibrated Δq
+        every N chip samples; raw meta gyro_odr advertises that TX/fusion
+        rate, with chip Hz in the trailing fields.
+        Accelerometer oversampling (if enabled) stays separate and still averages.
 
 config SENSOR_ACCEL_OVERSAMPLING
     int "Accelerometer oversampling factor"
@@ -275,15 +373,8 @@ config SENSOR_MAG_ODR
     default 200
     help
         Requested magnetometer output data rate in Hz.
+        Fixed at magnetometer init for the session (nearest supported continuous rate).
         Common values: 100, 200. Higher rates may not be supported by all sensors.
-
-config SENSOR_MAG_FIXED_ODR
-    bool "Use fixed magnetometer ODR"
-    default y
-    help
-        If enabled, use a fixed magnetometer ODR instead of dynamic adjustment.
-        This ensures VQF fusion receives consistent timing information.
-        When disabled, ODR is dynamically adjusted based on gyroscope speed.
 
 choice
 	prompt "Sensor fusion"
@@ -291,17 +382,19 @@ choice
     help
         Select the sensor fusion method.
 
-config SENSOR_USE_XIOFUSION
-    bool "Use x-io Technologies Fusion"
-    help
-        Use x-io Technologies Fusion for sensor fusion.
-        Based on Madgwick filter.
-
 config SENSOR_USE_VQF
     bool "Use VQF"
     help
         Use VQF for sensor fusion.
         Based on Kalman filter.
+
+config SENSOR_USE_EQF
+    bool "Use EqF"
+    help
+        Use ABC-EqF n=0 (Equivariant Filter) for sensor fusion.
+        Kalman filter on SO(3)×R³ with constant magnetometer trust.
+        Lower heading drift than VQF under low magnetic disturbance,
+        but does not perform as well as the VQF on 6D.
 
 endchoice
 
@@ -314,6 +407,15 @@ config VQF_ADAPTIVE_TAU_ACC
         Uses a three-regime strategy (rest / gentle / aggressive) with
         smoothed transitions to avoid Butterworth LP filter transients.
         This feature is experimental and may affect heading stability.
+
+config VQF_BENCH
+    bool "Enable VQF benchmark console command"
+    default n
+    depends on SENSOR_USE_VQF && USE_SLIMENRF_CONSOLE
+    help
+        Compile in the `vqfbench` console command and its benchmark working
+        storage. Keep this disabled for normal firmware builds to avoid the
+        extra RAM cost from static benchmark buffers.
 
 config SENSOR_USE_6_SIDE_CALIBRATION
     bool "Use 6-side calibration"
@@ -329,8 +431,13 @@ config SENSOR_USE_SENS_CALIBRATION
     depends on USE_SLIMENRF_CONSOLE
     help
         Use sensitivity calibration for gyroscope.
-        Calibration can be completed by rotating the tracker specified number of times around all axis.
-        Note any resulting yaw drift in degrees and enter these three observed values in the basic console.
+        There are two ways to calibrate from the console:
+        - Manual: rotate the tracker a number of times around each axis, note the
+          resulting yaw drift in degrees, and enter the three observed values with
+          'sens <x>,<y>,<z>'.
+        - Automated: run 'sens auto <x|y|z> [revolutions]' and spin the tracker the
+          requested number of full turns about one axis; the firmware integrates the
+          gyro rate and computes the scale factor for that axis automatically.
 
 config SENSOR_SENS_REV
     int "Number of rotations (rev)"
@@ -415,10 +522,42 @@ config CONNECTION_ENABLE_ACK
 
 config CONNECTION_OVER_HID
     bool "Use HID for data output"
+    depends on USB_DEVICE_STACK_NEXT && USBD_HID_SUPPORT && UART_CONSOLE
     default n
     help
         Use HID if available.
         Otherwise, use ESB only.
+
+config SLIMEVR_USB_DEVICE_VID
+    hex "SlimeVR USB vendor ID"
+    default 0x1209
+    help
+        USB vendor ID used by the SlimeVR USBD_NEXT device.
+
+config SLIMEVR_USB_DEVICE_PID
+    hex "SlimeVR USB product ID"
+    default 0x7692
+    help
+        USB product ID used by the SlimeVR tracker firmware.
+
+config SLIMEVR_USB_DEVICE_MANUFACTURER
+    string "SlimeVR USB manufacturer"
+    default "SlimeVR"
+    help
+        USB manufacturer string and console banner prefix.
+
+config SLIMEVR_USB_DEVICE_PRODUCT
+    string "SlimeVR USB product"
+    default "SlimeNRF Tracker"
+    help
+        USB product string and console banner name.
+
+config SLIMEVR_USB_DEVICE_MAX_POWER
+    int "SlimeVR USB max power"
+    range 0 250
+    default 100
+    help
+        USB bMaxPower value in 2 mA units.
 
 config CLOCK_USE_LFXO
     bool "Use external low-frequency crystal oscillator (LFXO)"
@@ -454,5 +593,7 @@ config CLOCK_CONTROL_NRF_K32SRC_RC_CALIBRATION
     bool "Enable RC oscillator calibration for K32SRC"
     default y if CLOCK_USE_LF_SYNTH && CONNECTION_TDMA
     default n
+
+rsource "Kconfig.sensors_drivers"
 
 source "Kconfig.zephyr"

@@ -38,10 +38,6 @@ void vqf_update_accel(float *a, float time);
 void vqf_update_mag(float *m, float time);
 void vqf_update(float *g, float *a, float *m, float time);
 
-void vqf_update_gyro_ts(float *g, uint64_t timestamp_us);
-void vqf_update_accel_ts(float *a, uint64_t timestamp_us);
-void vqf_update_mag_ts(float *m, uint64_t timestamp_us);
-
 void vqf_get_gyro_bias(float *g_off);
 void vqf_set_gyro_bias(float *g_off);
 
@@ -128,7 +124,9 @@ typedef struct {
 } vqf_debug_info_t;
 
 void vqf_get_debug_info(vqf_debug_info_t *info);
+#if defined(CONFIG_VQF_BENCH)
 void vqf_run_benchmark(uint32_t iterations);
+#endif
 
 extern const sensor_fusion_t sensor_fusion_vqf;
 

@@ -29,6 +29,7 @@ void sensor_calibration_process_gyro(float g[3]);
 void sensor_calibration_process_mag(float m[3]);
 
 void sensor_calibration_update_sensor_ids(int imu);
+uint8_t sensor_calibration_get_imu_id(void);
 uint8_t *sensor_calibration_get_sensor_data();
 
 void sensor_calibration_read(void);
@@ -48,10 +49,18 @@ void sensor_calibration_clear_mag(float m_inv[][3], bool write); // "request" ma
 void sensor_request_calibration(void);
 void sensor_request_calibration_6_side(void);
 void sensor_request_calibration_mag(void);
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions);
+#endif
 void sensor_calibration_online_mag_sample(const float m[3]);
 int sensor_calibration_online_mag_status(float *dir_bias);
 void sensor_calibration_track_mag_norm(float cal_norm);
 float sensor_calibration_get_mag_quality(void);
+void sensor_calibration_set_online_mag_enabled(bool enabled);
+bool sensor_calibration_get_online_mag_enabled(void);
+void sensor_calibration_online_mag_retained_save(void);
+void sensor_calibration_online_mag_retained_clear(void);
+void sensor_calibration_online_mag_cold_start(void);
 
 #if CONFIG_SENSOR_USE_TCAL
 
@@ -75,6 +84,23 @@ bool sensor_tcal_is_temp_outside_range(float temp, float *min_temp, float *max_t
 void sensor_tcal_check_auto_calibration(float current_temp);
 void sensor_tcal_set_auto_calibration(bool enabled);
 bool sensor_tcal_get_auto_calibration(void);
+
+// T-Cal compensation enable/disable (persisted)
+void sensor_tcal_set_enabled(bool enabled);
+bool sensor_tcal_get_enabled(void);
+
+/* What process_gyro actually subtracts right now (flag vs curve readiness). */
+typedef enum {
+	SENSOR_TCAL_APPLY_DISABLED = 0,   /* flag off → static ZRO */
+	SENSOR_TCAL_APPLY_ZRO_FALLBACK,   /* flag on, points < MLS min → ZRO */
+	SENSOR_TCAL_APPLY_CURVE,          /* LUT/MLS active */
+} sensor_tcal_apply_mode_t;
+
+sensor_tcal_apply_mode_t sensor_tcal_get_apply_mode(void);
+const char *sensor_tcal_get_apply_mode_name(void);
+/* Hot-path: cached (enabled && points>=min). Updated on enable/point changes. */
+bool sensor_tcal_curve_apply_ready(void);
+void sensor_tcal_refresh_apply_cache(void);
 
 // Continuous bucket-based T-Cal sampling
 void sensor_tcal_feed_continuous_sample(const float g[3], float temp);

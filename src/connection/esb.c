@@ -21,11 +21,12 @@
 	THE SOFTWARE.
 */
 #include "globals.h"
-#include "sensor/calibration.h"
+#include "sensor/calibration/calibration.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
 #include "system/test_mode.h"
 #include "system/watchdog.h"
+#include "system/esb_ota.h"
 #include "connection.h"
 #include "zephyr/sys/byteorder.h"
 #include "zephyr/sys/time_units.h"
@@ -37,6 +38,7 @@
 #include <hal/nrf_timer.h>
 #include <nrfx_timer.h>
 #include <zephyr/sys/crc.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 
 #include <stdlib.h>
@@ -93,7 +95,7 @@ static bool esb_paired = false;
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
 static void esb_thread(void);
-K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, 6, 0, 0);
+K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, ESB_THREAD_PRIORITY, 0, 0);
 static int64_t last_tx_time = 0;
 
 static uint32_t ping_success_streak = 0; // consecutive success counter
@@ -121,7 +123,419 @@ static uint8_t acked_remote_command = ESB_PONG_FLAG_NORMAL;
 static int64_t remote_command_receive_time = 0;
 static uint32_t received_channel_value = 0; // Store channel value from PONG data[8-11]
 static float received_sens_data[3] = {0};   // Store sensitivity data
+static uint8_t received_sens_auto_axis = 0;
+static uint16_t received_sens_auto_revolutions = 0;
 #define REMOTE_COMMAND_DELAY_MS 1500
+
+
+typedef void (*esb_remote_cmd_fn)(void);
+
+struct esb_remote_cmd {
+	uint8_t flag;
+	const char *name;
+	esb_remote_cmd_fn fn;
+};
+
+static void remote_print_meow(void);
+
+static void esb_remote_cmd_shutdown(void)
+{
+	LOG_WRN("Executing remote command: SHUTDOWN");
+	sys_command_shutdown();
+}
+
+static void esb_remote_cmd_calibrate(void)
+{
+	LOG_INF("Executing remote command: CALIBRATE");
+	sensor_request_calibration();
+}
+
+static void esb_remote_cmd_six_side_cal(void)
+{
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+	LOG_INF("Executing remote command: SIX_SIDE_CAL");
+	sensor_request_calibration_6_side();
+#else
+	LOG_WRN("Remote command: SIX_SIDE_CAL not supported (disabled in config)");
+#endif
+}
+
+static void esb_remote_cmd_meow(void)
+{
+	LOG_INF("Executing remote command: MEOW");
+	remote_print_meow();
+}
+
+static void esb_remote_cmd_scan(void)
+{
+	LOG_INF("Executing remote command: SCAN");
+	sensor_request_scan(true);
+}
+
+static void esb_remote_cmd_mag_clear(void)
+{
+	LOG_INF("Executing remote command: MAG_CLEAR");
+	sensor_calibration_clear_mag(NULL, true);
+}
+
+static void esb_remote_cmd_mag_cal(void)
+{
+	LOG_INF("Executing remote command: MAG_CAL");
+	sensor_calibration_clear_mag(NULL, true);
+	sensor_request_calibration_mag();
+}
+
+static void esb_remote_cmd_mag_on(void)
+{
+	LOG_INF("Executing remote command: MAG_ON");
+	sensor_set_mag_enabled(true);
+}
+
+static void esb_remote_cmd_mag_off(void)
+{
+	LOG_INF("Executing remote command: MAG_OFF");
+	sensor_set_mag_enabled(false);
+}
+
+static void esb_remote_cmd_mag_auto_on(void)
+{
+	LOG_INF("Executing remote command: MAG_AUTO_ON");
+	sensor_calibration_set_online_mag_enabled(true);
+}
+
+static void esb_remote_cmd_mag_auto_off(void)
+{
+	LOG_INF("Executing remote command: MAG_AUTO_OFF");
+	sensor_calibration_set_online_mag_enabled(false);
+}
+
+static void esb_remote_cmd_tcal_on(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	LOG_INF("Executing remote command: TCAL_ON");
+	sensor_tcal_set_enabled(true);
+#endif
+}
+
+static void esb_remote_cmd_tcal_off(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	LOG_INF("Executing remote command: TCAL_OFF");
+	sensor_tcal_set_enabled(false);
+#endif
+}
+
+static void esb_remote_cmd_tdma_on(void)
+{
+	LOG_INF("Executing remote command: TDMA_ON");
+	tdma_set_enabled(true);
+}
+
+static void esb_remote_cmd_tdma_off(void)
+{
+	LOG_INF("Executing remote command: TDMA_OFF");
+	tdma_set_enabled(false);
+}
+
+static void esb_remote_cmd_test_mode_on(void)
+{
+	LOG_INF("Executing remote command: TEST_MODE_ON");
+	test_mode_set(true);
+}
+
+static void esb_remote_cmd_test_mode_off(void)
+{
+	LOG_INF("Executing remote command: TEST_MODE_OFF");
+	test_mode_set(false);
+}
+
+static void esb_remote_cmd_reboot(void)
+{
+	LOG_WRN("Executing remote command: REBOOT");
+	sys_request_system_reboot(false);
+}
+
+static void esb_remote_cmd_clear(void)
+{
+	LOG_WRN("Executing remote command: CLEAR (clear pairing)");
+	esb_clear_pair();
+}
+
+static void esb_remote_cmd_dfu(void)
+{
+#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+	LOG_WRN("Executing remote command: DFU (enter bootloader)");
+#if CONFIG_BUILD_OUTPUT_UF2
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
+	k_msleep(100);
+#endif
+	sys_request_system_reboot(false);
+#else
+	LOG_WRN("Remote command: DFU not supported (no bootloader)");
+#endif
+}
+
+static void esb_remote_cmd_dfu_ota(void)
+{
+#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+	LOG_WRN("Executing remote command: DFU_OTA (enter OTA bootloader)");
+#if CONFIG_BUILD_OUTPUT_UF2
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
+	k_msleep(2);
+#endif
+	sys_request_system_reboot(false);
+#else
+	LOG_WRN("Remote command: DFU_OTA not supported (no bootloader)");
+#endif
+}
+
+static void esb_remote_cmd_set_channel(void)
+{
+	// Validate channel value (0-100)
+	if (received_channel_value <= 100) {
+		LOG_INF("Executing remote command: SET_CHANNEL to %u", received_channel_value);
+		// Save to retained memory
+		retained->rf_channel = (uint8_t)received_channel_value;
+		retained_update();
+		// Save to NVS
+		sys_write(
+			RF_CHANNEL_ID,
+			&retained->rf_channel,
+			&retained->rf_channel,
+			sizeof(retained->rf_channel)
+		);
+		LOG_INF("RF channel saved to NVS: %u", retained->rf_channel);
+		if (esb_reinitialize()) {
+			LOG_ERR("ESB reinitialize failed after channel change");
+		} else {
+			LOG_INF("ESB reinitialized with channel %u", retained->rf_channel);
+		}
+	} else {
+		LOG_ERR("Invalid channel value: %u (must be 0-100)", received_channel_value);
+	}
+}
+
+static void esb_remote_cmd_clear_channel(void)
+{
+	LOG_INF("Executing remote command: CLEAR_CHANNEL (restore default)");
+	// Clear saved channel (set to 0xFF = use default)
+	retained->rf_channel = 0xFF;
+	retained_update();
+	sys_write(
+		RF_CHANNEL_ID,
+		&retained->rf_channel,
+		&retained->rf_channel,
+		sizeof(retained->rf_channel)
+	);
+	LOG_INF("RF channel cleared, will use default on next boot");
+	if (esb_reinitialize()) {
+		LOG_ERR("ESB reinitialize failed after channel clear");
+	} else {
+		LOG_INF("ESB reinitialized with default channel %u", RADIO_RF_CHANNEL);
+	}
+}
+
+static void esb_remote_cmd_sens_set(void)
+{
+	LOG_INF("Executing remote command: SENS_SET");
+	cmd_sens_set(received_sens_data[0], received_sens_data[1], received_sens_data[2]);
+}
+
+static void esb_remote_cmd_sens_reset(void)
+{
+	LOG_INF("Executing remote command: SENS_RESET");
+	cmd_sens_reset();
+}
+
+static void esb_remote_cmd_sens_auto(void)
+{
+	LOG_INF(
+		"Executing remote command: SENS_AUTO axis=%u revolutions=%u",
+		received_sens_auto_axis,
+		received_sens_auto_revolutions
+	);
+	cmd_sens_auto_request(received_sens_auto_axis, received_sens_auto_revolutions);
+}
+
+static void esb_remote_cmd_reset_zro(void)
+{
+	LOG_INF("Executing remote command: RESET_ZRO");
+	cmd_reset_zro();
+}
+
+static void esb_remote_cmd_reset_acc(void)
+{
+	LOG_INF("Executing remote command: RESET_ACC");
+	cmd_reset_acc();
+}
+
+static void esb_remote_cmd_reset_bat(void)
+{
+	LOG_INF("Executing remote command: RESET_BAT");
+	cmd_reset_bat();
+}
+
+static void esb_remote_cmd_reset_tcal(void)
+{
+	LOG_INF("Executing remote command: RESET_TCAL");
+	cmd_reset_tcal();
+}
+
+static void esb_remote_cmd_tcal_auto_on(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	LOG_INF("Executing remote command: TCAL_AUTO_ON");
+	sensor_tcal_set_auto_calibration(true);
+#else
+	LOG_WRN("Remote command: TCAL_AUTO_ON not supported (T-Cal disabled in config)");
+#endif
+}
+
+static void esb_remote_cmd_tcal_auto_off(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	LOG_INF("Executing remote command: TCAL_AUTO_OFF");
+	sensor_tcal_set_auto_calibration(false);
+#else
+	LOG_WRN("Remote command: TCAL_AUTO_OFF not supported (T-Cal disabled in config)");
+#endif
+}
+
+static void esb_remote_cmd_ping(void)
+{
+	LOG_INF("Executing remote command: PING");
+	cmd_ping_start();
+}
+
+static void esb_remote_cmd_fusion_reset(void)
+{
+	LOG_INF("Executing remote command: FUSION_RESET");
+	cmd_fusion_reset();
+}
+
+static void esb_remote_cmd_tcal_boot_on(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	LOG_INF("Executing remote command: TCAL_BOOT_ON");
+	sensor_boot_cal_set_enabled(true);
+#else
+	LOG_WRN("Remote command: TCAL_BOOT_ON not supported (T-Cal disabled in config)");
+#endif
+}
+
+static void esb_remote_cmd_tcal_boot_off(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	LOG_INF("Executing remote command: TCAL_BOOT_OFF");
+	sensor_boot_cal_set_enabled(false);
+#else
+	LOG_WRN("Remote command: TCAL_BOOT_OFF not supported (T-Cal disabled in config)");
+#endif
+}
+
+static void esb_remote_cmd_data_collect_on(void)
+{
+	LOG_INF("Executing remote command: DATA_COLLECT_ON");
+	connection_set_data_collection(true);
+	test_mode_set(true);  // Prevent sleep during data collection
+}
+
+static void esb_remote_cmd_data_collect_off(void)
+{
+	LOG_INF("Executing remote command: DATA_COLLECT_OFF");
+	connection_set_data_collection(false);
+	test_mode_set(false);
+}
+
+static void esb_remote_cmd_ota_query_info(void)
+{
+	LOG_INF("Executing remote command: OTA_QUERY_INFO");
+	esb_ota_handle_query_info();
+}
+
+static void esb_remote_cmd_ota_abort(void)
+{
+	LOG_WRN("Executing remote command: OTA_ABORT");
+	esb_ota_handle_abort();
+}
+
+static void esb_remote_cmd_ota_suppress(void)
+{
+	LOG_INF("Executing remote command: OTA_SUPPRESS (reducing poll rate)");
+	connection_set_ota_suppressed(true);
+}
+
+static void esb_remote_cmd_ota_unsuppress(void)
+{
+	LOG_INF("Executing remote command: OTA_UNSUPPRESS (resuming normal rate)");
+	connection_set_ota_suppressed(false);
+}
+
+static const struct esb_remote_cmd esb_remote_cmds[] = {
+	{ESB_PONG_FLAG_SHUTDOWN, "SHUTDOWN", esb_remote_cmd_shutdown},
+	{ESB_PONG_FLAG_CALIBRATE, "CALIBRATE", esb_remote_cmd_calibrate},
+	{ESB_PONG_FLAG_SIX_SIDE_CAL, "SIX_SIDE_CAL", esb_remote_cmd_six_side_cal},
+	{ESB_PONG_FLAG_MEOW, "MEOW", esb_remote_cmd_meow},
+	{ESB_PONG_FLAG_SCAN, "SCAN", esb_remote_cmd_scan},
+	{ESB_PONG_FLAG_MAG_CLEAR, "MAG_CLEAR", esb_remote_cmd_mag_clear},
+	{ESB_PONG_FLAG_MAG_CAL, "MAG_CAL", esb_remote_cmd_mag_cal},
+	{ESB_PONG_FLAG_MAG_ON, "MAG_ON", esb_remote_cmd_mag_on},
+	{ESB_PONG_FLAG_MAG_OFF, "MAG_OFF", esb_remote_cmd_mag_off},
+	{ESB_PONG_FLAG_MAG_AUTO_ON, "MAG_AUTO_ON", esb_remote_cmd_mag_auto_on},
+	{ESB_PONG_FLAG_MAG_AUTO_OFF, "MAG_AUTO_OFF", esb_remote_cmd_mag_auto_off},
+	{ESB_PONG_FLAG_REBOOT, "REBOOT", esb_remote_cmd_reboot},
+	{ESB_PONG_FLAG_CLEAR, "CLEAR", esb_remote_cmd_clear},
+	{ESB_PONG_FLAG_DFU, "DFU", esb_remote_cmd_dfu},
+	{ESB_PONG_FLAG_DFU_OTA, "DFU_OTA", esb_remote_cmd_dfu_ota},
+	{ESB_PONG_FLAG_SET_CHANNEL, "SET_CHANNEL", esb_remote_cmd_set_channel},
+	{ESB_PONG_FLAG_CLEAR_CHANNEL, "CLEAR_CHANNEL", esb_remote_cmd_clear_channel},
+	{ESB_PONG_FLAG_SENS_SET, "SENS_SET", esb_remote_cmd_sens_set},
+	{ESB_PONG_FLAG_SENS_RESET, "SENS_RESET", esb_remote_cmd_sens_reset},
+	{ESB_PONG_FLAG_SENS_AUTO, "SENS_AUTO", esb_remote_cmd_sens_auto},
+	{ESB_PONG_FLAG_RESET_ZRO, "RESET_ZRO", esb_remote_cmd_reset_zro},
+	{ESB_PONG_FLAG_RESET_ACC, "RESET_ACC", esb_remote_cmd_reset_acc},
+	{ESB_PONG_FLAG_RESET_BAT, "RESET_BAT", esb_remote_cmd_reset_bat},
+	{ESB_PONG_FLAG_RESET_TCAL, "RESET_TCAL", esb_remote_cmd_reset_tcal},
+	{ESB_PONG_FLAG_TCAL_AUTO_ON, "TCAL_AUTO_ON", esb_remote_cmd_tcal_auto_on},
+	{ESB_PONG_FLAG_TCAL_AUTO_OFF, "TCAL_AUTO_OFF", esb_remote_cmd_tcal_auto_off},
+	{ESB_PONG_FLAG_PING, "PING", esb_remote_cmd_ping},
+	{ESB_PONG_FLAG_FUSION_RESET, "FUSION_RESET", esb_remote_cmd_fusion_reset},
+	{ESB_PONG_FLAG_TCAL_BOOT_ON, "TCAL_BOOT_ON", esb_remote_cmd_tcal_boot_on},
+	{ESB_PONG_FLAG_TCAL_BOOT_OFF, "TCAL_BOOT_OFF", esb_remote_cmd_tcal_boot_off},
+	{ESB_PONG_FLAG_TCAL_ON, "TCAL_ON", esb_remote_cmd_tcal_on},
+	{ESB_PONG_FLAG_TCAL_OFF, "TCAL_OFF", esb_remote_cmd_tcal_off},
+	{ESB_PONG_FLAG_TDMA_ON, "TDMA_ON", esb_remote_cmd_tdma_on},
+	{ESB_PONG_FLAG_TDMA_OFF, "TDMA_OFF", esb_remote_cmd_tdma_off},
+	{ESB_PONG_FLAG_TEST_MODE_ON, "TEST_MODE_ON", esb_remote_cmd_test_mode_on},
+	{ESB_PONG_FLAG_TEST_MODE_OFF, "TEST_MODE_OFF", esb_remote_cmd_test_mode_off},
+	{ESB_PONG_FLAG_DATA_COLLECT_ON, "DATA_COLLECT_ON", esb_remote_cmd_data_collect_on},
+	{ESB_PONG_FLAG_DATA_COLLECT_OFF, "DATA_COLLECT_OFF", esb_remote_cmd_data_collect_off},
+	{ESB_PONG_FLAG_OTA_QUERY_INFO, "OTA_QUERY_INFO", esb_remote_cmd_ota_query_info},
+	{ESB_PONG_FLAG_OTA_ABORT, "OTA_ABORT", esb_remote_cmd_ota_abort},
+	{ESB_PONG_FLAG_OTA_SUPPRESS, "OTA_SUPPRESS", esb_remote_cmd_ota_suppress},
+	{ESB_PONG_FLAG_OTA_UNSUPPRESS, "OTA_UNSUPPRESS", esb_remote_cmd_ota_unsuppress},
+};
+
+static const char *esb_remote_cmd_name(uint8_t flag)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(esb_remote_cmds); i++) {
+		if (esb_remote_cmds[i].flag == flag) {
+			return esb_remote_cmds[i].name;
+		}
+	}
+	return "UNKNOWN";
+}
+
+/* ── OTA packet queue (ISR → thread) ─────────────────────────────
+ * OTA packets received in ESB ISR are queued here and processed
+ * in the connection thread where flash/logging is safe. */
+#define OTA_RX_QUEUE_SIZE 16
+static struct {
+	uint8_t data[CONFIG_ESB_MAX_PAYLOAD_LENGTH];
+	uint8_t length;
+} ota_rx_queue[OTA_RX_QUEUE_SIZE];
+static volatile uint8_t ota_rx_head;
+static volatile uint8_t ota_rx_tail;
 
 // Server time synchronization for TDMA scheduling (using ticks)
 static bool server_time_synced = false;
@@ -140,12 +554,12 @@ static int32_t g_skew_ref_offset = 0;        // Offset at skew reference point
 static uint32_t g_skew_ref_local_ticks = 0;  // Local ticks at skew reference point (updated infrequently)
 #define SKEW_REF_REFRESH_TICKS (60 * 32768)  // Refresh skew reference every ~60s
 
-// Minimum RTT tracking for asymmetric delay compensation
-// In ESB, return path (ACK) has fixed delay ≈ min_rtt/2
-// Forward path absorbs all retransmission overhead
-// Init to ~305µs (10 ticks): conservative estimate for clean 2Mbps ESB RTT,
-// avoids wildly wrong first offset if first PONG has retransmissions.
+// Minimum RTT tracking for PONG acceptance threshold and diagnostics.
+// Init to ~305µs (10 ticks): conservative estimate for clean 2Mbps ESB RTT.
 static uint32_t g_min_rtt_ticks = 10;
+static uint32_t g_min_rtt_age = 0; // PONGs since last min_rtt update
+#define MIN_RTT_AGE_LIMIT 120      // Age out after ~120 PONGs (~2 min at 1/s)
+#define MIN_RTT_CEILING   20       // Never age beyond this (conservative upper bound)
 
 // Warm-up counter: first few PONGs use faster EMA for quick convergence
 static uint32_t g_sync_update_count = 0;
@@ -180,6 +594,23 @@ static void remote_print_meow(void)
 	LOG_INF("%s%s%s", meows[meow], meow_punctuations[punctuation], meow_suffixes[suffix]);
 }
 
+
+static void esb_remote_command_execute(uint8_t cmd)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(esb_remote_cmds); i++) {
+		if (esb_remote_cmds[i].flag == cmd) {
+			if (esb_remote_cmds[i].fn) {
+				esb_remote_cmds[i].fn();
+			}
+			return;
+		}
+	}
+	LOG_WRN("Unknown remote command: 0x%02X", cmd);
+}
+
+
+
+
 static uint8_t tracker_id = 0;
 static void set_tracker_id(uint8_t id)
 {
@@ -189,6 +620,8 @@ static void set_tracker_id(uint8_t id)
 // --- esb_write() rate logging ---
 static uint32_t esb_write_calls = 0;
 static uint32_t esb_write_queued = 0;
+static uint32_t esb_write_dup_queued = 0;
+static uint32_t esb_write_dropped = 0;
 static int64_t esb_rate_last_ts = 0;
 
 void esb_write_rate_tick(void)
@@ -199,9 +632,17 @@ void esb_write_rate_tick(void)
 	}
 	esb_write_calls++;
 	if (now - esb_rate_last_ts >= 5000) {
-		LOG_INF("esb_write rate: calls=%u/s queued=%u/s", esb_write_calls / 5, esb_write_queued / 5);
+		LOG_INF(
+			"esb_write rate: calls=%u/s queued=%u/s dup=%u/s drop=%u/s",
+			esb_write_calls / 5,
+			esb_write_queued / 5,
+			esb_write_dup_queued / 5,
+			esb_write_dropped / 5
+		);
 		esb_write_calls = 0;
 		esb_write_queued = 0;
+		esb_write_dup_queued = 0;
+		esb_write_dropped = 0;
 		esb_rate_last_ts = now;
 	}
 }
@@ -209,8 +650,39 @@ void esb_write_rate_tick(void)
 // ESB recovery mechanism for persistent ENOMEM errors
 static uint32_t consecutive_enomem_errors = 0;
 static int64_t last_enomem_time = 0;
+static atomic_t tx_failed_pop_pending;
 #define ENOMEM_ERROR_THRESHOLD 3    // Force recovery after N consecutive errors
 #define ENOMEM_ERROR_WINDOW_MS 1000 // Reset counter if no error for this duration
+
+static void drop_failed_tx_payload(void)
+{
+	int err = esb_pop_tx();
+
+	if (err == 0) {
+		LOG_DBG("Dropped failed TX payload from ESB FIFO");
+	} else if (err == -EBUSY) {
+		atomic_set(&tx_failed_pop_pending, 1);
+		LOG_DBG("Deferring failed TX payload drop: ESB busy");
+	} else if (err != -ENODATA) {
+		LOG_WRN("Failed to drop failed TX payload: %d", err);
+	}
+}
+
+static void drop_failed_tx_payload_if_pending(void)
+{
+	if (atomic_cas(&tx_failed_pop_pending, 1, 0)) {
+		drop_failed_tx_payload();
+	}
+}
+
+static void esb_start_queued_tx(void)
+{
+	int tx_ret = esb_start_tx();
+
+	if (tx_ret != 0 && tx_ret != -EBUSY && tx_ret != -ENODATA) {
+		LOG_WRN("esb_start_tx failed: %d", tx_ret);
+	}
+}
 
 static void esb_clear_time_sync_state(void)
 {
@@ -351,7 +823,7 @@ void clocks_request_start(uint32_t delay_us)
 		NULL,
 		NULL,
 		NULL,
-		5,
+		CLOCKS_START_THREAD_PRIORITY,
 		0,
 		K_USEC(delay_us)
 	);
@@ -379,7 +851,7 @@ void clocks_request_stop(uint32_t delay_us)
 		NULL,
 		NULL,
 		NULL,
-		5,
+		CLOCKS_STOP_THREAD_PRIORITY,
 		0,
 		K_USEC(delay_us)
 	);
@@ -396,11 +868,13 @@ void event_handler(struct esb_evt const *event)
 		tx_success_count++;
 		// Reset ENOMEM error counter on successful transmission
 		consecutive_enomem_errors = 0;
-		if (esb_paired && !connection_get_data_collection()) {
+		if (esb_paired && !connection_get_data_collection() && esb_is_idle()) {
 			clocks_stop();
 		}
 		break;
 	case ESB_EVENT_TX_FAILED:
+		drop_failed_tx_payload();
+		esb_start_queued_tx();
 		tx_failed_count++;
 
 		// Detailed packet type diagnostics for TX_FAILED
@@ -462,12 +936,11 @@ void event_handler(struct esb_evt const *event)
 			);
 		}
 
-		if (esb_paired && !connection_get_data_collection()) {
+		if (esb_paired && !connection_get_data_collection() && esb_is_idle()) {
 			clocks_stop();
 		}
 		break;
 	case ESB_EVENT_RX_RECEIVED: {
-		uint32_t current_rx_ticks = sys_clock_tick_get_32();
 		int err = 0;
 		err = esb_read_rx_payload(&rx_payload);
 		if (err == -ENODATA) {
@@ -580,6 +1053,9 @@ void event_handler(struct esb_evt const *event)
 					// Check flags field (byte 7)
 					uint8_t pong_flags = rx_payload.data[7];
 					uint32_t rtt_us = 0;
+					float pong_sens_data[3] = {0.0f, 0.0f, 0.0f};
+					uint8_t pong_sens_auto_axis = 0;
+					uint16_t pong_sens_auto_revolutions = 0;
 
 					if (pong_flags == ESB_PONG_FLAG_SENS_SET) {
 						// Special case: SENS_SET command repurposes time sync bytes for data
@@ -588,19 +1064,32 @@ void event_handler(struct esb_evt const *event)
 						int16_t y_int = (int16_t)((rx_payload.data[5] << 8) | rx_payload.data[6]);
 						int16_t z_int = (int16_t)((rx_payload.data[8] << 8) | rx_payload.data[9]);
 
-						received_sens_data[0] = (float)x_int / 100.0f;
-						received_sens_data[1] = (float)y_int / 100.0f;
-						received_sens_data[2] = (float)z_int / 100.0f;
+						pong_sens_data[0] = (float)x_int / 100.0f;
+						pong_sens_data[1] = (float)y_int / 100.0f;
+						pong_sens_data[2] = (float)z_int / 100.0f;
 
 						LOG_INF(
 							"Received SENS_SET data: %.2f, %.2f, %.2f",
-							(double)received_sens_data[0],
-							(double)received_sens_data[1],
-							(double)received_sens_data[2]
+							(double)pong_sens_data[0],
+							(double)pong_sens_data[1],
+							(double)pong_sens_data[2]
 						);
+					} else if (pong_flags == ESB_PONG_FLAG_SENS_AUTO) {
+						pong_sens_auto_axis = rx_payload.data[3];
+						pong_sens_auto_revolutions
+							= ((uint16_t)rx_payload.data[4] << 8) | (uint16_t)rx_payload.data[5];
+						if (pong_sens_auto_revolutions == 0) {
+							LOG_INF("Received SENS_AUTO data: axis=%u, revolutions=default", pong_sens_auto_axis);
+						} else {
+							LOG_INF(
+								"Received SENS_AUTO data: axis=%u, revolutions=%u",
+								pong_sens_auto_axis,
+								pong_sens_auto_revolutions
+							);
+						}
 					} else if (ping_ticks_for_this_ctr != 0) {
 						// ====================================================================
-						// RTT and Server Time Offset Calculation (ESB Asymmetric Model)
+						// RTT and Server Time Offset Calculation (Reference-Point Model)
 						// ====================================================================
 						// In ESB, the return path (ACK) has FIXED delay regardless of
 						// retransmissions. All retransmission time is on the forward path.
@@ -609,17 +1098,29 @@ void event_handler(struct esb_evt const *event)
 						// With retransmit:  T1 --[fail]--[fail]--[air]--> T2
 						//                   T4 <--[ACK]-- T3≈T2
 						//
-						// return_delay ≈ min_rtt / 2  (constant)
-						// offset = T2 - T4 + return_delay
+						// offset = T2 - T4 (constant one-way bias cancels for TDMA)
 						// ====================================================================
+						uint32_t t4_ticks = esb_last_ack_rx_ticks;
 
 						// Calculate full RTT: from PING send (T1) to PONG receive (T4)
-						uint32_t rtt_ticks = current_rx_ticks - ping_ticks_for_this_ctr;
+						uint32_t rtt_ticks = t4_ticks - ping_ticks_for_this_ctr;
 						rtt_us = k_ticks_to_us_floor32(rtt_ticks);
 
 						// Track minimum RTT (no-retransmission baseline)
-						if (rtt_ticks > 0 && rtt_ticks < g_min_rtt_ticks) {
+						// with aging: if min hasn't been refreshed in
+						// MIN_RTT_AGE_LIMIT PONGs, nudge it upward by 1 tick
+						// to recover from anomalously low measurements.
+						if (rtt_ticks > 0 && rtt_ticks <= g_min_rtt_ticks) {
 							g_min_rtt_ticks = rtt_ticks;
+							g_min_rtt_age = 0;
+						} else {
+							g_min_rtt_age++;
+							if (g_min_rtt_age >= MIN_RTT_AGE_LIMIT &&
+							    g_min_rtt_ticks < MIN_RTT_CEILING) {
+								g_min_rtt_ticks++;
+								g_min_rtt_age = 0;
+								LOG_DBG("min_rtt aged up to %u ticks", g_min_rtt_ticks);
+							}
 						}
 
 						// log ping and rtt
@@ -634,12 +1135,28 @@ void event_handler(struct esb_evt const *event)
 							LOG_DBG("PONG ok, ack rtt=%u us (ctr=%u)", (unsigned)rtt_us, rx_ctr);
 						}
 
-						if (rtt_us < 3000) {
-							// Asymmetric offset: ACK return path has fixed delay
-							int32_t return_delay_ticks = (int32_t)g_min_rtt_ticks / 2;
+						/*
+						 * Adaptive RTT acceptance threshold.
+						 * Accept PONGs with RTT up to 4× min_rtt (handles minor
+						 * retransmissions) or 1000µs absolute floor (during min_rtt
+						 * warm-up when min is unreliable).
+						 */
+						uint32_t rtt_threshold_us = k_ticks_to_us_floor32(g_min_rtt_ticks * 4);
+						if (rtt_threshold_us < 1000) {
+							rtt_threshold_us = 1000;
+						}
+						if (rtt_us < rtt_threshold_us) {
+							// Reference-point offset: T2 - T4
+							// The constant one-way delay bias is the same for
+							// all trackers and cancels out in TDMA slot alignment.
+							// Decoupling from min_rtt avoids noise injection when
+							// min_rtt ages/updates.
 							int32_t server_offset_ticks
-								= (int32_t)(ping_rx_ticks - current_rx_ticks) + return_delay_ticks;
+								= (int32_t)(ping_rx_ticks - t4_ticks);
 
+							/* Save prior sync stamp before overwrite — EMA predict
+							 * needs elapsed since last accepted PONG, not zero. */
+							uint32_t prev_sync_local_ticks = g_last_sync_local_ticks;
 							g_last_rx_raw_ticks = ping_rx_ticks;
 							g_last_sync_local_ticks = ping_ticks_for_this_ctr;
 							g_last_sync_timestamp = k_uptime_get();
@@ -687,28 +1204,32 @@ void event_handler(struct esb_evt const *event)
 									}
 
 									/*
-									 * EMA-filtered offset update.
-									 *
-									 * Warm-up (first 5 PONGs): alpha=1/2 for fast convergence
-									 * after boot/reconnect. min_rtt may still be settling,
-									 * so aggressive tracking is better than slow convergence.
-									 *
-									 * Steady-state (after warm-up): alpha=1/4 for stability.
-									 * Smooths EVENT_IRQ jitter (~10-25 ticks) to ±6 ticks.
-									 * The >32000 reset path handles genuine large jumps.
-									 */
-									g_sync_update_count++;
-									int32_t offset_innovation = server_offset_ticks - (int32_t)g_server_ticks_offset;
-									if (g_sync_update_count <= SYNC_WARM_UP_COUNT) {
-										/* Warm-up: alpha=1/2 */
-										g_server_ticks_offset += (offset_innovation + 1) / 2;
-									} else {
-										/* Steady state: alpha=1/4 */
-										g_server_ticks_offset += (offset_innovation + 2) / 4;
-									}
-
-									// Refresh skew reference periodically to avoid uint32 wrap
-									if (delta_from_ref > SKEW_REF_REFRESH_TICKS) {
+								 * Predict-Update EMA offset filter.
+								 *
+								 * Use skew prediction as the expected offset,
+								 * so EMA innovation contains only measurement
+								 * noise (not deterministic drift).  This allows
+								 * a smaller alpha for better noise rejection
+								 * while skew handles drift tracking.
+								 *
+								 * Warm-up (first 5 PONGs): alpha=3/4 for fast
+								 * initial convergence before skew is estimated.
+								 */
+								g_sync_update_count++;
+								/* Predict from last accepted sync (prev), not current stamp. */
+								uint32_t delta_since_sync = ping_ticks_for_this_ctr - prev_sync_local_ticks;
+								int32_t predicted_current = (int32_t)g_server_ticks_offset
+									+ (int32_t)((int64_t)g_clock_skew_ppb * delta_since_sync / 1000000000LL);
+								int32_t offset_innovation = server_offset_ticks - predicted_current;
+								if (g_sync_update_count <= SYNC_WARM_UP_COUNT) {
+									/* Warm-up: alpha=3/4 for fast convergence */
+									g_server_ticks_offset = predicted_current + (offset_innovation * 3 + 2) / 4;
+								} else {
+									/* Steady state: alpha=1/4 (skew handles drift) */
+									g_server_ticks_offset = predicted_current + (offset_innovation + 2) / 4;
+								}
+								// Refresh skew reference periodically to avoid uint32 wrap
+								if (delta_from_ref > SKEW_REF_REFRESH_TICKS) {
 										g_skew_ref_offset = server_offset_ticks;
 										g_skew_ref_local_ticks = ping_ticks_for_this_ctr;
 									}
@@ -761,8 +1282,12 @@ void event_handler(struct esb_evt const *event)
 
 					// handle remote commands and delayed execution
 					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
-						if (received_remote_command == ESB_PONG_FLAG_NORMAL) {
-							// new command received
+						if (received_remote_command == ESB_PONG_FLAG_NORMAL ||
+						    (received_remote_command == acked_remote_command &&
+						     pong_flags != received_remote_command)) {
+							// new command received, or override already-executed command
+							// whose confirmation was superseded by the receiver
+							// (but skip re-accepting the same command repeatedly)
 							received_remote_command = pong_flags;
 							remote_command_receive_time = k_uptime_get();
 
@@ -771,101 +1296,14 @@ void event_handler(struct esb_evt const *event)
 								received_channel_value
 									= ((uint32_t)rx_payload.data[8] << 24) | ((uint32_t)rx_payload.data[9] << 16)
 									| ((uint32_t)rx_payload.data[10] << 8) | ((uint32_t)rx_payload.data[11]);
+							} else if (pong_flags == ESB_PONG_FLAG_SENS_SET) {
+								memcpy(received_sens_data, pong_sens_data, sizeof(received_sens_data));
+							} else if (pong_flags == ESB_PONG_FLAG_SENS_AUTO) {
+								received_sens_auto_axis = pong_sens_auto_axis;
+								received_sens_auto_revolutions = pong_sens_auto_revolutions;
 							}
 
-							const char *cmd_name = "UNKNOWN";
-							switch (pong_flags) {
-							case ESB_PONG_FLAG_SHUTDOWN:
-								cmd_name = "SHUTDOWN";
-								break;
-							case ESB_PONG_FLAG_CALIBRATE:
-								cmd_name = "CALIBRATE";
-								break;
-							case ESB_PONG_FLAG_SIX_SIDE_CAL:
-								cmd_name = "SIX_SIDE_CAL";
-								break;
-							case ESB_PONG_FLAG_MEOW:
-								cmd_name = "MEOW";
-								break;
-							case ESB_PONG_FLAG_SCAN:
-								cmd_name = "SCAN";
-								break;
-							case ESB_PONG_FLAG_MAG_CLEAR:
-								cmd_name = "MAG_CLEAR";
-								break;
-							case ESB_PONG_FLAG_MAG_CAL:
-								cmd_name = "MAG_CAL";
-								break;
-							case ESB_PONG_FLAG_MAG_ON:
-								cmd_name = "MAG_ON";
-								break;
-							case ESB_PONG_FLAG_MAG_OFF:
-								cmd_name = "MAG_OFF";
-								break;
-							case ESB_PONG_FLAG_REBOOT:
-								cmd_name = "REBOOT";
-								break;
-							case ESB_PONG_FLAG_CLEAR:
-								cmd_name = "CLEAR";
-								break;
-							case ESB_PONG_FLAG_DFU:
-								cmd_name = "DFU";
-								break;
-							case ESB_PONG_FLAG_DFU_OTA:
-								cmd_name = "DFU_OTA";
-								break;
-							case ESB_PONG_FLAG_SET_CHANNEL:
-								cmd_name = "SET_CHANNEL";
-								break;
-							case ESB_PONG_FLAG_SENS_SET:
-								cmd_name = "SENS_SET";
-								break;
-							case ESB_PONG_FLAG_SENS_RESET:
-								cmd_name = "SENS_RESET";
-								break;
-							case ESB_PONG_FLAG_RESET_ZRO:
-								cmd_name = "RESET_ZRO";
-								break;
-							case ESB_PONG_FLAG_RESET_ACC:
-								cmd_name = "RESET_ACC";
-								break;
-							case ESB_PONG_FLAG_RESET_BAT:
-								cmd_name = "RESET_BAT";
-								break;
-							case ESB_PONG_FLAG_RESET_TCAL:
-								cmd_name = "RESET_TCAL";
-								break;
-							case ESB_PONG_FLAG_TCAL_AUTO_ON:
-								cmd_name = "TCAL_AUTO_ON";
-								break;
-							case ESB_PONG_FLAG_TCAL_AUTO_OFF:
-								cmd_name = "TCAL_AUTO_OFF";
-								break;
-							case ESB_PONG_FLAG_PING:
-								cmd_name = "PING";
-								break;
-							case ESB_PONG_FLAG_FUSION_RESET:
-								cmd_name = "FUSION_RESET";
-								break;
-							case ESB_PONG_FLAG_TCAL_BOOT_ON:
-								cmd_name = "TCAL_BOOT_ON";
-								break;
-							case ESB_PONG_FLAG_TCAL_BOOT_OFF:
-								cmd_name = "TCAL_BOOT_OFF";
-								break;
-							case ESB_PONG_FLAG_TCAL_ON:
-								cmd_name = "TCAL_ON";
-								break;
-							case ESB_PONG_FLAG_TCAL_OFF:
-								cmd_name = "TCAL_OFF";
-								break;
-							case ESB_PONG_FLAG_TDMA_ON:
-								cmd_name = "TDMA_ON";
-								break;
-							case ESB_PONG_FLAG_TDMA_OFF:
-								cmd_name = "TDMA_OFF";
-								break;
-							}
+							const char *cmd_name = esb_remote_cmd_name(pong_flags);
 							if (pong_flags == ESB_PONG_FLAG_SET_CHANNEL) {
 								LOG_INF(
 									"Remote command %s (0x%02X) received, channel=%u, will execute in %dms",
@@ -875,11 +1313,14 @@ void event_handler(struct esb_evt const *event)
 									REMOTE_COMMAND_DELAY_MS
 								);
 							} else {
+								bool is_ota = (pong_flags >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
+									       pong_flags <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
 								LOG_INF(
-									"Remote command %s (0x%02X) received, will execute in %dms",
+									"Remote command %s (0x%02X) received, %s",
 									cmd_name,
 									pong_flags,
-									REMOTE_COMMAND_DELAY_MS
+									is_ota ? "executing immediately" :
+									"will execute in 1500ms"
 								);
 							}
 						}
@@ -900,7 +1341,7 @@ void event_handler(struct esb_evt const *event)
 			default:
 				/* ACK payload from receiver carrying ARQ retransmit requests */
 				if (rx_payload.length >= 4 &&
-				    rx_payload.data[0] == 0xAA &&
+				    rx_payload.data[0] == RAW_ARQ_MARKER &&
 				    connection_get_data_collection()) {
 					uint8_t retx_n = rx_payload.data[1];
 					uint8_t max_entries = (rx_payload.length - 2) / 2;
@@ -909,6 +1350,7 @@ void event_handler(struct esb_evt const *event)
 					}
 					extern volatile uint16_t raw_retx_queue[];
 					extern volatile uint8_t  raw_retx_count;
+					unsigned retx_key = irq_lock();
 					for (uint8_t i = 0; i < retx_n; i++) {
 						uint16_t seq = sys_get_be16(&rx_payload.data[2 + i * 2]);
 						/* Deduplicate */
@@ -923,7 +1365,24 @@ void event_handler(struct esb_evt const *event)
 							raw_retx_queue[raw_retx_count++] = seq;
 						}
 					}
-				} else {
+					irq_unlock(retx_key);
+				}
+				/* OTA packets from receiver (in ACK payload) —
+				 * queue for deferred processing in thread context
+				 * (flash ops and logging not safe in ISR) */
+				else if (rx_payload.length >= 2 &&
+					 rx_payload.data[0] >= ESB_OTA_DATA_TYPE &&
+					 rx_payload.data[0] <= ESB_OTA_ACTIVATE_TYPE) {
+					uint8_t next = (ota_rx_head + 1) % OTA_RX_QUEUE_SIZE;
+					if (next != ota_rx_tail) {
+						memcpy(ota_rx_queue[ota_rx_head].data,
+						       rx_payload.data, rx_payload.length);
+						ota_rx_queue[ota_rx_head].length = rx_payload.length;
+						__DMB();
+						ota_rx_head = next;
+					}
+				}
+				else {
 					LOG_WRN("Ignoring invalid payload length %u", rx_payload.length);
 				}
 			} // end of rx_payload length switch
@@ -1025,11 +1484,19 @@ int esb_initialize(bool tx)
 void esb_deinitialize(void)
 {
 	if (esb_initialized) {
+		/* Clear first so esb_write / connection_thread stop before radio teardown. */
 		esb_initialized = false;
-		k_msleep(3); // wait for pending transmissions
+		k_msleep(5); // wait for in-flight writers to observe flag + drain TX
 		esb_disable();
 	}
 	esb_initialized = false;
+}
+
+int esb_reinitialize(void)
+{
+	esb_deinitialize();
+	k_msleep(10);
+	return esb_initialize(true);
 }
 
 inline void esb_set_addr_discovery(void)
@@ -1217,6 +1684,21 @@ void esb_clear_pair(void)
 	LOG_INF("Pairing data reset");
 }
 
+void esb_process_ota_rx_queue(void)
+{
+	while (ota_rx_tail != ota_rx_head) {
+		uint8_t idx = ota_rx_tail;
+		if (ota_rx_queue[idx].data[0] != ESB_OTA_DATA_TYPE) {
+			LOG_WRN("OTA queue: non-data type=0x%02X len=%u",
+				ota_rx_queue[idx].data[0], ota_rx_queue[idx].length);
+		}
+		esb_ota_process_rx_packet(ota_rx_queue[idx].data,
+					  ota_rx_queue[idx].length);
+		__DMB();
+		ota_rx_tail = (idx + 1) % OTA_RX_QUEUE_SIZE;
+	}
+}
+
 void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 {
 	if (!esb_initialized || !esb_paired) {
@@ -1225,10 +1707,15 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	if (!clock_status) {
 		clocks_start();
 	}
+	drop_failed_tx_payload_if_pending();
 	if (data_length < 1) {
 		LOG_ERR("Invalid data length %u", data_length);
 		return;
 	}
+
+	bool is_ping = data[0] == ESB_PING_TYPE;
+	bool is_raw = (data[0] >= 0x10 && data[0] <= 0x14);
+	bool drop_on_fifo_full = no_ack && !is_raw;
 
 	tx_payload.pipe = 1 + (tracker_id % 7);
 	tx_payload.noack = no_ack;
@@ -1238,12 +1725,10 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	// Tick rate counter
 	esb_write_rate_tick();
 
-	if (data[0] == ESB_PING_TYPE) {
+	if (is_ping) {
 		if (!server_time_synced) {
 			LOG_DBG("Sending PING while time not synced - attempting to re-sync");
 		}
-		ping_pending = true;
-		ping_failed = false;
 		// Set sequence number
 		data[2] = ping_counter;
 		if (server_time_synced) {
@@ -1257,7 +1742,6 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		// Calculate crc8 checksum over first 12 bytes
 		uint8_t crc_calc = crc8_ccitt(0x07, data, ESB_PING_LEN - 1);
 		data[ESB_PING_LEN - 1] = crc_calc;
-		ping_counter++;
 	}
 	memcpy(tx_payload.data, data, data_length);
 
@@ -1267,39 +1751,95 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	last_tx.length = data_length;
 	last_tx.timestamp = k_uptime_get();
 
-	// Try to queue the packet
+	/*
+	 * TDMA slot gating / random backoff for noack sensor-data packets.
+	 *
+	 * Wait BEFORE queuing: if the packet were queued first and the radio
+	 * were still auto-draining a previous TX, the new packet could be
+	 * transmitted before the TDMA slot (bypassing the wait entirely).
+	 *
+	 * PING / ACK packets bypass this (no_ack == false) so time-sync and
+	 * connection-health probes are never delayed.
+	 * Raw data-collection packets always bypass for minimum latency.
+	 *
+	 * When TDMA is disabled (compile-time or runtime), use random backoff
+	 * to reduce collision
+	 */
+	if (no_ack && !is_raw) {
+#if CONFIG_CONNECTION_TDMA
+		if (tdma_is_enabled()) {
+			tdma_wait_for_slot();
+		} else
+#endif
+		{
+			/* Random backoff: 0-1ms jitter using low bits of cycle counter */
+			uint32_t jitter_us = (k_cycle_get_32() & 0x3FF) % 1000;
+			if (jitter_us > 100) {
+				k_usleep(jitter_us);
+			}
+		}
+	}
+
+	// Try to queue the packet (now inside the TDMA slot window)
 	int queue_status = esb_write_payload(&tx_payload);
-	// only flush if tx full
+
+	if (queue_status == -ENOMEM && drop_on_fifo_full) {
+		esb_write_dropped++;
+		if (esb_is_idle()) {
+			esb_start_queued_tx();
+		}
+		return;
+	}
+
 	if (queue_status == -ENOMEM) {
-		esb_flush_tx();
+		if (esb_is_idle()) {
+			(void)esb_flush_tx();
+		} else {
+			k_msleep(1);
+			drop_failed_tx_payload_if_pending();
+		}
 		queue_status = esb_write_payload(&tx_payload);
 	}
 
-	bool is_raw = (data[0] >= 0x10 && data[0] <= 0x12);
-	// manually repeat raw packets for better reliability
-	if (is_raw) {
+	// manually repeat raw IMU/mag packets for better reliability
+	// Skip duplication for raw meta and calibration
+	// which are sent at controlled intervals with guaranteed delivery
+	if (queue_status == 0 && is_raw && data[0] != ESB_RAW_META_TYPE && data[0] != ESB_RAW_CAL_TYPE) {
 		tx_payload.noack = true;
-		queue_status = esb_write_payload(&tx_payload);
-		if (queue_status == 0) {
-			queue_status = esb_write_payload(&tx_payload);
+		int dup_status = esb_write_payload(&tx_payload);
+		if (dup_status == 0) {
+			esb_write_dup_queued++;
 		}
 	}
 # if 0
-	if (no_ack) {
+	if (no_ack && !is_raw) {
 		// manually repeat packet for noack packets for better reliability
-		queue_status = esb_write_payload(&tx_payload);
+		int dup_ret = esb_write_payload(&tx_payload);
+		if (dup_ret != 0) {
+			LOG_WRN("Redundant copy queue failed: %d", dup_ret);
+		} else {
+			esb_write_dup_queued++;
+		}
+		queue_status = dup_ret;
 	}
 #endif
-	// Record ping history metadata (timing updated after TDMA wait, just before TX)
-	if (data[0] == ESB_PING_TYPE && queue_status == 0 && data_length == ESB_PING_LEN) {
+	/* Zero ping_ticks until TX stamp — avoid RX binding new counter to old ticks. */
+	if (is_ping && queue_status == 0 && data_length == ESB_PING_LEN) {
+		ping_pending = true;
+		ping_failed = false;
+		ping_counter++;
+		unsigned key = irq_lock();
 		ping_history[ping_history_idx].counter = tx_payload.data[2];
+		ping_history[ping_history_idx].ping_ticks = 0;
+		irq_unlock(key);
 		ping_ctr_sent = tx_payload.data[2];
 		LOG_DBG("PING queued (ctr=%u)", (unsigned)tx_payload.data[2]);
-	} else if (tx_payload.data[0] == ESB_PING_TYPE && queue_status != 0) {
+	} else if (is_ping && queue_status != 0) {
+		ping_pending = false;
 		// PING failed to queue - this is critical!
 		const char *err_str = "unknown";
 		if (queue_status == -ENOMEM) {
-			err_str = "ENOMEM (ESB not ready)";
+			err_str = "ENOMEM (FIFO full)";
 		} else if (queue_status == -ENOSPC) {
 			err_str = "ENOSPC (FIFO full)";
 		} else if (queue_status == -EACCES) {
@@ -1388,29 +1928,16 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	}
 
 	/*
-	 * TDMA slot gating for noack sensor-data packets.
-	 *
-	 * PING / ACK packets bypass TDMA (no_ack == false) so time-sync and
-	 * connection-health probes are never delayed.
-	 * Raw data (0x10-0x12) always bypasses TDMA for minimum latency.
-	 */
-#if CONFIG_CONNECTION_TDMA
-	if (no_ack) {
-		if (!is_raw) {
-			tdma_wait_for_slot();
-		}
-	}
-#endif
-	/*
-	 * Record ping send timestamps here — after any TDMA wait — so that
-	 * ping_history[].ping_ticks and ping_send_time reflect the moment the
-	 * radio actually begins transmitting, not when the packet was queued.
-	 * This gives an accurate RTT baseline regardless of TDMA sleep duration.
+	 * Record ping send timestamps here — after TDMA wait and queuing —
+	 * so that ping_history[].ping_ticks and ping_send_time reflect the
+	 * moment the radio actually begins transmitting.
 	 */
 	if (tx_payload.data[0] == ESB_PING_TYPE && queue_status == 0) {
+		unsigned key = irq_lock();
 		ping_history[ping_history_idx].ping_ticks = sys_clock_tick_get_32();
-		ping_send_time = k_uptime_get();
 		ping_history_idx = (ping_history_idx + 1) % PING_HISTORY_SIZE;
+		irq_unlock(key);
+		ping_send_time = k_uptime_get();
 	}
 	/*
 	 * In MANUAL_START mode the radio auto-drains the FIFO once started.
@@ -1418,7 +1945,9 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	 * the TX chain is already running and our queued packet will be
 	 * sent automatically.  No retry or recovery needed.
 	 */
-	esb_start_tx();
+	if (queue_status == 0) {
+		esb_start_queued_tx();
+	}
 }
 
 bool esb_ready(void)
@@ -1521,6 +2050,7 @@ static void esb_thread(void)
 				set_status(SYS_STATUS_CONNECTION_ERROR, true);
 #if USER_SHUTDOWN_ENABLED
 			if (!shutdown_requested && connection_error_start_time > 0
+				&& !connection_get_ota_suppressed()
 				&& k_uptime_get() - connection_error_start_time
 					   > CONFIG_CONNECTION_TIMEOUT_DELAY && get_status(SYS_STATUS_CALIBRATION_RUNNING) == false) // shutdown if receiver is not detected and not in calibrating
 			{
@@ -1534,257 +2064,12 @@ static void esb_thread(void)
 
 		if (received_remote_command != ESB_PONG_FLAG_NORMAL && received_remote_command != acked_remote_command
 			&& remote_command_receive_time > 0) {
-			if (now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
-				switch (received_remote_command) {
-				case ESB_PONG_FLAG_SHUTDOWN:
-					LOG_WRN("Executing remote command: SHUTDOWN");
-					sys_command_shutdown();
-					break;
-
-				case ESB_PONG_FLAG_CALIBRATE:
-					LOG_INF("Executing remote command: CALIBRATE");
-					sensor_request_calibration();
-					break;
-
-				case ESB_PONG_FLAG_SIX_SIDE_CAL:
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-					LOG_INF("Executing remote command: SIX_SIDE_CAL");
-					sensor_request_calibration_6_side();
-#else
-					LOG_WRN("Remote command: SIX_SIDE_CAL not supported (disabled in config)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_MEOW:
-					LOG_INF("Executing remote command: MEOW");
-					remote_print_meow();
-					break;
-
-				case ESB_PONG_FLAG_SCAN:
-					LOG_INF("Executing remote command: SCAN");
-					sensor_request_scan(true);
-					break;
-
-				case ESB_PONG_FLAG_MAG_CLEAR:
-					LOG_INF("Executing remote command: MAG_CLEAR");
-					sensor_calibration_clear_mag(NULL, true);
-					break;
-
-				case ESB_PONG_FLAG_MAG_CAL:
-					LOG_INF("Executing remote command: MAG_CAL");
-					sensor_calibration_clear_mag(NULL, true);
-					sensor_request_calibration_mag();
-					break;
-
-				case ESB_PONG_FLAG_MAG_ON:
-					LOG_INF("Executing remote command: MAG_ON");
-					sensor_set_mag_enabled(true);
-					break;
-
-				case ESB_PONG_FLAG_MAG_OFF:
-					LOG_INF("Executing remote command: MAG_OFF");
-					sensor_set_mag_enabled(false);
-					break;
-
-				case ESB_PONG_FLAG_TCAL_ON:
-					LOG_INF("TODO: Executing remote command: TCAL_ON");
-					break;
-
-				case ESB_PONG_FLAG_TCAL_OFF:
-					LOG_INF("TODO: Executing remote command: TCAL_OFF");
-					break;
-
-				case ESB_PONG_FLAG_TDMA_ON:
-					LOG_INF("Executing remote command: TDMA_ON");
-					tdma_set_enabled(true);
-					break;
-
-				case ESB_PONG_FLAG_TDMA_OFF:
-					LOG_INF("Executing remote command: TDMA_OFF");
-					tdma_set_enabled(false);
-					break;
-
-				case ESB_PONG_FLAG_TEST_MODE_ON:
-					LOG_INF("Executing remote command: TEST_MODE_ON");
-					test_mode_set(true);
-					break;
-
-				case ESB_PONG_FLAG_TEST_MODE_OFF:
-					LOG_INF("Executing remote command: TEST_MODE_OFF");
-					test_mode_set(false);
-					break;
-
-				case ESB_PONG_FLAG_REBOOT:
-					LOG_WRN("Executing remote command: REBOOT");
-					sys_request_system_reboot(false);
-					break;
-
-				case ESB_PONG_FLAG_CLEAR:
-					LOG_WRN("Executing remote command: CLEAR (clear pairing)");
-					esb_clear_pair();
-					break;
-
-				case ESB_PONG_FLAG_DFU:
-#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-					LOG_WRN("Executing remote command: DFU (enter bootloader)");
-#if CONFIG_BUILD_OUTPUT_UF2
-					NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
-					k_msleep(100);
-#endif
-					sys_request_system_reboot(false);
-#else
-					LOG_WRN("Remote command: DFU not supported (no bootloader)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_DFU_OTA:
-#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-					LOG_WRN("Executing remote command: DFU_OTA (enter OTA bootloader)");
-#if CONFIG_BUILD_OUTPUT_UF2
-					NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
-					k_msleep(2);
-#endif
-					sys_request_system_reboot(false);
-#else
-					LOG_WRN("Remote command: DFU_OTA not supported (no bootloader)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_SET_CHANNEL: {
-					// Validate channel value (0-100)
-					if (received_channel_value <= 100) {
-						LOG_INF("Executing remote command: SET_CHANNEL to %u", received_channel_value);
-						// Save to retained memory
-						retained->rf_channel = (uint8_t)received_channel_value;
-						retained_update();
-						// Save to NVS
-						sys_write(
-							RF_CHANNEL_ID,
-							&retained->rf_channel,
-							&retained->rf_channel,
-							sizeof(retained->rf_channel)
-						);
-						LOG_INF("RF channel saved to NVS: %u", retained->rf_channel);
-						// Reinitialize ESB with new channel
-						esb_deinitialize();
-						k_msleep(10);
-						esb_initialize(true); // Channel will be applied inside esb_initialize
-						LOG_INF("ESB reinitialized with channel %u", retained->rf_channel);
-					} else {
-						LOG_ERR("Invalid channel value: %u (must be 0-100)", received_channel_value);
-					}
-				} break;
-
-				case ESB_PONG_FLAG_CLEAR_CHANNEL:
-					LOG_INF("Executing remote command: CLEAR_CHANNEL (restore default)");
-					// Clear saved channel (set to 0xFF = use default)
-					retained->rf_channel = 0xFF;
-					retained_update();
-					sys_write(
-						RF_CHANNEL_ID,
-						&retained->rf_channel,
-						&retained->rf_channel,
-						sizeof(retained->rf_channel)
-					);
-					LOG_INF("RF channel cleared, will use default on next boot");
-					// Reinitialize ESB with default channel
-					esb_deinitialize();
-					k_msleep(10);
-					esb_initialize(true); // Will use default channel since rf_channel is 0xFF
-					LOG_INF("ESB reinitialized with default channel %u", RADIO_RF_CHANNEL);
-					break;
-
-				case ESB_PONG_FLAG_SENS_SET:
-					LOG_INF("Executing remote command: SENS_SET");
-					cmd_sens_set(received_sens_data[0], received_sens_data[1], received_sens_data[2]);
-					break;
-
-				case ESB_PONG_FLAG_SENS_RESET:
-					LOG_INF("Executing remote command: SENS_RESET");
-					cmd_sens_reset();
-					break;
-
-				case ESB_PONG_FLAG_RESET_ZRO:
-					LOG_INF("Executing remote command: RESET_ZRO");
-					cmd_reset_zro();
-					break;
-
-				case ESB_PONG_FLAG_RESET_ACC:
-					LOG_INF("Executing remote command: RESET_ACC");
-					cmd_reset_acc();
-					break;
-
-				case ESB_PONG_FLAG_RESET_BAT:
-					LOG_INF("Executing remote command: RESET_BAT");
-					cmd_reset_bat();
-					break;
-
-				case ESB_PONG_FLAG_RESET_TCAL:
-					LOG_INF("Executing remote command: RESET_TCAL");
-					cmd_reset_tcal();
-					break;
-
-				case ESB_PONG_FLAG_TCAL_AUTO_ON:
-#if CONFIG_SENSOR_USE_TCAL
-					LOG_INF("Executing remote command: TCAL_AUTO_ON");
-					sensor_tcal_set_auto_calibration(true);
-#else
-					LOG_WRN("Remote command: TCAL_AUTO_ON not supported (T-Cal disabled in config)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_TCAL_AUTO_OFF:
-#if CONFIG_SENSOR_USE_TCAL
-					LOG_INF("Executing remote command: TCAL_AUTO_OFF");
-					sensor_tcal_set_auto_calibration(false);
-#else
-					LOG_WRN("Remote command: TCAL_AUTO_OFF not supported (T-Cal disabled in config)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_PING:
-					LOG_INF("Executing remote command: PING");
-					cmd_ping_start();
-					break;
-
-				case ESB_PONG_FLAG_FUSION_RESET:
-					LOG_INF("Executing remote command: FUSION_RESET");
-					cmd_fusion_reset();
-					break;
-
-				case ESB_PONG_FLAG_TCAL_BOOT_ON:
-#if CONFIG_SENSOR_USE_TCAL
-					LOG_INF("Executing remote command: TCAL_BOOT_ON");
-					sensor_boot_cal_set_enabled(true);
-#else
-					LOG_WRN("Remote command: TCAL_BOOT_ON not supported (T-Cal disabled in config)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_TCAL_BOOT_OFF:
-#if CONFIG_SENSOR_USE_TCAL
-					LOG_INF("Executing remote command: TCAL_BOOT_OFF");
-					sensor_boot_cal_set_enabled(false);
-#else
-					LOG_WRN("Remote command: TCAL_BOOT_OFF not supported (T-Cal disabled in config)");
-#endif
-					break;
-
-				case ESB_PONG_FLAG_DATA_COLLECT_ON:
-					LOG_INF("Executing remote command: DATA_COLLECT_ON");
-					connection_set_data_collection(true);
-					test_mode_set(true);  // Prevent sleep during data collection
-					break;
-
-				case ESB_PONG_FLAG_DATA_COLLECT_OFF:
-					LOG_INF("Executing remote command: DATA_COLLECT_OFF");
-					connection_set_data_collection(false);
-					break;
-
-				default:
-					LOG_WRN("Unknown remote command: 0x%02X", received_remote_command);
-					break;
-				}
+			/* OTA commands (0x30-0x33) bypass the safety delay since they are
+			 * time-sensitive and not destructive like SHUTDOWN/CALIBRATE. */
+			bool is_ota_cmd = (received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
+					   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
+			if (is_ota_cmd || now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
+				esb_remote_command_execute(received_remote_command);
 
 				acked_remote_command = received_remote_command;
 

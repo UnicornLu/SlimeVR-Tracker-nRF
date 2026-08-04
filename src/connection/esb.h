@@ -46,6 +46,8 @@ void clocks_request_start(uint32_t delay_us);
 void clocks_request_stop(uint32_t delay_us);
 int esb_initialize(bool);
 void esb_deinitialize(void);
+/* Quiesce TX then re-init PTX (channel/NVS already applied in esb_initialize). */
+int esb_reinitialize(void);
 
 void esb_set_addr_discovery(void);
 void esb_set_addr_paired(void);
@@ -56,6 +58,7 @@ void esb_pair(void);
 void esb_reset_pair(void);
 void esb_clear_pair(void);
 
+void esb_process_ota_rx_queue(void);
 void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give packets some names
 
 #define PING_INTERVAL_MS 997
@@ -68,7 +71,7 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_LEN 13 // with CRC-8
 #define ESB_SENSOR_DATA_LEN 17
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
-#define ESB_COMPOSITE_TYPE 0x05 // Composite packet containing multiple sub-packets
+#define ESB_COMPOSITE_TYPE 0xFE // Composite packet containing multiple sub-packets
 
 // Remote command flags for PONG data[7] (shared with receiver)
 #define ESB_PONG_FLAG_NORMAL 0x00
@@ -107,11 +110,40 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_FLAG_DFU_OTA 0x21       // Enter OTA DFU bootloader
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
+#define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
+#define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
+#define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
+#define ESB_PONG_FLAG_OTA_QUERY_INFO 0x30   // Request firmware info for ESB OTA
+#define ESB_PONG_FLAG_OTA_ABORT 0x31        // Abort ESB OTA update
+#define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
+#define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
 
 // Raw data collection packet types
-#define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
-#define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
+// DEPRECATED on tracker: ESB_RAW_IMU/MAG unused; live TX is ESB_RAW_IMU_QUAT_TYPE.
+// Kept for wire-format docs / receiver + analyzer compatibility.
+#define ESB_RAW_IMU_TYPE    0x10  // DEPRECATED: legacy raw IMU (float)
+#define ESB_RAW_MAG_TYPE    0x11  // DEPRECATED: reserved raw mag
 #define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
+#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (packet-loss resistant)
+#define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
+
+// ACK payload marker for raw-data ARQ retransmit requests (receiver → tracker)
+#define RAW_ARQ_MARKER 0xAA
+
+// ESB_RAW_CAL_TYPE sub-types (byte[2])
+#define RAW_CAL_SUB_ACCEL   0x01  // Accel calibration: accBAinv[4][3] (48 bytes)
+#define RAW_CAL_SUB_MAG     0x02  // Mag calibration: magBAinv[4][3] (48 bytes)
+#define RAW_CAL_SUB_GYRO    0x03  // Gyro cal: gyroBias[3] + gyroSensScale[3] (24 bytes)
+#define RAW_CAL_SUB_TCAL    0x04  // T-Cal state: enabled, count, temp range, correction offset
+#define RAW_CAL_SUB_TCAL_POINTS 0x05  // T-Cal raw points (chunked, 2 per packet)
+
+// ESB OTA packet types (used during firmware update over ESB)
+#define ESB_OTA_DATA_TYPE       0x20  // OTA firmware data (receiver → tracker)
+#define ESB_OTA_STATUS_TYPE     0x21  // OTA status report (tracker → receiver)
+#define ESB_OTA_FW_INFO_TYPE    0x22  // Firmware info report (tracker → receiver)
+#define ESB_OTA_BEGIN_TYPE      0x23  // Begin OTA session (receiver → tracker)
+#define ESB_OTA_VERIFY_TYPE     0x24  // Request CRC verification (receiver → tracker)
+#define ESB_OTA_ACTIVATE_TYPE   0x25  // Activate new firmware (receiver → tracker)
 
 bool esb_ready(void);
 
