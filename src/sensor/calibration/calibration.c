@@ -28,7 +28,6 @@
 
 #include <math.h>
 #include <string.h>
-#include <zephyr/irq.h>
 
 #if CONFIG_CMSIS_DSP
 #include <arm_math.h>
@@ -186,11 +185,8 @@ void sensor_calibration_process_mag(float m[3])
 	//	for (int i = 0; i < 3; i++)
 	//		m[i] -= magBias[i];
 	sensor_sample_mag(m);
-	/* Snap under irq_lock so calibration_thread publish cannot tear the live matrix. */
 	float snap[4][3];
-	unsigned key = irq_lock();
-	memcpy(snap, magBAinv, sizeof(snap));
-	irq_unlock(key);
+	magneto_online_snapshot_BAinv(snap);
 	apply_BAinv(m, snap);
 }
 
@@ -211,23 +207,58 @@ uint8_t *sensor_calibration_get_sensor_data()
 
 void sensor_calibration_read(void)
 {
+	/* Heal NaN/±inf persisted by older builds: validation used v_epsilon(),
+	 * whose CMSIS path treated NaN as in-range, so invalid calibrations could
+	 * be stored with a valid CRC. Clean retained first so the copies below
+	 * and the online-mag install stay finite. */
+	bool healed = false;
+	if (!v_finite(retained->accelBias, 3) || !v_finite(retained->gyroBias, 3)
+	    || !v_finite(retained->magBias, 3)) {
+		memset(retained->accelBias, 0, sizeof(retained->accelBias));
+		memset(retained->gyroBias, 0, sizeof(retained->gyroBias));
+		memset(retained->magBias, 0, sizeof(retained->magBias));
+		healed = true;
+	}
+	if (!v_finite(&retained->accBAinv[0][0], 12)) {
+		sensor_calibration_clear_6_side(retained->accBAinv, false);
+		healed = true;
+	}
+	if (!v_finite(&retained->magBAinv[0][0], 12)) {
+		float identity[4][3] = {{0}};
+		for (int i = 0; i < 3; i++) {
+			identity[i + 1][i] = 1.0f;
+		}
+		memcpy(retained->magBAinv, identity, sizeof(identity));
+		healed = true;
+	}
+	if (!v_finite(retained->gyroSensScale, 3)) {
+		retained->gyroSensScale[0] = 1.0f;
+		retained->gyroSensScale[1] = 1.0f;
+		retained->gyroSensScale[2] = 1.0f;
+		healed = true;
+	}
+	if (healed) {
+		LOG_WRN("Calibration: cleared non-finite values persisted by an older build");
+		retained_update();
+	}
 	memcpy(sensor_data, retained->sensor_data, sizeof(sensor_data));
 	memcpy(accelBias, retained->accelBias, sizeof(accelBias));
 	memcpy(gyroBias, retained->gyroBias, sizeof(gyroBias));
 	memcpy(magBias, retained->magBias, sizeof(magBias));
-	{
-		unsigned key = irq_lock();
-		memcpy(magBAinv, retained->magBAinv, sizeof(magBAinv));
-		irq_unlock(key);
-	}
 	memcpy(accBAinv, retained->accBAinv, sizeof(accBAinv));
 	if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
 		retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
 	}
+	magneto_online_replace_BAinv_and_reset(retained->magBAinv);
+	magneto_online_runtime_configure(
+		retained->mag_online_calibration_mode != MAG_ONLINE_CALIBRATION_DISABLED
+	);
 	LOG_INF("Online mag calibration: %s", sensor_calibration_get_online_mag_enabled() ? "enabled" : "disabled");
 	if (sensor_calibration_get_online_mag_enabled()) {
 		float zero[3] = {0};
-		if (v_diff_mag(magBAinv[0], zero) != 0) {
+		float live_snapshot[4][3];
+		magneto_online_snapshot_BAinv(live_snapshot);
+		if (v_diff_mag(live_snapshot[0], zero) != 0) {
 			magneto_online_runtime_load_retained();
 			if (cal_online_mag_update_count() > 0 || cal_online_mag_norm_count() > 0) {
 				LOG_INF(
@@ -236,11 +267,7 @@ void sensor_calibration_read(void)
 					cal_online_mag_norm_count()
 				);
 			}
-		} else {
-			magneto_online_runtime_reset();
 		}
-	} else {
-		magneto_online_runtime_reset();
 	}
 #if CONFIG_SENSOR_USE_TCAL
 	sensor_tcal_runtime_init_from_retained();
@@ -256,7 +283,10 @@ int sensor_calibration_validate(float *a_bias, float *g_bias, bool write)
 		g_bias = gyroBias;
 	}
 	float zero[3] = {0};
-	if (!v_epsilon(a_bias, zero, 0.5) || !v_epsilon(g_bias, zero, 50.0)) // check accel is <0.5G and gyro <50dps
+	/* NaN/±inf first: v_epsilon()'s CMSIS path (arm_sqrt_f32 returns 0 for
+	 * NaN) treats NaN as in-range, so a NaN calibration would pass. */
+	if (!v_finite(a_bias, 3) || !v_finite(g_bias, 3)
+	    || !v_epsilon(a_bias, zero, 0.5) || !v_epsilon(g_bias, zero, 50.0)) // check accel is <0.5G and gyro <50dps
 	{
 		sensor_calibration_clear(a_bias, g_bias, write);
 		// Validation failure: do NOT call any fusion function
@@ -281,7 +311,8 @@ int sensor_calibration_validate_6_side(float a_inv[][3], bool write)
 	}
 	float magnitude = v_avg(diagonal);
 	float average[3] = {magnitude, magnitude, magnitude};
-	if (!v_epsilon(a_inv[0], zero, 0.5)
+	if (!v_finite(&a_inv[0][0], 12) // NaN/±inf must never pass (v_epsilon CMSIS leak)
+		|| !v_epsilon(a_inv[0], zero, 0.5)
 		|| !v_epsilon(diagonal, average, magnitude * 0.1f)) // check accel is <0.5G and diagonals are within 10%
 	{
 		sensor_calibration_clear_6_side(a_inv, write);
@@ -295,11 +326,14 @@ int sensor_calibration_validate_6_side(float a_inv[][3], bool write)
 
 int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 {
+	bool validating_live_state = m_inv == NULL;
+	float live_snapshot[4][3];
 	if (m_inv == NULL) {
-		m_inv = magBAinv;
+		magneto_online_snapshot_BAinv(live_snapshot);
+		m_inv = live_snapshot;
 	}
 	if (!mag_bainv_structurally_ok(m_inv, 0.0f)) {
-		sensor_calibration_clear_mag(m_inv, write);
+		sensor_calibration_clear_mag(validating_live_state ? NULL : m_inv, write);
 		LOG_WRN("Invalidated calibration");
 		LOG_WRN("The magnetometer may be damaged or calibration was not completed properly");
 		return -1;
@@ -356,14 +390,10 @@ void sensor_calibration_clear_6_side(float a_inv[][3], bool write)
 void sensor_calibration_clear_mag(float m_inv[][3], bool write)
 {
 	bool clearing_live_state = (m_inv == NULL || m_inv == magBAinv);
-	if (m_inv == NULL) {
-		m_inv = magBAinv;
-	}
+	float cleared[4][3] = {0};
 	if (clearing_live_state) {
-		unsigned key = irq_lock();
-		memset(m_inv, 0, sizeof(magBAinv)); // zeroed matrix will disable magnetometer in fusion
-		irq_unlock(key);
-		magneto_online_runtime_reset();
+		magneto_online_replace_BAinv_and_reset(cleared);
+		m_inv = cleared;
 	} else {
 		memset(m_inv, 0, sizeof(magBAinv));
 	}

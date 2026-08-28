@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
+#include "system/uptime.h"
 #include "system/watchdog.h"
 #include "util.h"
 
@@ -41,7 +42,8 @@ LOG_MODULE_REGISTER(cal_tcal_runtime, LOG_LEVEL_INF);
 #define TCAL_ACCUM_FLUSH_INTERVAL_MS 25000
 #define TCAL_ACCUM_MIN_SAMPLES 2000
 #define TCAL_ACCUM_TEMP_DRIFT_MAX 0.53f
-#define TCAL_ACCUM_GYRO_RANGE_THRESHOLD 1.5f
+#define TCAL_ACCUM_GYRO_RANGE_THRESHOLD 5.0f /* dps, windowed-mean range method */
+#define TCAL_ACCUM_GYRO_MOTION_WINDOW_MS 250 /* ms - smooth raw gyro noise before range check */
 
 #define TCAL_SAVE_SIGNIFICANCE_THRESHOLD 0.002f
 
@@ -64,6 +66,13 @@ static struct {
 	double temp_sum;
 	int sample_count;
 	int temp_count;
+	/* Gyro motion gate uses the range of short-window MEANS, not raw samples:
+	 * a large but stable zero-rate offset plus high-frequency noise (e.g.
+	 * >10 dps spread while stationary) must not abort accumulation. */
+	double gyro_win_sum[3];
+	int gyro_win_count;
+	int gyro_win_samples;
+	bool gyro_win_tracked;
 	float min_g[3];
 	float max_g[3];
 	float min_a[3];
@@ -121,6 +130,28 @@ const char *sensor_tcal_get_apply_mode_name(void)
 
 void sensor_tcal_runtime_init_from_retained(void)
 {
+	/* Heal NaN/±inf points persisted by older builds: one bad point breaks
+	 * every MLS/LUT lookup (NaN weights never fall below the min-weight
+	 * gate), so clear it and recompute the point count. */
+	uint8_t healed_points = 0;
+	uint8_t valid_points = 0;
+	for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+		if (!v_finite(&retained->tempCalPoints[i].temp, 1)
+		    || !v_finite(retained->tempCalPoints[i].bias, 3)) {
+			LOG_WRN("T-Cal: clearing non-finite calibration point at slot %d", i);
+			memset(&retained->tempCalPoints[i], 0, sizeof(retained->tempCalPoints[i]));
+			healed_points++;
+		}
+		if (retained->tempCalPoints[i].temp != 0.0f) {
+			valid_points++;
+		}
+	}
+	if (healed_points > 0) {
+		retained->tempCalState.count = valid_points;
+		retained->tempCalState.valid = false;
+		retained_update();
+	}
+
 	tcal_compensation_enabled = retained->tcal_enabled;
 	sensor_tcal_refresh_apply_cache();
 	LOG_INF(
@@ -236,6 +267,12 @@ static void tcal_save_point(int idx, const float bias[3], float measured_temp)
 	}
 	if (isnan(measured_temp)) {
 		LOG_WRN("T-Cal: Invalid measured temperature, skipping save");
+		return;
+	}
+	/* One NaN point breaks every MLS/LUT lookup (NaN weights pass the
+	 * min-weight gate), so never commit a non-finite bias. */
+	if (!v_finite(bias, 3)) {
+		LOG_WRN("T-Cal: Non-finite bias, skipping save");
 		return;
 	}
 
@@ -417,17 +454,23 @@ void sensor_tcal_feed_continuous_sample(const float g[3], float temp)
 		return;
 	}
 
+	// A NaN/±inf sample would poison gyro_sum and be committed as a NaN
+	// calibration point (tcal_save_point validates temperature only).
+	if (!v_finite(g, 3)) {
+		return;
+	}
+
 	// Initialize accumulator on first sample
 	if (!tcal_accum.active) {
 		tcal_accum_reset();
 		tcal_accum.active = true;
 		tcal_accum.start_time = k_uptime_get();
-		tcal_accum.min_g[0] = g[0];
-		tcal_accum.min_g[1] = g[1];
-		tcal_accum.min_g[2] = g[2];
-		tcal_accum.max_g[0] = g[0];
-		tcal_accum.max_g[1] = g[1];
-		tcal_accum.max_g[2] = g[2];
+		tcal_accum.gyro_win_sum[0] = 0.0;
+		tcal_accum.gyro_win_sum[1] = 0.0;
+		tcal_accum.gyro_win_sum[2] = 0.0;
+		tcal_accum.gyro_win_count = 0;
+		tcal_accum.gyro_win_tracked = false;
+		tcal_accum.gyro_win_samples = MAX(1, (int)(sensor_get_gyro_odr() * TCAL_ACCUM_GYRO_MOTION_WINDOW_MS / 1000.0f));
 		tcal_accum.temp_min = temp;
 		tcal_accum.temp_max = temp;
 		tcal_accum.accel_peek_div = 0;
@@ -439,22 +482,39 @@ void sensor_tcal_feed_continuous_sample(const float g[3], float temp)
 		}
 	}
 
-	// Motion detection: gyro peak–peak
+	// Motion detection: gyro windowed-mean range
 	for (int j = 0; j < 3; j++) {
-		if (g[j] < tcal_accum.min_g[j]) {
-			tcal_accum.min_g[j] = g[j];
+		tcal_accum.gyro_win_sum[j] += (double)g[j];
+	}
+	tcal_accum.gyro_win_count++;
+	if (tcal_accum.gyro_win_count >= tcal_accum.gyro_win_samples) {
+		for (int j = 0; j < 3; j++) {
+			float win_mean = (float)(tcal_accum.gyro_win_sum[j] / tcal_accum.gyro_win_count);
+			tcal_accum.gyro_win_sum[j] = 0.0;
+			if (!tcal_accum.gyro_win_tracked) {
+				tcal_accum.min_g[j] = win_mean;
+				tcal_accum.max_g[j] = win_mean;
+			} else {
+				if (win_mean < tcal_accum.min_g[j]) {
+					tcal_accum.min_g[j] = win_mean;
+				}
+				if (win_mean > tcal_accum.max_g[j]) {
+					tcal_accum.max_g[j] = win_mean;
+				}
+			}
 		}
-		if (g[j] > tcal_accum.max_g[j]) {
-			tcal_accum.max_g[j] = g[j];
-		}
-		if (tcal_accum.max_g[j] - tcal_accum.min_g[j] > TCAL_ACCUM_GYRO_RANGE_THRESHOLD) {
-			LOG_DBG(
-				"T-Cal: Gyro motion in accumulator, axis %d (range: %.3f dps), resetting",
-				j,
-				(double)(tcal_accum.max_g[j] - tcal_accum.min_g[j])
-			);
-			tcal_accum_reset();
-			return;
+		tcal_accum.gyro_win_count = 0;
+		tcal_accum.gyro_win_tracked = true;
+		for (int j = 0; j < 3; j++) {
+			if (tcal_accum.max_g[j] - tcal_accum.min_g[j] > TCAL_ACCUM_GYRO_RANGE_THRESHOLD) {
+				LOG_DBG(
+					"T-Cal: Gyro motion in accumulator, axis %d (windowed-mean range: %.3f dps), resetting",
+					j,
+					(double)(tcal_accum.max_g[j] - tcal_accum.min_g[j])
+				);
+				tcal_accum_reset();
+				return;
+			}
 		}
 	}
 
@@ -837,7 +897,12 @@ static int sensor_tcal_calculate_doffset(const float measured_bias[3], float tem
 		float doffset = measured_bias[axis] - curve_bias[axis];
 
 		// Apply threshold: if D_offset is too small, it's likely noise - don't correct
-		if (fabsf(doffset) < BOOT_CAL_DOFFSET_MIN_THRESHOLD) {
+		// Reject NaN/±inf (all-ones exponent): NaN < threshold is false, so the
+		// plain comparison would persist NaN into retained memory.
+		uint32_t doffset_bits;
+		memcpy(&doffset_bits, &doffset, sizeof(doffset_bits));
+		if ((doffset_bits & 0x7F800000u) == 0x7F800000u
+		    || fabsf(doffset) < BOOT_CAL_DOFFSET_MIN_THRESHOLD) {
 			retained->bootCalState.doffset[axis] = 0.0f;
 		} else {
 			retained->bootCalState.doffset[axis] = doffset;
@@ -880,7 +945,7 @@ void sensor_tcal_boot_calibration_check(void)
 	}
 
 	// Check time window using uptime
-	int64_t uptime = k_uptime_get();
+	int64_t uptime = system_uptime_since_boot_ms();
 
 	// Before window starts
 	if (uptime < BOOT_CAL_TIME_WINDOW_START_MS) {

@@ -44,7 +44,14 @@ enum sensor_interface_spec
 
 typedef struct sensor_ext_ssi {
 	int (*ext_write)(const uint8_t addr, const uint8_t *buf, uint32_t num_bytes);
+	/* Single I2CM transaction: write num_write bytes (a register address), then
+	 * read num_read register-data bytes. num_read counts register data only;
+	 * any device-internal dummy bytes are an IMU-driver concern, not part of
+	 * this budget. */
 	int (*ext_write_read)(const uint8_t addr, const void *write_buf, size_t num_write, void *read_buf, size_t num_read);
+	/* Max register-data bytes readable in one I2CM transaction. Requests longer
+	 * than this are segmented by the interface layer (sub-register advanced by
+	 * the number of data bytes already read). */
 	uint8_t ext_burst;
 } sensor_ext_ssi_t;
 
@@ -60,6 +67,7 @@ bool sensor_interface_imu_is_i2c(void);
 int sensor_interface_spi_configure(enum sensor_interface_dev dev, uint32_t frequency, uint32_t dummy_reads);
 void sensor_interface_ext_configure(const sensor_ext_ssi_t *ext);
 const sensor_ext_ssi_t *sensor_interface_ext_get(void);
+enum sensor_interface_spec sensor_interface_get_spec(enum sensor_interface_dev dev);
 
 int ssi_write(enum sensor_interface_dev dev, const uint8_t *buf, uint32_t num_bytes);
 int ssi_read(enum sensor_interface_dev dev, uint8_t *buf, uint32_t num_bytes);

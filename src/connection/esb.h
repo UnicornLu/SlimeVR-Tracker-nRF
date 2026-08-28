@@ -24,20 +24,43 @@
 #define SLIMENRF_ESB
 
 #include <esb.h>
-#include <nrfx_timer.h>
 
-// TODO: timer?
 #define LAST_RESET_LIMIT 10
 extern uint8_t last_reset;
-// TODO: move to esb/timer
-// extern const nrfx_timer_t m_timer;
 extern bool esb_state;
-extern bool timer_state;
 
-// TODO: esb/sensor?
 extern uint16_t led_clock;
 extern uint32_t led_clock_offset;
 
+/* ---------------------------------------------------------------------------
+ * RF channel storage encoding (retained/NVS byte).
+ *
+ * User-facing channel is 0-100. Stored byte encodes:
+ *   0xFF        -> default channel (CONFIG_RADIO_RF_CHANNEL)
+ *   0           -> invalid/uninitialized (legacy data) -> default
+ *   128         -> channel 0
+ *   1..100      -> channel value
+ *
+ * Keeps 0 unambiguous as "no setting" so upgrading old devices can never
+ * accidentally land on channel 0. */
+#define ESB_RF_CHANNEL_DEFAULT 0xFF
+#define ESB_RF_CHANNEL_ZERO_ENC 128
+
+static inline uint8_t esb_rf_channel_encode(uint8_t channel)
+{
+	return channel == 0 ? ESB_RF_CHANNEL_ZERO_ENC : channel;
+}
+
+static inline uint8_t esb_rf_channel_decode(uint8_t stored)
+{
+	if (stored == ESB_RF_CHANNEL_ZERO_ENC) {
+		return 0; /* channel 0 */
+	}
+	if (stored == ESB_RF_CHANNEL_DEFAULT || stored == 0 || stored > 100) {
+		return ESB_RF_CHANNEL_DEFAULT; /* default (incl. legacy/invalid) */
+	}
+	return stored;
+}
 void esb_write_ack(uint8_t type);
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
@@ -59,7 +82,7 @@ void esb_reset_pair(void);
 void esb_clear_pair(void);
 
 void esb_process_ota_rx_queue(void);
-void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give packets some names
+int esb_write(uint8_t *data, bool no_ack, size_t data_length);
 
 #define PING_INTERVAL_MS 997
 // Ping/Pong types for ACK payload validation

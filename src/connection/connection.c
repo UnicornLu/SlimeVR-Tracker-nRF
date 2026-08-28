@@ -23,9 +23,11 @@
 #include "globals.h"
 #include "sensor/sensor.h"
 #include "sensor/calibration/calibration.h"
+#include "sensor/calibration/online_mag.h"
 #include "connection.h"
 #include "util.h"
 #include "esb.h"
+#include "sensor_data_snapshot.h"
 #include "tdma.h"
 #include "build_defines.h"
 #include "hid.h"
@@ -34,6 +36,9 @@
 #include "system/watchdog.h"
 #include "system/test_mode.h"
 #include "system/esb_ota.h"
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+#include "radio_capture.h"
+#endif
 
 #include <math.h>
 #include <stdbool.h>
@@ -44,67 +49,134 @@
 
 static uint8_t tracker_id, batt, batt_v, sensor_temp, imu_id, mag_id, tracker_status;
 static uint8_t tracker_svr_status = SVR_STATUS_OK;
-/*
- * Seqlock publish: sensor thread writes, connection thread reads.
- * Odd seq = write in progress; reader retries. No irq_lock.
- */
-static float sensor_q[4], sensor_a[3], sensor_m[3];
-static bool send_precise_quat;
-static atomic_t sensor_qa_seq;
-static atomic_t sensor_m_seq;
+static sensor_data_snapshot_t sensor_data_snapshot;
+static float sensor_last_q[4];
 static bool sensor_ids_set = false; /* true after connection_update_sensor_ids() first called */
 static K_SEM_DEFINE(connection_wake_sem, 0, 1);
 
 static void connection_sensor_snap_q_a(float q_out[4], float a_out[3])
 {
-	unsigned s;
-	do {
-		s = (unsigned)atomic_get(&sensor_qa_seq);
-		if (s & 1U) {
-			k_yield(); /* writer mid-update; never busy-spin to WDT */
-			continue;
-		}
-		memcpy(q_out, sensor_q, sizeof(sensor_q));
-		memcpy(a_out, sensor_a, sizeof(sensor_a));
-	} while ((unsigned)atomic_get(&sensor_qa_seq) != s);
+	sensor_data_snapshot_read_qa(&sensor_data_snapshot, q_out, a_out);
 }
 
 static void connection_sensor_snap_q_m(float q_out[4], float m_out[3])
 {
-	unsigned sq;
-	unsigned sm;
-	do {
-		sq = (unsigned)atomic_get(&sensor_qa_seq);
-		sm = (unsigned)atomic_get(&sensor_m_seq);
-		if ((sq | sm) & 1U) {
-			k_yield();
-			continue;
-		}
-		memcpy(q_out, sensor_q, sizeof(sensor_q));
-		memcpy(m_out, sensor_m, sizeof(sensor_m));
-	} while ((unsigned)atomic_get(&sensor_qa_seq) != sq || (unsigned)atomic_get(&sensor_m_seq) != sm);
+	sensor_data_snapshot_read_qm(&sensor_data_snapshot, q_out, m_out);
 }
 
 static bool connection_sensor_get_precise_quat(void)
 {
-	unsigned s;
-	bool precise;
-	do {
-		s = (unsigned)atomic_get(&sensor_qa_seq);
-		if (s & 1U) {
-			k_yield();
-			continue;
-		}
-		precise = send_precise_quat;
-	} while ((unsigned)atomic_get(&sensor_qa_seq) != s);
-	return precise;
+	return sensor_data_snapshot_is_precise(&sensor_data_snapshot);
 }
 
 static uint8_t packet_sequence = 0;
-static int64_t last_ping_time = 0;
+static atomic_t next_ping_deadline_ms = ATOMIC_INIT(0);
+static atomic_t ping_server_phase_aligned = ATOMIC_INIT(0);
 static uint32_t ping_interval_ms = PING_INTERVAL_MS;
+static uint32_t ping_aligned_interval_ms;
 
 #define PING_RESYNC_MIN_INTERVAL_MS 500
+#define PING_QUEUE_RETRY_MS 50
+#define PING_SERVER_PHASE_TOLERANCE_MS 2
+
+static struct {
+	atomic_t due;
+	atomic_t attempts;
+	atomic_t queue_ok;
+	atomic_t queue_fail;
+	atomic_t retry_deferred;
+	atomic_t attempts_in_window;
+	atomic_t attempts_rate_max;
+	atomic_t window_started_ms;
+} ping_sched_stats;
+static atomic_t ping_resync_requested;
+
+static uint32_t ping_phase_ms(uint32_t interval_ms)
+{
+	if (interval_ms == 0) {
+		return 0;
+	}
+	return ((uint32_t)(tracker_id % TDMA_MAX_TRACKERS) * interval_ms) / TDMA_MAX_TRACKERS;
+}
+
+static uint32_t ping_next_periodic_deadline(uint32_t previous_deadline, uint32_t now, uint32_t interval_ms)
+{
+	uint32_t next = previous_deadline + interval_ms;
+	if ((int32_t)(next - now) <= 0) {
+		next = now + interval_ms;
+	}
+	return next;
+}
+
+static uint32_t ping_server_phase_delay_ms(uint32_t interval_ms)
+{
+	uint64_t server_ticks = esb_get_server_time_ticks_64();
+	if (server_ticks == 0 || interval_ms == 0) {
+		return 0;
+	}
+
+	uint32_t interval_ticks = (uint32_t)(((uint64_t)interval_ms * 32768U + 500U) / 1000U);
+	uint32_t phase_ticks
+		= (uint32_t)(((uint64_t)ping_phase_ms(interval_ms) * 32768U + 500U) / 1000U);
+	uint32_t server_phase_ticks = (uint32_t)(server_ticks % interval_ticks);
+	uint32_t delay_ticks = phase_ticks >= server_phase_ticks ? phase_ticks - server_phase_ticks
+											  : interval_ticks - server_phase_ticks + phase_ticks;
+	uint32_t delay_ms = (uint32_t)(((uint64_t)delay_ticks * 1000U + 32767U) / 32768U);
+	if (delay_ms <= PING_SERVER_PHASE_TOLERANCE_MS) {
+		delay_ms += interval_ms;
+	}
+	return delay_ms;
+}
+
+static void ping_stats_attempt(uint32_t now)
+{
+	uint32_t window_started_ms = (uint32_t)atomic_get(&ping_sched_stats.window_started_ms);
+	if (window_started_ms == 0) {
+		atomic_set(&ping_sched_stats.window_started_ms, (atomic_val_t)now);
+	} else if (now - window_started_ms >= 1000) {
+		uint32_t attempts = (uint32_t)atomic_set(&ping_sched_stats.attempts_in_window, 0);
+		uint32_t max_rate = (uint32_t)atomic_get(&ping_sched_stats.attempts_rate_max);
+		if (attempts > max_rate) {
+			atomic_set(&ping_sched_stats.attempts_rate_max, (atomic_val_t)attempts);
+		}
+		atomic_set(&ping_sched_stats.window_started_ms, (atomic_val_t)now);
+	}
+	atomic_inc(&ping_sched_stats.attempts_in_window);
+}
+
+static void connection_signal_wake(void);
+
+void connection_request_ping_resync(void)
+{
+	/* Called from ESB event context. The connection thread owns the deadline. */
+	atomic_set(&ping_resync_requested, 1);
+	atomic_set(&ping_server_phase_aligned, 0);
+	ping_aligned_interval_ms = 0;
+	atomic_set(&next_ping_deadline_ms, (atomic_val_t)k_uptime_get_32());
+	connection_signal_wake();
+}
+
+void connection_print_ping_stats(void)
+{
+	uint32_t attempts_in_window = (uint32_t)atomic_get(&ping_sched_stats.attempts_in_window);
+	uint32_t max_rate = (uint32_t)atomic_get(&ping_sched_stats.attempts_rate_max);
+	if (attempts_in_window > max_rate) {
+		max_rate = attempts_in_window;
+	}
+	printk(
+		"PING SCHED due=%u attempt=%u queue_ok=%u queue_fail=%u retry_deferred=%u rate_max=%u/s next_ms=%u phase_ms=%u aligned=%u resync_pending=%u\n",
+		(uint32_t)atomic_get(&ping_sched_stats.due),
+		(uint32_t)atomic_get(&ping_sched_stats.attempts),
+		(uint32_t)atomic_get(&ping_sched_stats.queue_ok),
+		(uint32_t)atomic_get(&ping_sched_stats.queue_fail),
+		(uint32_t)atomic_get(&ping_sched_stats.retry_deferred),
+		max_rate,
+		(uint32_t)atomic_get(&next_ping_deadline_ms),
+		ping_phase_ms(get_ping_interval_ms()),
+		(uint32_t)atomic_get(&ping_server_phase_aligned),
+		(uint32_t)atomic_get(&ping_resync_requested)
+	);
+}
 
 LOG_MODULE_REGISTER(connection, LOG_LEVEL_INF);
 
@@ -119,7 +191,6 @@ uint32_t get_ping_interval_ms(void)
 	return ping_interval_ms + esb_get_ping_backoff_ms();
 }
 
-static void connection_signal_wake(void);
 static void connection_thread(void);
 K_THREAD_DEFINE(connection_thread_id, 2048, connection_thread, NULL, NULL, NULL, CONNECTION_THREAD_PRIORITY, K_FP_REGS, 0);
 
@@ -151,6 +222,12 @@ uint8_t connection_get_id(void)
 void connection_set_id(uint8_t id)
 {
 	tracker_id = id;
+	atomic_set(&ping_server_phase_aligned, 0);
+	ping_aligned_interval_ms = 0;
+	atomic_set(
+		&next_ping_deadline_ms,
+		(atomic_val_t)(k_uptime_get_32() + ping_phase_ms(PING_INTERVAL_MS))
+	);
 	tdma_init(id);
 }
 
@@ -259,6 +336,8 @@ static int fill_sub_runtime(uint8_t *buf)
 
 struct composite_builder {
 	uint8_t types[5];
+	int64_t *last_times[5];
+	int64_t stamps[5];
 	int n;
 	int used;
 };
@@ -320,51 +399,68 @@ static void fill_normal_packet(uint8_t type, uint8_t data[16])
 	}
 }
 
-static void write_normal_packet(const uint8_t data[16])
+static bool write_normal_packet(const uint8_t data[16])
 {
+	/* Radio unavailable: HID is the configured output path, so its
+	 * enqueue success is the send success. */
+	if (!esb_ready()) {
+#if CONFIG_CONNECTION_OVER_HID
+		if (!connection_hid_output_ready()) {
+			return false;
+		}
+		return hid_write_packet_n(data);
+#else
+		return false;
+#endif
+	}
+
+	/* Radio available: only ESB queue success counts, so a failed
+	 * admission cannot consume the test-rate slot or mirror to HID;
+	 * HID stays a mirror of successful sends. */
+	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
+
+	memcpy(esb_pkt, data, 16);
+	esb_pkt[16] = packet_sequence;
+	if (esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN) != 0) {
+		return false;
+	}
+	packet_sequence++;
 #if CONFIG_CONNECTION_OVER_HID
 	if (connection_hid_output_ready()) {
 		hid_write_packet_n(data);
 	}
 #endif
-
-	if (!esb_ready()) {
-		return;
-	}
-
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence++;
-	esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN);
+	return true;
 }
 
 #if CONFIG_CONNECTION_OVER_HID
-static void write_hid_packet_type(uint8_t type)
+static bool write_hid_packet_type(uint8_t type)
 {
 	if (!connection_hid_output_ready()) {
-		return;
+		return false;
 	}
 
 	uint8_t data[16];
 
 	fill_normal_packet(type, data);
-	hid_write_packet_n(data);
+	return hid_write_packet_n(data);
 }
 
-static void write_hid_composite_as_normal_packets(const struct composite_builder *builder)
+static bool write_hid_composite_as_normal_packets(const struct composite_builder *builder)
 {
+	bool queued = true;
 	for (int i = 0; i < builder->n; i++) {
-		write_hid_packet_type(builder->types[i]);
+		queued &= write_hid_packet_type(builder->types[i]);
 	}
+	return queued;
 }
 #endif
 
-static void connection_write_packet_type(uint8_t type)
+static bool connection_write_packet_type(uint8_t type)
 {
 	uint8_t data[16];
 	fill_normal_packet(type, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
 void connection_update_sensor_ids(int imu, int mag)
@@ -373,9 +469,6 @@ void connection_update_sensor_ids(int imu, int mag)
 	mag_id = get_server_constant_mag_id(mag);
 	sensor_ids_set = true;
 }
-
-static int64_t quat_update_time = 0;
-static int64_t last_quat_time = 0;
 
 void connection_update_sensor_data(float *q, float *a, int64_t data_time)
 {
@@ -388,26 +481,17 @@ void connection_update_sensor_data(float *q, float *a, int64_t data_time)
 		return;
 	}
 
-	unsigned s = (unsigned)atomic_get(&sensor_qa_seq);
-	atomic_set(&sensor_qa_seq, (atomic_val_t)(s + 1U)); /* odd = writing */
-	send_precise_quat = q_epsilon(q, sensor_q, 0.005f);
-	memcpy(sensor_q, q, sizeof(sensor_q));
-	memcpy(sensor_a, a, sizeof(sensor_a));
-	atomic_set(&sensor_qa_seq, (atomic_val_t)(s + 2U)); /* even = stable */
-	quat_update_time = k_uptime_get();
+	bool precise = q_epsilon(q, sensor_last_q, 0.005f);
+	memcpy(sensor_last_q, q, sizeof(sensor_last_q));
+	sensor_data_snapshot_publish_qa(&sensor_data_snapshot, q, a, precise);
 	connection_signal_wake();
 }
 
-static int64_t mag_update_time = 0;
 static int64_t last_mag_time = 0;
 
 void connection_update_sensor_mag(float *m)
 {
-	unsigned s = (unsigned)atomic_get(&sensor_m_seq);
-	atomic_set(&sensor_m_seq, (atomic_val_t)(s + 1U));
-	memcpy(sensor_m, m, sizeof(sensor_m));
-	atomic_set(&sensor_m_seq, (atomic_val_t)(s + 2U));
-	mag_update_time = k_uptime_get();
+	sensor_data_snapshot_publish_m(&sensor_data_snapshot, m);
 	connection_signal_wake();
 }
 
@@ -487,53 +571,53 @@ void connection_update_status(int status)
 //| |4      |id      |q0               |q1               |q2               |q3               |m0 |m1 |m2 |
 //| |5      |id      |runtime (uint64, us)                              |resv              |rssi |
 
-void connection_write_packet_0() // device info
+bool connection_write_packet_0() // device info
 {
 	uint8_t data[16];
 
 	fill_normal_packet(0, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
-void connection_write_packet_1() // full precision quat and accel
+bool connection_write_packet_1() // full precision quat and accel
 {
 	uint8_t data[16];
 
 	fill_normal_packet(1, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
-void connection_write_packet_2() // reduced precision quat and accel with battery,
-								 // temp, and rssi
+bool connection_write_packet_2() // reduced precision quat and accel with battery,
+				 // temp, and rssi
 {
 	uint8_t data[16];
 
 	fill_normal_packet(2, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
-void connection_write_packet_3() // status
+bool connection_write_packet_3() // status
 {
 	uint8_t data[16];
 
 	fill_normal_packet(3, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
-void connection_write_packet_4() // full precision quat and magnetometer
+bool connection_write_packet_4() // full precision quat and magnetometer
 {
 	uint8_t data[16];
 
 	fill_normal_packet(4, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
-void connection_write_packet_5() // runtime estimate
+bool connection_write_packet_5() // runtime estimate
 {
 	uint8_t data[16];
 
 	fill_normal_packet(5, data);
-	write_normal_packet(data);
+	return write_normal_packet(data);
 }
 
 static int64_t last_info_time = 0;
@@ -582,7 +666,7 @@ struct raw_imu_queued {
 K_MSGQ_DEFINE(raw_imu_msgq, sizeof(struct raw_imu_queued), RAW_IMU_QUEUE_SIZE, 4);
 
 static uint16_t raw_sequence = 0;
-static bool data_collection_active = false;
+static atomic_t data_collection_active;
 static volatile bool ota_suppressed = false; /* Reduce poll rate during parallel OTA */
 static int64_t ota_suppress_start_time = 0;  /* Timestamp when suppress was enabled */
 #define OTA_SUPPRESS_TIMEOUT_MS (10 * 60 * 1000)
@@ -618,9 +702,11 @@ static uint8_t raw_metadata_buf[RAW_PACKET_SIZE];
 #define RAW_META_CAL_DRIP_MS 200
 static int64_t raw_meta_cal_last_ms = 0;
 
-/* Latest mag for piggyback: seqlock; 0=empty, odd=writing, even>0=valid */
-static float latest_mag[3] = {0};
-static atomic_t latest_mag_seq;
+static struct k_spinlock latest_mag_lock;
+static float latest_mag[3];
+static uint32_t latest_mag_session;
+static bool latest_mag_valid;
+static atomic_t raw_collection_session;
 
 /* Calibration drip-feed state (one packet per connection cycle) */
 static bool raw_cal_pending = false;
@@ -692,14 +778,21 @@ static void connection_align_mag_BAinv_body(float out[4][3], const float in[4][3
 
 void connection_set_data_collection(bool enable)
 {
-	if (enable && !data_collection_active) {
+	bool was_active = atomic_get(&data_collection_active) != 0;
+	if (!enable) {
+		atomic_set(&data_collection_active, 0);
+	}
+	if (enable && !was_active) {
 		/* Flush any stale data in queues */
 		k_msgq_purge(&raw_imu_msgq);
 		raw_sequence = 0;
 		raw_metadata_sent = false;
 		raw_metadata_pending = false;
 		raw_meta_cal_last_ms = 0;
-		atomic_set(&latest_mag_seq, 0);
+		atomic_inc(&raw_collection_session);
+		k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
+		latest_mag_valid = false;
+		k_spin_unlock(&latest_mag_lock, mag_key);
 		raw_cal_pending = false;
 		/* Reset ARQ state */
 		memset(raw_ring_valid, 0, sizeof(raw_ring_valid));
@@ -707,14 +800,20 @@ void connection_set_data_collection(bool enable)
 		raw_retx_count = 0;
 		irq_unlock(key);
 		raw_retx_total = 0;
+	} else if (!enable && was_active) {
+		k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
+		latest_mag_valid = false;
+		k_spin_unlock(&latest_mag_lock, mag_key);
 	}
-	data_collection_active = enable;
+	if (enable) {
+		atomic_set(&data_collection_active, 1);
+	}
 	LOG_INF("Data collection %s", enable ? "STARTED" : "STOPPED");
 }
 
 bool connection_get_data_collection(void)
 {
-	return data_collection_active;
+	return atomic_get(&data_collection_active) != 0;
 }
 
 void connection_set_ota_suppressed(bool suppressed)
@@ -735,7 +834,7 @@ bool connection_get_ota_suppressed(void)
 
 void connection_queue_raw_sample(const struct raw_imu_sample *sample)
 {
-	if (!data_collection_active) {
+	if (!connection_get_data_collection()) {
 		return;
 	}
 
@@ -754,17 +853,21 @@ void connection_queue_raw_sample(const struct raw_imu_sample *sample)
 
 void connection_queue_raw_mag(const float mag[3])
 {
-	if (!data_collection_active) {
+	if (!connection_get_data_collection()) {
 		return;
 	}
+	uint32_t session = (uint32_t)atomic_get(&raw_collection_session);
 
-	/* Store latest mag for piggybacking onto IMU packets */
 	float aligned[3];
 	connection_align_mag_body(mag, aligned);
-	unsigned s = (unsigned)atomic_get(&latest_mag_seq) & ~1U;
-	atomic_set(&latest_mag_seq, (atomic_val_t)(s + 1U));
-	memcpy(latest_mag, aligned, sizeof(latest_mag));
-	atomic_set(&latest_mag_seq, (atomic_val_t)(s + 2U));
+	k_spinlock_key_t key = k_spin_lock(&latest_mag_lock);
+	if (connection_get_data_collection()
+	    && session == (uint32_t)atomic_get(&raw_collection_session)) {
+		memcpy(latest_mag, aligned, sizeof(latest_mag));
+		latest_mag_session = session;
+		latest_mag_valid = true;
+	}
+	k_spin_unlock(&latest_mag_lock, key);
 }
 
 void connection_send_raw_metadata(
@@ -839,8 +942,10 @@ static bool connection_cal_drip_send(void)
 
 	case 1: { /* Mag calibration */
 		buf[2] = RAW_CAL_SUB_MAG;
+		float mag_BAinv[4][3];
 		float mag_body_BAinv[4][3];
-		connection_align_mag_BAinv_body(mag_body_BAinv, retained->magBAinv);
+		magneto_online_snapshot_BAinv(mag_BAinv);
+		connection_align_mag_BAinv_body(mag_body_BAinv, mag_BAinv);
 		memcpy(&buf[3], mag_body_BAinv, sizeof(mag_body_BAinv));
 		esb_write(buf, false, RAW_PACKET_SIZE);
 		raw_cal_phase = 2;
@@ -948,7 +1053,7 @@ static bool connection_cal_drip_send(void)
 
 bool connection_raw_metadata_resend_due(void)
 {
-	if (!data_collection_active || !raw_metadata_sent) {
+	if (!connection_get_data_collection() || !raw_metadata_sent) {
 		return false;
 	}
 	return (k_uptime_get() - raw_metadata_last_ms) >= RAW_METADATA_RESEND_MS;
@@ -956,7 +1061,7 @@ bool connection_raw_metadata_resend_due(void)
 
 bool connection_process_raw_data(void)
 {
-	if (!data_collection_active) {
+	if (!connection_get_data_collection()) {
 		return false;
 	}
 
@@ -1041,17 +1146,14 @@ bool connection_process_raw_data(void)
 		float mag_snap[3];
 		bool mag_ok = false;
 		{
-			unsigned s;
-			do {
-				s = (unsigned)atomic_get(&latest_mag_seq);
-				if (s == 0U || (s & 1U)) {
-					break;
-				}
+			k_spinlock_key_t key = k_spin_lock(&latest_mag_lock);
+			if (latest_mag_valid
+			    && latest_mag_session == (uint32_t)atomic_get(&raw_collection_session)) {
 				memcpy(mag_snap, latest_mag, sizeof(mag_snap));
-			} while ((unsigned)atomic_get(&latest_mag_seq) != s);
-			if (s != 0U && !(s & 1U) && atomic_cas(&latest_mag_seq, (atomic_val_t)s, 0)) {
 				mag_ok = true;
 			}
+			latest_mag_valid = false;
+			k_spin_unlock(&latest_mag_lock, key);
 		}
 		if (mag_ok) {
 			memcpy(&buf[32], &mag_snap[0], 4);
@@ -1076,9 +1178,61 @@ bool connection_process_raw_data(void)
 	return false;
 }
 
-static int64_t last_sensor_quat_time = 0;
-#define SENSOR_QUAT_INTERVAL_TDMA_MS 1
-#define SENSOR_QUAT_INTERVAL_NOTDMA_MS 6
+/* Exact test-mode rate schedule in local monotonic microseconds. TDMA still
+ * owns slot admission; this schedule only selects which slot opportunities
+ * carry a test packet. Fractional microseconds are accumulated so arbitrary
+ * TPS values have no integer-ms bias. */
+static struct {
+	uint64_t next_due_us;
+	uint32_t remainder;
+	uint16_t tps;
+} test_rate_schedule;
+static uint64_t test_wake_delay_us;
+static bool test_wake_delay_valid;
+
+static void test_rate_schedule_sync(uint64_t now_us)
+{
+	uint16_t tps = test_mode_effective_tps();
+	if (tps == 0) {
+		memset(&test_rate_schedule, 0, sizeof(test_rate_schedule));
+		return;
+	}
+	if (test_rate_schedule.tps != tps || test_rate_schedule.next_due_us == 0
+		|| test_rate_schedule.next_due_us + 1000000ULL < now_us) {
+		test_rate_schedule.tps = tps;
+		test_rate_schedule.next_due_us = now_us;
+		test_rate_schedule.remainder = 0;
+	}
+}
+
+static bool test_rate_due(uint64_t now_us)
+{
+	test_rate_schedule_sync(now_us);
+	return test_rate_schedule.tps != 0 && now_us >= test_rate_schedule.next_due_us;
+}
+
+static void test_rate_advance(uint64_t now_us)
+{
+	uint16_t tps = test_rate_schedule.tps;
+	if (tps == 0) {
+		return;
+	}
+	do {
+		test_rate_schedule.next_due_us += 1000000U / tps;
+		test_rate_schedule.remainder += 1000000U % tps;
+		if (test_rate_schedule.remainder >= tps) {
+			test_rate_schedule.next_due_us++;
+			test_rate_schedule.remainder -= tps;
+		}
+	} while (test_rate_schedule.next_due_us <= now_us);
+}
+
+static uint64_t test_rate_delay_us(uint64_t now_us)
+{
+	test_rate_schedule_sync(now_us);
+	return test_rate_schedule.next_due_us > now_us
+		? test_rate_schedule.next_due_us - now_us : 0;
+}
 
 /* Lookahead window: if a low-freq packet is within this many ms of being due,
  * piggyback it onto the current transmission as a composite sub-packet. */
@@ -1095,7 +1249,7 @@ static int64_t last_sensor_quat_time = 0;
  * Format: [ESB_COMPOSITE_TYPE][tracker_id][sub_count][sub0_type][sub0_data...]
  *         [sub1_type][sub1_data...]...[sequence]
  */
-static void send_composite(const uint8_t *types, int n)
+static bool send_composite(const uint8_t *types, int n)
 {
 	uint8_t buf[ESB_MAX_PAYLOAD_LEN];
 	int pos = 0;
@@ -1113,14 +1267,19 @@ static void send_composite(const uint8_t *types, int n)
 		}
 	}
 
-	buf[pos++] = packet_sequence++;
-	esb_write(buf, no_ack, pos);
+	buf[pos++] = packet_sequence;
+	if (esb_write(buf, no_ack, pos) != 0) {
+		return false;
+	}
+	packet_sequence++;
+	return true;
 }
 
 static void composite_builder_reset(struct composite_builder *builder)
 {
 	builder->n = 0;
 	builder->used = 0;
+	memset(builder->last_times, 0, sizeof(builder->last_times));
 }
 
 /*
@@ -1148,22 +1307,47 @@ composite_try_add_due(struct composite_builder *builder, uint8_t type, bool want
 	if (!composite_try_add(builder, type)) {
 		return false;
 	}
-	*last_time = now;
+	builder->last_times[builder->n - 1] = last_time;
+	builder->stamps[builder->n - 1] = now;
 	return true;
 }
 
-static void send_composite_or_single(const struct composite_builder *builder, uint8_t fallback_type)
+/* Apply deferred low-frequency last-sent timestamps once the packet that
+ * carries them was actually queued; a failed send must leave them unchanged
+ * so the data is retried. */
+static void composite_commit_timestamps(const struct composite_builder *builder)
+{
+	for (int i = 0; i < builder->n; i++) {
+		if (builder->last_times[i]) {
+			*builder->last_times[i] = builder->stamps[i];
+		}
+	}
+}
+
+static bool send_composite_or_single(const struct composite_builder *builder, uint8_t fallback_type)
 {
 	if (builder->n > 1) {
-		if (esb_ready()) {
-			send_composite(builder->types, builder->n);
+		if (!esb_ready()) {
+#if CONFIG_CONNECTION_OVER_HID
+			/* Radio unavailable: HID is the configured output path;
+			 * its enqueue success is the send success. */
+			return write_hid_composite_as_normal_packets(builder);
+#else
+			return false;
+#endif
+		}
+
+		/* Radio available: only ESB queue success counts, so a failed
+		 * admission cannot advance the schedule or mirror to HID. */
+		if (!send_composite(builder->types, builder->n)) {
+			return false;
 		}
 #if CONFIG_CONNECTION_OVER_HID
 		write_hid_composite_as_normal_packets(builder);
 #endif
-	} else {
-		connection_write_packet_type(fallback_type);
+		return true;
 	}
+	return connection_write_packet_type(fallback_type);
 }
 
 static void connection_signal_wake(void)
@@ -1174,41 +1358,44 @@ static void connection_signal_wake(void)
 static int64_t connection_next_deadline_ms(int64_t now)
 {
 	int64_t deadline = now + 1000; /* bounded fallback */
-	int quat_interval_ms = tdma_is_enabled() ? SENSOR_QUAT_INTERVAL_TDMA_MS
-						 : SENSOR_QUAT_INTERVAL_NOTDMA_MS;
 
-	if (esb_ready()) {
-		uint32_t ping_iv = get_ping_interval_ms();
-		int64_t ping_dl = last_ping_time + (int64_t)ping_iv;
-		if (ping_dl < deadline) {
-			deadline = ping_dl;
+	uint32_t ping_deadline = (uint32_t)atomic_get(&next_ping_deadline_ms);
+	uint32_t ping_window_delay_ms;
+	if (esb_ready() && tdma_ping_wake_delay_ms(&ping_window_delay_ms)) {
+		int64_t guarded_deadline = now + ping_window_delay_ms;
+		if (guarded_deadline < deadline) {
+			deadline = guarded_deadline;
+		}
+	} else if (esb_ready() && (int32_t)(ping_deadline - (uint32_t)deadline) < 0) {
+		deadline = ping_deadline;
+	}
+	test_wake_delay_valid = false;
+	if (test_mode_get()) {
+		uint64_t now_us = k_ticks_to_us_near64(k_uptime_ticks());
+		test_wake_delay_us = test_rate_delay_us(now_us);
+		test_wake_delay_valid = true;
+		int64_t t_dl = now + (int64_t)((test_wake_delay_us + 999ULL) / 1000ULL);
+		if (t_dl < deadline) {
+			deadline = t_dl;
 		}
 	}
-	if (quat_update_time) {
-		int64_t q_dl = last_sensor_quat_time + quat_interval_ms;
-		if (q_dl < deadline) {
-			deadline = q_dl;
+	if (!test_mode_get()) {
+		if (sensor_data_snapshot_m_pending(&sensor_data_snapshot)) {
+			int64_t m_dl = last_mag_time + 100;
+			if (m_dl < deadline) {
+				deadline = m_dl;
+			}
 		}
-	}
-	if (mag_update_time) {
-		int64_t m_dl = last_mag_time + 100;
-		if (m_dl < deadline) {
-			deadline = m_dl;
+		if (sensor_ids_set) {
+			int64_t i_dl = last_info_time + 100;
+			if (i_dl < deadline) {
+				deadline = i_dl;
+			}
 		}
-	}
-	if (sensor_ids_set) {
-		int64_t i_dl = last_info_time + 100;
-		if (i_dl < deadline) {
-			deadline = i_dl;
-		}
-	}
-	{
 		int64_t s_dl = last_status_time + 1000;
 		if (s_dl < deadline) {
 			deadline = s_dl;
 		}
-	}
-	{
 		int64_t r_dl = last_runtime_time + 1000;
 		if (r_dl < deadline) {
 			deadline = r_dl;
@@ -1227,6 +1414,14 @@ static void connection_idle_wait(int64_t now)
 	if (wait_ms > 1000) {
 		wait_ms = 1000;
 	}
+	if (test_wake_delay_valid) {
+		uint64_t wait_us = (uint64_t)wait_ms * 1000ULL;
+		if (test_wake_delay_us < wait_us) {
+			wait_us = test_wake_delay_us;
+		}
+		(void)k_sem_take(&connection_wake_sem, K_USEC((uint32_t)wait_us));
+		return;
+	}
 	(void)k_sem_take(&connection_wake_sem, K_MSEC(wait_ms));
 }
 
@@ -1234,6 +1429,10 @@ void connection_thread(void)
 {
 	/* Register connection thread with watchdog */
 	watchdog_register_thread(WDT_CHANNEL_CONNECTION, 0);
+	atomic_set(
+		&next_ping_deadline_ms,
+		(atomic_val_t)(k_uptime_get_32() + ping_phase_ms(PING_INTERVAL_MS))
+	);
 
 	while (1) {
 		int64_t now = k_uptime_get();
@@ -1254,48 +1453,86 @@ void connection_thread(void)
 			continue;
 		}
 
-		if (radio_ready) {
-			/*
-			 * Process OTA packets queued from ESB ISR (safe in thread context).
-			 * Must run before esb_ota_is_active() check since BEGIN activates OTA.
-			 * Also must run before PING to process ACK payloads from previous PINGs.
-			 */
-			esb_process_ota_rx_queue();
+		esb_process_ota_rx_queue();
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		radio_capture_process();
+#endif
 
-			/* PING has highest priority.
-			 *
-			 * When TDMA is enabled and the last sync is getting stale
-			 * (>2× PING interval), force an early PING to re-sync before
-			 * the TDMA slot estimate drifts too far.  This prevents the
-			 * gradual TPS degradation caused by transmitting in wrong slots.
-			 */
+		if (radio_ready) {
+			/* Synchronized operation derives the next PING directly from server
+			 * frame time. The deterministic interval is always <=1 second and the
+			 * following physical slot is reserved by every tracker. Startup and
+			 * receiver-reset recovery retain the immediate unslotted path. */
 			uint32_t effective_ping_interval_ms = get_ping_interval_ms();
-			bool ping_due = (now - last_ping_time >= effective_ping_interval_ms);
-#if CONFIG_CONNECTION_TDMA
-			if (!ping_due && tdma_is_enabled()) {
-				int64_t sync_age = esb_get_sync_age_ms();
-				uint32_t resync_interval_ms = effective_ping_interval_ms / 2;
-				if (resync_interval_ms < PING_RESYNC_MIN_INTERVAL_MS) {
-					resync_interval_ms = PING_RESYNC_MIN_INTERVAL_MS;
+			uint32_t ping_deadline = (uint32_t)atomic_get(&next_ping_deadline_ms);
+			bool force_resync = atomic_cas(&ping_resync_requested, 1, 0);
+			uint32_t ping_window_delay_ms = 0;
+			bool guarded_schedule = !force_resync && tdma_ping_wake_delay_ms(&ping_window_delay_ms);
+			if (guarded_schedule) {
+				ping_deadline = (uint32_t)now + ping_window_delay_ms;
+				ping_aligned_interval_ms = effective_ping_interval_ms;
+				atomic_set(&ping_server_phase_aligned, 1);
+			} else if (!force_resync) {
+				if (ping_aligned_interval_ms != effective_ping_interval_ms) {
+					atomic_set(&ping_server_phase_aligned, 0);
 				}
-				if (sync_age > (int64_t)effective_ping_interval_ms * 2
-					&& (now - last_ping_time) >= resync_interval_ms) {
-					ping_due = true;
+				if (!atomic_get(&ping_server_phase_aligned)) {
+					uint32_t phase_delay_ms = ping_server_phase_delay_ms(effective_ping_interval_ms);
+					if (phase_delay_ms > 0) {
+						ping_deadline = (uint32_t)now + phase_delay_ms;
+						atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
+						ping_aligned_interval_ms = effective_ping_interval_ms;
+						atomic_set(&ping_server_phase_aligned, 1);
+					}
 				}
 			}
-#endif
+
+			bool ping_due = force_resync
+				|| (guarded_schedule ? ping_window_delay_ms == 0
+					: (int32_t)((uint32_t)now - ping_deadline) >= 0);
 			if (ping_due) {
+				enum tdma_ping_admission admission = force_resync
+					? TDMA_PING_UNAVAILABLE : tdma_wait_for_ping_window();
+				if (!force_resync && admission == TDMA_PING_DEFERRED) {
+					uint32_t retry_delay_ms = 0;
+					if (tdma_ping_wake_delay_ms(&retry_delay_ms)) {
+						atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
+					}
+					continue;
+				}
+				atomic_inc(&ping_sched_stats.due);
+				atomic_inc(&ping_sched_stats.attempts);
+				ping_stats_attempt((uint32_t)now);
+				if (!guarded_schedule) {
+					ping_deadline = ping_next_periodic_deadline(
+						ping_deadline, (uint32_t)now, effective_ping_interval_ms
+					);
+					atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
+				}
+
 				uint8_t ping[ESB_PING_LEN] = {0};
 				ping[0] = ESB_PING_TYPE;
 				ping[1] = connection_get_id();
-				ping[2] = 0;
-				memset(&ping[3], 0x00, 4);
-				ping[7] = esb_get_ping_ack_flag();
-				memset(&ping[8], 0x00, 4);
-				ping[ESB_PING_LEN - 1] = 0;
-				esb_write(ping, false, ESB_PING_LEN);
-				last_ping_time = now;
-				// k_usleep(400);
+				uint8_t ping_ack_flag = esb_get_ping_ack_flag();
+				ping[7] = ping_ack_flag;
+				if (ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON) {
+					uint16_t tps = test_mode_get_target_tps();
+					ping[8] = (tps >> 8) & 0xFF;
+					ping[9] = tps & 0xFF;
+				}
+				int err = esb_write(ping, false, ESB_PING_LEN);
+				if (err == 0) {
+					atomic_inc(&ping_sched_stats.queue_ok);
+				} else {
+					atomic_inc(&ping_sched_stats.queue_fail);
+					atomic_inc(&ping_sched_stats.retry_deferred);
+					atomic_set(&ping_server_phase_aligned, 0);
+					uint32_t retry_delay_ms = PING_QUEUE_RETRY_MS;
+					if (guarded_schedule) {
+						(void)tdma_ping_wake_delay_ms(&retry_delay_ms);
+					}
+					atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
+				}
 				continue;
 			}
 
@@ -1329,7 +1566,7 @@ void connection_thread(void)
 			if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
 				/* Auto-stop data collection after prolonged connection error
 				 * to avoid indefinite battery drain and stuck state. */
-				if (data_collection_active) {
+				if (connection_get_data_collection()) {
 					static int64_t dc_conn_error_start;
 					if (dc_conn_error_start == 0) {
 						dc_conn_error_start = now;
@@ -1352,7 +1589,7 @@ void connection_thread(void)
 
 		/* During data collection, throttle fusion data
 		 * to leave radio bandwidth for raw data. */
-		if (radio_ready && data_collection_active) {
+		if (radio_ready && connection_get_data_collection()) {
 			static int64_t last_fusion_dc_time;
 			if (now - last_fusion_dc_time < 9) {
 				k_usleep(300);
@@ -1361,19 +1598,33 @@ void connection_thread(void)
 			last_fusion_dc_time = now;
 		}
 
-		/* Determine which data types are due or nearly due */
-		int quat_interval_ms = tdma_is_enabled() ? SENSOR_QUAT_INTERVAL_TDMA_MS : SENSOR_QUAT_INTERVAL_NOTDMA_MS;
-		bool quat_ready = quat_update_time && (now - last_sensor_quat_time >= quat_interval_ms);
-		bool mag_due = mag_update_time && (now - last_mag_time > 100);
-		bool info_due = sensor_ids_set && (now - last_info_time > 100);
-		bool status_due = (now - last_status_time > 1000);
-		bool runtime_due = (now - last_runtime_time > 1000);
+		/* TDMA is the sole frame scheduler. In normal mode a fresh snapshot
+		 * enters admission immediately. In test mode the configured interval
+		 * is both floor and ceiling: publications only refresh the latest
+		 * snapshot; exactly one packet enters admission when the interval is
+		 * due. */
+		bool pending = sensor_data_snapshot_qa_pending(&sensor_data_snapshot);
+		bool in_test_mode = test_mode_get();
+		if (!in_test_mode && test_rate_schedule.tps != 0) {
+			memset(&test_rate_schedule, 0, sizeof(test_rate_schedule));
+		}
+		uint64_t now_us = k_ticks_to_us_near64(k_uptime_ticks());
+		bool test_send_due = in_test_mode && test_rate_due(now_us);
+		bool quat_ready = in_test_mode ? test_send_due : pending;
+		/* In test mode all low-frequency data rides the next target-rate
+		 * packet. Standalone sends would violate the configured ceiling. */
+		bool mag_due = !in_test_mode && sensor_data_snapshot_m_pending(&sensor_data_snapshot)
+			&& (now - last_mag_time > 100);
+		bool info_due = !in_test_mode && sensor_ids_set && (now - last_info_time > 100);
+		bool status_due = !in_test_mode && (now - last_status_time > 1000);
+		bool runtime_due = !in_test_mode && (now - last_runtime_time > 1000);
 
-		/* Lookahead: consider nearly-due low-freq packets for piggybacking */
+		/* Low-frequency fields may always piggyback on a quat/test packet. */
 		bool info_soon = sensor_ids_set && (now - last_info_time > 100 - COMPOSITE_LOOKAHEAD_MS);
 		bool status_soon = (now - last_status_time > 1000 - COMPOSITE_LOOKAHEAD_MS);
 		bool runtime_soon = (now - last_runtime_time > 1000 - COMPOSITE_LOOKAHEAD_MS);
-		bool mag_soon = mag_update_time && (now - last_mag_time > 100 - COMPOSITE_LOOKAHEAD_MS);
+		bool mag_soon = sensor_data_snapshot_m_pending(&sensor_data_snapshot)
+			&& (now - last_mag_time > 100 - COMPOSITE_LOOKAHEAD_MS);
 		bool status_wanted = status_due || status_soon;
 		bool runtime_wanted = runtime_due || runtime_soon;
 		bool info_wanted = info_due || info_soon;
@@ -1387,9 +1638,7 @@ void connection_thread(void)
 			/* Primary: quat sub-packet */
 			if (mag_wanted) {
 				/* mag includes full quat, use type 4 instead of separate quat+mag */
-				composite_try_add(&builder, 4);
-				mag_update_time = 0;
-				last_mag_time = now;
+				composite_try_add_due(&builder, 4, true, &last_mag_time, now);
 				fallback_type = 4;
 			} else if (!connection_sensor_get_precise_quat() && info_wanted) {
 				/* compact quat (type 2) contains batt/temp but NOT imu_id/mag_id.
@@ -1406,10 +1655,15 @@ void connection_thread(void)
 			composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
 			composite_try_add_due(&builder, 0, info_wanted, &last_info_time, now);
 
-			send_composite_or_single(&builder, fallback_type);
-			quat_update_time = 0;
-			last_quat_time = now;
-			last_sensor_quat_time = now;
+			if (send_composite_or_single(&builder, fallback_type)) {
+				/* Only a successfully queued packet consumes the test-rate
+				 * slot; missed ESB admission is retried without advancing
+				 * the schedule. */
+				if (in_test_mode) {
+					test_rate_advance(k_ticks_to_us_near64(k_uptime_ticks()));
+				}
+				composite_commit_timestamps(&builder);
+			}
 			continue;
 		}
 
@@ -1419,15 +1673,15 @@ void connection_thread(void)
 			if (status_wanted || runtime_wanted) {
 				struct composite_builder builder;
 				composite_builder_reset(&builder);
-				composite_try_add(&builder, 4);
+				composite_try_add_due(&builder, 4, true, &last_mag_time, now);
 				composite_try_add_due(&builder, 3, status_wanted, &last_status_time, now);
 				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
-				send_composite_or_single(&builder, 4);
-			} else {
-				connection_write_packet_4();
+				if (send_composite_or_single(&builder, 4)) {
+					composite_commit_timestamps(&builder);
+				}
+			} else if (connection_write_packet_4()) {
+				last_mag_time = now;
 			}
-			mag_update_time = 0;
-			last_mag_time = now;
 			continue;
 		}
 
@@ -1436,14 +1690,15 @@ void connection_thread(void)
 			if (status_wanted || runtime_wanted) {
 				struct composite_builder builder;
 				composite_builder_reset(&builder);
-				composite_try_add(&builder, 0);
+				composite_try_add_due(&builder, 0, true, &last_info_time, now);
 				composite_try_add_due(&builder, 3, status_wanted, &last_status_time, now);
 				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
-				send_composite_or_single(&builder, 0);
-			} else {
-				connection_write_packet_0();
+				if (send_composite_or_single(&builder, 0)) {
+					composite_commit_timestamps(&builder);
+				}
+			} else if (connection_write_packet_0()) {
+				last_info_time = now;
 			}
-			last_info_time = now;
 			continue;
 		}
 
@@ -1451,20 +1706,21 @@ void connection_thread(void)
 			if (runtime_wanted) {
 				struct composite_builder builder;
 				composite_builder_reset(&builder);
-				composite_try_add(&builder, 3);
+				composite_try_add_due(&builder, 3, true, &last_status_time, now);
 				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
+				if (send_composite_or_single(&builder, 3)) {
+					composite_commit_timestamps(&builder);
+				}
+			} else if (connection_write_packet_3()) {
 				last_status_time = now;
-				send_composite_or_single(&builder, 3);
-			} else {
-				last_status_time = now;
-				connection_write_packet_3();
 			}
 			continue;
 		}
 
 		if (runtime_due) {
-			last_runtime_time = now;
-			connection_write_packet_5();
+			if (connection_write_packet_5()) {
+				last_runtime_time = now;
+			}
 			continue;
 		}
 

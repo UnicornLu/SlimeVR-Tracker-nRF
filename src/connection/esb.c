@@ -32,11 +32,8 @@
 #include "zephyr/sys/time_units.h"
 
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
-#if defined(NRF54L15_XXAA)
 #include <hal/nrf_clock.h>
-#endif /* defined(NRF54L15_XXAA) */
-#include <hal/nrf_timer.h>
-#include <nrfx_timer.h>
+#include <nrfx_power.h>
 #include <zephyr/sys/crc.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
@@ -44,13 +41,14 @@
 #include <stdlib.h>
 #include "esb.h"
 #include "tdma.h"
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+#include "radio_capture.h"
+#endif
 #include "console.h"
 #include "system/clock_control.h"
 
 uint8_t last_reset = 0;
-// const nrfx_timer_t m_timer = NRFX_TIMER_INSTANCE(1);
 bool esb_state = false;
-bool timer_state = false;
 uint16_t led_clock = 0;
 uint32_t led_clock_offset = 0;
 
@@ -65,9 +63,39 @@ static struct esb_payload tx_payload_pair = ESB_CREATE_PAYLOAD(0, 0, 0, 0, 0, 0,
 
 static uint8_t paired_addr[8] = {0};
 
-static bool esb_initialized = false;
-static bool esb_paired = false;
+/* ---------------------------------------------------------------------------
+ * ESB connection state machine.
+ *
+ * Explicit state replaces the implicit esb_paired/ping_failures matrix so
+ * pairing, connection, and error recovery transitions are visible in one
+ * place. Radio/data readiness is unchanged: esb_ready() == PAIRED.
+ *
+ *   PAIRING    - pairing burst to discovery address (entered on boot if
+ *                unpaired, or via esb_reset_pair/remote clear)
+ *   PAIRED     - paired address active, normal operation
+ *   RECOVERING - ping loss detected; ping counter keeps accumulating
+ *                failures for the shutdown watchdog, while the flag
+ *                gates repeated recovery bursts from esb_thread
+ * ------------------------------------------------------------------------- */
+typedef enum {
+	ESB_ST_PAIRING,
+	ESB_ST_PAIRED,
+	ESB_ST_RECOVERING,
+} esb_conn_state_t;
 
+static esb_conn_state_t esb_conn_state = ESB_ST_PAIRING;
+
+static bool esb_initialized = false;
+
+/* Preferred ESB channels: even channels outside WiFi/BT-heavy spectrum
+ * (upstream SlimeVR selection). */
+static const uint8_t __maybe_unused ESB_ALLOWED_CHANNELS[] = {
+	0, 2, 52, 72, 74, 76, 78, 82, 84, 86, 88, 50, 24, 48,
+	70, 68, 46, 44, 20, 54, 56, 28, 30,
+	6, 8, 10, 12, 14, 16, 18, 32, 34,
+	36, 38, 40, 42, 58, 60, 62, 64, 66,
+};
+#define ESB_ALLOWED_CHANNELS_COUNT ARRAY_SIZE(ESB_ALLOWED_CHANNELS)
 #define TX_ERROR_THRESHOLD 300
 #define RADIO_RETRANSMIT_DELAY CONFIG_RADIO_RETRANSMIT_DELAY
 #define RADIO_RF_CHANNEL CONFIG_RADIO_RF_CHANNEL
@@ -83,20 +111,25 @@ static bool esb_paired = false;
 #define PING_RECOVERY_THRESHOLD 1
 #endif
 
+/* Keep recovery probes comfortably inside the receiver membership timeout.
+ * Long exponential backoff created a feedback loop after receiver reboot:
+ * ~10 s PING cadence versus a 5 s active timeout repeatedly removed slots. */
 #define PING_BACKOFF_LVL1_THRESHOLD 2
-#define PING_BACKOFF_LVL2_THRESHOLD 5
-#define PING_BACKOFF_LVL3_THRESHOLD 10
-#define PING_BACKOFF_LVL4_THRESHOLD 20
 #define PING_BACKOFF_LVL1_MS        500
-#define PING_BACKOFF_LVL2_MS        1500
-#define PING_BACKOFF_LVL3_MS        4000
-#define PING_BACKOFF_LVL4_MS        9000
 
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
 static void esb_thread(void);
 K_THREAD_DEFINE(esb_thread_id, 1024, esb_thread, NULL, NULL, NULL, ESB_THREAD_PRIORITY, 0, 0);
 static int64_t last_tx_time = 0;
+
+/*
+ * nRF54L only: how long to keep HFCLK (and constant latency) up after the last
+ * ESB TX before stopping it. Frequent HFXO/PLL restarts are unreliable on
+ * nRF54L (anomaly 20/39), so clocks are stopped only after a longer idle
+ * period instead of after every drained TX.
+ */
+#define ESB_CLOCK_IDLE_STOP_MS 3000
 
 static uint32_t ping_success_streak = 0; // consecutive success counter
 static bool ping_pending = false;
@@ -112,16 +145,21 @@ static int64_t ping_send_time = 0;
 #define PING_HISTORY_SIZE 10
 struct ping_history_entry {
 	uint8_t counter;
-	// ticks at ping send time
+	// ticks at ping send time, NETWORK tick domain (sync/offset math)
 	uint32_t ping_ticks;
+	// ticks at ping send time, KERNEL tick domain (RTT vs t4 stamp)
+	uint32_t ping_ticks_kernel;
 };
 static struct ping_history_entry ping_history[PING_HISTORY_SIZE] = {0};
 static uint8_t ping_history_idx = 0;
 
 static uint8_t received_remote_command = ESB_PONG_FLAG_NORMAL;
 static uint8_t acked_remote_command = ESB_PONG_FLAG_NORMAL;
+static uint16_t acked_test_rate_tps = 0; // TEST_MODE_ON payload at ack time
+static uint16_t executing_test_rate_tps = 0; // Snapshot for the in-flight TEST_MODE_ON execution
 static int64_t remote_command_receive_time = 0;
 static uint32_t received_channel_value = 0; // Store channel value from PONG data[8-11]
+static uint32_t received_test_rate_tps = 0; // Optional target TPS riding on TEST_MODE_ON (data[8-9])
 static float received_sens_data[3] = {0};   // Store sensitivity data
 static uint8_t received_sens_auto_axis = 0;
 static uint16_t received_sens_auto_revolutions = 0;
@@ -239,8 +277,25 @@ static void esb_remote_cmd_tdma_off(void)
 
 static void esb_remote_cmd_test_mode_on(void)
 {
-	LOG_INF("Executing remote command: TEST_MODE_ON");
+	/* Optional target TPS rides in PING data[8-9]; 0 = built-in default.
+	 * Read the pre-execution snapshot (see esb_thread) so a PONG landing
+	 * mid-execution cannot split apply/ack across different values. */
+	uint16_t tps = executing_test_rate_tps;
+	test_mode_set_target_tps(tps);
 	test_mode_set(true);
+	if (tps == 0) {
+		LOG_INF("Executing remote command: TEST_MODE_ON (default rate)");
+		return;
+	}
+	/* Field-diagnosis view: raw target vs capacity-clamped effective rate. */
+	uint16_t effective_tps = test_mode_effective_tps();
+	uint16_t frame_ticks = tdma_frame_ticks_get();
+	LOG_INF(
+		"Executing remote command: TEST_MODE_ON target=%u TPS effective=%u TPS (frame=%u ticks)",
+		tps,
+		effective_tps,
+		frame_ticks
+	);
 }
 
 static void esb_remote_cmd_test_mode_off(void)
@@ -263,13 +318,9 @@ static void esb_remote_cmd_clear(void)
 
 static void esb_remote_cmd_dfu(void)
 {
-#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT
 	LOG_WRN("Executing remote command: DFU (enter bootloader)");
-#if CONFIG_BUILD_OUTPUT_UF2
-	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
-	k_msleep(100);
-#endif
-	sys_request_system_reboot(false);
+	sys_enter_dfu(false);
 #else
 	LOG_WRN("Remote command: DFU not supported (no bootloader)");
 #endif
@@ -277,13 +328,9 @@ static void esb_remote_cmd_dfu(void)
 
 static void esb_remote_cmd_dfu_ota(void)
 {
-#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#if CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT
 	LOG_WRN("Executing remote command: DFU_OTA (enter OTA bootloader)");
-#if CONFIG_BUILD_OUTPUT_UF2
-	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
-	k_msleep(2);
-#endif
-	sys_request_system_reboot(false);
+	sys_enter_dfu(true);
 #else
 	LOG_WRN("Remote command: DFU_OTA not supported (no bootloader)");
 #endif
@@ -294,8 +341,8 @@ static void esb_remote_cmd_set_channel(void)
 	// Validate channel value (0-100)
 	if (received_channel_value <= 100) {
 		LOG_INF("Executing remote command: SET_CHANNEL to %u", received_channel_value);
-		// Save to retained memory
-		retained->rf_channel = (uint8_t)received_channel_value;
+		// Save to retained memory (encoded)
+		retained->rf_channel = esb_rf_channel_encode((uint8_t)received_channel_value);
 		retained_update();
 		// Save to NVS
 		sys_write(
@@ -304,11 +351,11 @@ static void esb_remote_cmd_set_channel(void)
 			&retained->rf_channel,
 			sizeof(retained->rf_channel)
 		);
-		LOG_INF("RF channel saved to NVS: %u", retained->rf_channel);
+		LOG_INF("RF channel saved to NVS: %u", received_channel_value);
 		if (esb_reinitialize()) {
 			LOG_ERR("ESB reinitialize failed after channel change");
 		} else {
-			LOG_INF("ESB reinitialized with channel %u", retained->rf_channel);
+			LOG_INF("ESB reinitialized with channel %u", received_channel_value);
 		}
 	} else {
 		LOG_ERR("Invalid channel value: %u (must be 0-100)", received_channel_value);
@@ -318,8 +365,8 @@ static void esb_remote_cmd_set_channel(void)
 static void esb_remote_cmd_clear_channel(void)
 {
 	LOG_INF("Executing remote command: CLEAR_CHANNEL (restore default)");
-	// Clear saved channel (set to 0xFF = use default)
-	retained->rf_channel = 0xFF;
+	// Clear saved channel (set to default marker)
+	retained->rf_channel = ESB_RF_CHANNEL_DEFAULT;
 	retained_update();
 	sys_write(
 		RF_CHANNEL_ID,
@@ -541,6 +588,61 @@ static volatile uint8_t ota_rx_tail;
 static bool server_time_synced = false;
 
 // Server time synchronization
+/*
+ * Network (TDMA) tick domain conversion. The TDMA network runs at 32768 Hz
+ * on all nodes. On nRF52 the kernel tick is also 32768 Hz, so kernel and
+ * network ticks are the same domain. On nRF54L the kernel runs at 31250 Hz
+ * (GRTC 1 MHz / 32): kernel ticks advance 4.88% slower than network ticks,
+ * so any sync-path stamp kept in kernel ticks injects a 4.63% rate error
+ * into the server-time extrapolation.
+ *
+ * Conversion takes the full 64-bit monotonic kernel time and yields 64-bit
+ * network ticks. Truncating a 32-bit kernel stamp BEFORE converting makes
+ * the network value jump at every kernel-tick wrap (the two 32-bit domains
+ * wrap at different points, corrupting wrap-safe differences); converting
+ * the 64-bit timeline first keeps truncated (wire) stamps and 32-bit
+ * wrap-safe differences exact. RTT math (t1/t4 differences) stays in kernel
+ * ticks where both stamps share the domain and k_ticks_to_us is
+ * kernel-aware. Network ticks convert back to us/ms explicitly (32768 Hz),
+ * never via kernel-tick macros.
+ */
+static inline uint64_t net_ticks_from_kernel64(uint64_t kernel_ticks)
+{
+#if defined(CONFIG_SOC_SERIES_NRF54L) || defined(CONFIG_SOC_COMPATIBLE_NRF54L)
+	return (k_ticks_to_us_near64(kernel_ticks) * 32768ULL) / 1000000ULL;
+#else
+	return kernel_ticks;
+#endif
+}
+
+/* Reassemble a wrapping 32-bit kernel-tick stamp onto the 64-bit monotonic
+ * timeline: the nearest 64-bit value whose low 32 bits equal short_ticks.
+ * Valid for stamps within +/-2^31 kernel ticks of the current time. */
+static inline uint64_t kernel_ticks_extend32(uint32_t short_ticks)
+{
+	uint64_t now = k_uptime_ticks();
+	uint64_t candidate = (now & ~(uint64_t)0xFFFFFFFFULL) | short_ticks;
+	int64_t diff = (int64_t)(candidate - now);
+	if (diff < -(int64_t)0x80000000LL) {
+		candidate += 0x100000000ULL;
+	} else if (diff > (int64_t)0x7FFFFFFFLL) {
+		candidate -= 0x100000000ULL;
+	}
+	return candidate;
+}
+
+/* 32768 Hz network ticks -> microseconds (floor), platform-independent. */
+static inline uint64_t net_ticks_to_us_64(uint64_t net_ticks)
+{
+	return (net_ticks * 1000000ULL) / 32768ULL;
+}
+
+/* 32768 Hz network ticks -> milliseconds (floor), platform-independent. */
+static inline uint32_t net_ticks_to_ms_32(uint32_t net_ticks)
+{
+	return (uint32_t)(((uint64_t)net_ticks * 1000ULL) / 32768ULL);
+}
+
 static uint32_t g_server_ticks_offset = 0;
 static uint32_t g_last_rx_raw_ticks = 0;
 static uint32_t g_last_sync_local_ticks = 0;
@@ -561,6 +663,8 @@ static uint32_t g_min_rtt_age = 0; // PONGs since last min_rtt update
 #define MIN_RTT_AGE_LIMIT 120      // Age out after ~120 PONGs (~2 min at 1/s)
 #define MIN_RTT_CEILING   20       // Never age beyond this (conservative upper bound)
 
+#define RECEIVER_RESTART_BACKWARD_TICKS (32768U * 2U)
+static uint32_t receiver_restart_detections;
 // Warm-up counter: first few PONGs use faster EMA for quick convergence
 static uint32_t g_sync_update_count = 0;
 #define SYNC_WARM_UP_COUNT 5
@@ -703,20 +807,7 @@ static void esb_clear_time_sync_state(void)
 
 uint32_t esb_get_ping_backoff_ms(void)
 {
-	if (ping_failures >= PING_BACKOFF_LVL4_THRESHOLD) {
-		return PING_BACKOFF_LVL4_MS;
-	}
-	if (ping_failures >= PING_BACKOFF_LVL3_THRESHOLD) {
-		return PING_BACKOFF_LVL3_MS;
-	}
-	if (ping_failures >= PING_BACKOFF_LVL2_THRESHOLD) {
-		return PING_BACKOFF_LVL2_MS;
-	}
-	if (ping_failures >= PING_BACKOFF_LVL1_THRESHOLD) {
-		return PING_BACKOFF_LVL1_MS;
-	}
-
-	return 0;
+	return ping_failures >= PING_BACKOFF_LVL1_THRESHOLD ? PING_BACKOFF_LVL1_MS : 0;
 }
 
 bool clock_status = false;
@@ -745,7 +836,6 @@ int clocks_start(void)
 	int err;
 	int res;
 	struct onoff_client clk_cli;
-	int fetch_attempts = 0;
 
 	sys_notify_init_spinwait(&clk_cli.notify);
 
@@ -755,23 +845,43 @@ int clocks_start(void)
 		return err;
 	}
 
+	/*
+	 * Wait for the HF clock to actually start. A cold HFXO start can take
+	 * several milliseconds. Match the SDK's esb_clocks_start()
+	 * (sdk-nrf/subsys/esb/esb_glue.c): keep waiting until the onoff request
+	 * completes. Returning while the request is still pending would leave
+	 * clk_cli dangling on the onoff manager's client list, and the
+	 * completion ISR would later walk that stale node (bus fault).
+	 */
 	do {
-		k_usleep(100);
 		err = sys_notify_fetch_result(&clk_cli.notify, &res);
 		if (!err && res) {
 			LOG_ERR("Clock could not be started: %d", res);
 			return res;
 		}
-		if (err && ++fetch_attempts > 10) {
-			LOG_WRN_ONCE("Unable to fetch Clock request result: %d", err);
-			return err;
+		if (err == -EAGAIN) {
+			k_yield();
 		}
-	} while (err);
+	} while (err == -EAGAIN);
 
-#if defined(NRF54L15_XXAA)
-	/* MLTPAN-20 */
+	if (err) {
+		LOG_ERR("Unexpected return code from sys_notify_fetch_result: %d", err);
+		return err;
+	}
+
+#if NRF_CLOCK_HAS_PLL
+	/* MLTPAN-20: CLOCK PLL must be running for radio (nRF54L and later). */
 	nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_PLLSTART);
-#endif /* defined(NRF54L15_XXAA) */
+#endif
+
+#if defined(CONFIG_SOC_SERIES_NRF54L)
+	/* nRF54L anomaly 20: constant latency sub-power mode must be active while
+	 * the radio is used, otherwise a TX payload can silently not be
+	 * transmitted and the radio stays stuck (ESB TX FIFO fills up). Mirrors
+	 * what MPSL / nrf_802154 / esb_glue.c do on nRF54L.
+	 */
+	(void)nrfx_power_constlat_mode_request();
+#endif
 
 	clock_status = true;
 	return 0;
@@ -793,6 +903,10 @@ void clocks_stop(void)
 	clock_status = false;
 
 	onoff_release(clk_mgr);
+
+#if defined(CONFIG_SOC_SERIES_NRF54L)
+	nrfx_power_constlat_mode_free();
+#endif
 
 	LOG_DBG("HF clock stop request");
 }
@@ -868,8 +982,13 @@ void event_handler(struct esb_evt const *event)
 		tx_success_count++;
 		// Reset ENOMEM error counter on successful transmission
 		consecutive_enomem_errors = 0;
-		if (esb_paired && !connection_get_data_collection() && esb_is_idle()) {
+		if (esb_conn_state != ESB_ST_PAIRING && !connection_get_data_collection() && esb_is_idle()) {
+#if defined(CONFIG_SOC_SERIES_NRF54L)
+			/* nRF54L: keep HFCLK up while ESB is active; idle stop is
+			 * handled in esb_thread after ESB_CLOCK_IDLE_STOP_MS. */
+#else
 			clocks_stop();
+#endif
 		}
 		break;
 	case ESB_EVENT_TX_FAILED:
@@ -929,6 +1048,7 @@ void event_handler(struct esb_evt const *event)
 		if (ping_failures == TX_ERROR_THRESHOLD) // consecutive ping failures
 		{
 			connection_error_start_time = k_uptime_get(); // Mark when connection errors started
+			esb_conn_state = ESB_ST_RECOVERING;
 			LOG_WRN(
 				"Ping failure threshold reached (%d failures), starting "
 				"timeout timer",
@@ -936,8 +1056,13 @@ void event_handler(struct esb_evt const *event)
 			);
 		}
 
-		if (esb_paired && !connection_get_data_collection() && esb_is_idle()) {
+		if (esb_conn_state != ESB_ST_PAIRING && !connection_get_data_collection() && esb_is_idle()) {
+#if defined(CONFIG_SOC_SERIES_NRF54L)
+			/* nRF54L: keep HFCLK up while ESB is active; idle stop is
+			 * handled in esb_thread after ESB_CLOCK_IDLE_STOP_MS. */
+#else
 			clocks_stop();
+#endif
 		}
 		break;
 	case ESB_EVENT_RX_RECEIVED: {
@@ -1001,6 +1126,7 @@ void event_handler(struct esb_evt const *event)
 						ping_pending = false;
 						ping_failed = false;
 						ping_failures = 0;
+						esb_conn_state = ESB_ST_PAIRED;
 						if (get_status(SYS_STATUS_CONNECTION_ERROR) == true) {
 							set_status(SYS_STATUS_CONNECTION_ERROR, false);
 							connection_error_start_time = 0;
@@ -1019,6 +1145,7 @@ void event_handler(struct esb_evt const *event)
 					ping_pending = false;
 					ping_failed = false;
 					ping_failures = 0;
+					esb_conn_state = ESB_ST_PAIRED;
 					if (get_status(SYS_STATUS_CONNECTION_ERROR) == true) {
 						ping_success_streak++;
 						if (ping_success_streak >= PING_RECOVERY_THRESHOLD) {
@@ -1056,7 +1183,7 @@ void event_handler(struct esb_evt const *event)
 					float pong_sens_data[3] = {0.0f, 0.0f, 0.0f};
 					uint8_t pong_sens_auto_axis = 0;
 					uint16_t pong_sens_auto_revolutions = 0;
-
+					bool receiver_clock_restarted = false;
 					if (pong_flags == ESB_PONG_FLAG_SENS_SET) {
 						// Special case: SENS_SET command repurposes time sync bytes for data
 						// Skip time sync update
@@ -1088,6 +1215,22 @@ void event_handler(struct esb_evt const *event)
 							);
 						}
 					} else if (ping_ticks_for_this_ctr != 0) {
+						receiver_clock_restarted = g_time_initialized
+							&& (int32_t)(ping_rx_ticks - g_last_rx_raw_ticks)
+								< -(int32_t)RECEIVER_RESTART_BACKWARD_TICKS;
+						if (receiver_clock_restarted) {
+							receiver_restart_detections++;
+							LOG_WRN(
+								"Receiver clock restart detected old=%u new=%u count=%u",
+								g_last_rx_raw_ticks,
+								ping_rx_ticks,
+								receiver_restart_detections
+							);
+							esb_clear_time_sync_state();
+							tdma_set_enabled(false);
+							ping_failures = 0;
+							connection_request_ping_resync();
+						}
 						// ====================================================================
 						// RTT and Server Time Offset Calculation (Reference-Point Model)
 						// ====================================================================
@@ -1100,10 +1243,23 @@ void event_handler(struct esb_evt const *event)
 						//
 						// offset = T2 - T4 (constant one-way bias cancels for TDMA)
 						// ====================================================================
+						/* T4 = ACK RX stamp exported by the ESB lib (radio
+						 * moment). Read the wrapping uint32 once; RTT keeps
+						 * the kernel-domain pair, and only the network-domain
+						 * view extends it to the nearest 64-bit epoch. */
 						uint32_t t4_ticks = esb_last_ack_rx_ticks;
+						uint32_t t4_net_ticks =
+							(uint32_t)net_ticks_from_kernel64(kernel_ticks_extend32(t4_ticks));
 
 						// Calculate full RTT: from PING send (T1) to PONG receive (T4)
-						uint32_t rtt_ticks = t4_ticks - ping_ticks_for_this_ctr;
+						uint32_t ping_ticks_kernel_for_this_ctr = 0;
+						for (int i = 0; i < PING_HISTORY_SIZE; i++) {
+							if (ping_history[i].counter == rx_ctr && ping_history[i].ping_ticks_kernel != 0) {
+								ping_ticks_kernel_for_this_ctr = ping_history[i].ping_ticks_kernel;
+								break;
+							}
+						}
+						uint32_t rtt_ticks = t4_ticks - ping_ticks_kernel_for_this_ctr;
 						rtt_us = k_ticks_to_us_floor32(rtt_ticks);
 
 						// Track minimum RTT (no-retransmission baseline)
@@ -1152,7 +1308,7 @@ void event_handler(struct esb_evt const *event)
 							// Decoupling from min_rtt avoids noise injection when
 							// min_rtt ages/updates.
 							int32_t server_offset_ticks
-								= (int32_t)(ping_rx_ticks - t4_ticks);
+								= (int32_t)(ping_rx_ticks - t4_net_ticks);
 
 							/* Save prior sync stamp before overwrite — EMA predict
 							 * needs elapsed since last accepted PONG, not zero. */
@@ -1170,21 +1326,14 @@ void event_handler(struct esb_evt const *event)
 								server_time_synced = true;
 								LOG_DBG("Server offset initialized: %d ticks", server_offset_ticks);
 							} else {
-								// Long-baseline skew estimation:
-								// Keep skew reference point fixed, compute total drift
-								// over growing baseline to average out RTT noise
 								uint32_t delta_from_ref = ping_ticks_for_this_ctr - g_skew_ref_local_ticks;
-
-								// Compute innovation (prediction residual) for diagnostics
-								int32_t predicted_drift = (int32_t)((int64_t)g_clock_skew_ppb * (int64_t)delta_from_ref / 1000000000LL);
+								int32_t predicted_drift = (int32_t)((int64_t)g_clock_skew_ppb
+									* (int64_t)delta_from_ref / 1000000000LL);
 								int32_t predicted_offset = g_skew_ref_offset + predicted_drift;
 								int32_t innovation = server_offset_ticks - predicted_offset;
-
-								// Large jump detection (> 1 second ≈ 32000 ticks)
 								if (abs(innovation) > 32000) {
 									LOG_WRN(
-										"Large offset jump detected (%d ticks), resetting "
-										"(old=%d new=%d)",
+										"Large offset jump detected (%d ticks), resetting (old=%d new=%d)",
 										innovation,
 										g_server_ticks_offset,
 										server_offset_ticks
@@ -1194,60 +1343,42 @@ void event_handler(struct esb_evt const *event)
 									g_skew_ref_local_ticks = ping_ticks_for_this_ctr;
 									g_clock_skew_ppb = 0;
 								} else {
-									// Update skew from long-baseline total drift
-									// As baseline grows, RTT noise effect shrinks
 									if (delta_from_ref >= 32768) {
 										int64_t total_drift = (int64_t)(server_offset_ticks - g_skew_ref_offset);
-										int32_t raw_skew_ppb = (int32_t)(total_drift * 1000000000LL / (int64_t)delta_from_ref);
-										// Gentle EMA: long baseline already provides stability
-										g_clock_skew_ppb = g_clock_skew_ppb + (raw_skew_ppb - g_clock_skew_ppb) / 4;
+										int32_t raw_skew_ppb = (int32_t)(total_drift * 1000000000LL
+											/ (int64_t)delta_from_ref);
+										g_clock_skew_ppb += (raw_skew_ppb - g_clock_skew_ppb) / 4;
 									}
-
-									/*
-								 * Predict-Update EMA offset filter.
-								 *
-								 * Use skew prediction as the expected offset,
-								 * so EMA innovation contains only measurement
-								 * noise (not deterministic drift).  This allows
-								 * a smaller alpha for better noise rejection
-								 * while skew handles drift tracking.
-								 *
-								 * Warm-up (first 5 PONGs): alpha=3/4 for fast
-								 * initial convergence before skew is estimated.
-								 */
-								g_sync_update_count++;
-								/* Predict from last accepted sync (prev), not current stamp. */
-								uint32_t delta_since_sync = ping_ticks_for_this_ctr - prev_sync_local_ticks;
-								int32_t predicted_current = (int32_t)g_server_ticks_offset
-									+ (int32_t)((int64_t)g_clock_skew_ppb * delta_since_sync / 1000000000LL);
-								int32_t offset_innovation = server_offset_ticks - predicted_current;
-								if (g_sync_update_count <= SYNC_WARM_UP_COUNT) {
-									/* Warm-up: alpha=3/4 for fast convergence */
-									g_server_ticks_offset = predicted_current + (offset_innovation * 3 + 2) / 4;
-								} else {
-									/* Steady state: alpha=1/4 (skew handles drift) */
-									g_server_ticks_offset = predicted_current + (offset_innovation + 2) / 4;
-								}
-								// Refresh skew reference periodically to avoid uint32 wrap
-								if (delta_from_ref > SKEW_REF_REFRESH_TICKS) {
+									g_sync_update_count++;
+									uint32_t delta_since_sync = ping_ticks_for_this_ctr - prev_sync_local_ticks;
+									int32_t predicted_current = (int32_t)g_server_ticks_offset
+										+ (int32_t)((int64_t)g_clock_skew_ppb * delta_since_sync / 1000000000LL);
+									int32_t offset_innovation = server_offset_ticks - predicted_current;
+									if (g_sync_update_count <= SYNC_WARM_UP_COUNT) {
+										g_server_ticks_offset = predicted_current + (offset_innovation * 3 + 2) / 4;
+									} else {
+										g_server_ticks_offset = predicted_current + (offset_innovation + 2) / 4;
+									}
+									if (delta_from_ref > SKEW_REF_REFRESH_TICKS) {
 										g_skew_ref_offset = server_offset_ticks;
 										g_skew_ref_local_ticks = ping_ticks_for_this_ctr;
 									}
-
-									LOG_DBG("Offset update: innovation=%d offset=%d skew=%d ppb (rtt=%u min=%u)",
+									LOG_DBG(
+										"Offset update: innovation=%d offset=%d skew=%d ppb (rtt=%u min=%u)",
 										innovation, g_server_ticks_offset, g_clock_skew_ppb,
-										rtt_ticks, g_min_rtt_ticks);
+										rtt_ticks, g_min_rtt_ticks
+									);
 								}
 							}
 
 							server_time_synced = true;
 
 							// Display skew-compensated estimated server time
-							uint32_t local_now = sys_clock_tick_get_32();
+							uint32_t local_now = (uint32_t)net_ticks_from_kernel64(k_uptime_ticks());
 							uint32_t elapsed_since_meas = local_now - ping_ticks_for_this_ctr;
 							int32_t skew_corr = (int32_t)((int64_t)g_clock_skew_ppb * elapsed_since_meas / 1000000000LL);
 							uint32_t est_ticks = (uint32_t)((int32_t)g_server_ticks_offset + (int32_t)local_now + skew_corr);
-							uint32_t server_time_ms = k_ticks_to_ms_near32(est_ticks);
+							uint32_t server_time_ms = net_ticks_to_ms_32(est_ticks);
 							uint32_t server_ms = server_time_ms % 1000;
 							uint32_t server_s = (server_time_ms / 1000) % 60;
 							uint32_t server_m = (server_time_ms / 60000) % 60;
@@ -1282,12 +1413,16 @@ void event_handler(struct esb_evt const *event)
 
 					// handle remote commands and delayed execution
 					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
-						if (received_remote_command == ESB_PONG_FLAG_NORMAL ||
+						uint16_t pong_test_rate_tps = pong_flags == ESB_PONG_FLAG_TEST_MODE_ON
+							&& rx_payload.length >= 10
+							? ((uint16_t)rx_payload.data[8] << 8) | rx_payload.data[9] : 0;
+						bool test_rate_changed = pong_flags == ESB_PONG_FLAG_TEST_MODE_ON
+							&& pong_test_rate_tps != received_test_rate_tps;
+						if (received_remote_command == ESB_PONG_FLAG_NORMAL || test_rate_changed ||
 						    (received_remote_command == acked_remote_command &&
 						     pong_flags != received_remote_command)) {
-							// new command received, or override already-executed command
-							// whose confirmation was superseded by the receiver
-							// (but skip re-accepting the same command repeatedly)
+							// New flag, a TEST_MODE_ON payload update, or override of
+							// an executed command whose confirmation was superseded.
 							received_remote_command = pong_flags;
 							remote_command_receive_time = k_uptime_get();
 
@@ -1301,6 +1436,8 @@ void event_handler(struct esb_evt const *event)
 							} else if (pong_flags == ESB_PONG_FLAG_SENS_AUTO) {
 								received_sens_auto_axis = pong_sens_auto_axis;
 								received_sens_auto_revolutions = pong_sens_auto_revolutions;
+							} else if (pong_flags == ESB_PONG_FLAG_TEST_MODE_ON) {
+								received_test_rate_tps = pong_test_rate_tps;
 							}
 
 							const char *cmd_name = esb_remote_cmd_name(pong_flags);
@@ -1392,14 +1529,7 @@ void event_handler(struct esb_evt const *event)
 	} // end of event switch
 }
 
-// this was randomly generated
-// TODO: I have no idea?
-// TODO: see esb information, check CONFIG_ESB_PIPE_COUNT
-/*
-base_addr_p0: Base address for pipe 0, in big endian.
-base_addr_p1: Base address for pipe 1-7, in big endian.
-pipe_prefixes: Address prefix for pipe 0 to 7.
-*/
+/* ESB pipe addresses (base addresses big-endian; prefixes for pipes 0-7). */
 static const uint8_t discovery_base_addr_0[4] = {0x62, 0x39, 0x8A, 0xF2};
 static const uint8_t discovery_base_addr_1[4] = {0x28, 0xFF, 0x50, 0xB8};
 static const uint8_t discovery_addr_prefix[8] = {0xFE, 0xFF, 0x29, 0x27, 0x09, 0x02, 0xB2, 0xD6};
@@ -1414,46 +1544,54 @@ int esb_initialize(bool tx)
 
 	if (tx) {
 		config.protocol = ESB_PROTOCOL_ESB_DPL;
-		// config.mode = ESB_MODE_PTX;
 		config.event_handler = event_handler;
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		config.tx_capture_handler = radio_capture_record;
+#endif
 		config.bitrate = ESB_BITRATE_2MBPS;
-		// config.crc = ESB_CRC_16BIT;
 		config.tx_output_power = CONFIG_RADIO_TX_POWER;
 		config.retransmit_delay = RADIO_RETRANSMIT_DELAY;
-		config.retransmit_count = 2;
+		config.retransmit_count = 1;
 		config.tx_mode = ESB_TXMODE_MANUAL_START;
-		// config.payload_length = 252; // config by CONFIG_ESB_MAX_PAYLOAD_LENGTH
 		config.selective_auto_ack = true;
 		config.use_fast_ramp_up = true;
 	} else {
 		config.protocol = ESB_PROTOCOL_ESB_DPL;
 		config.mode = ESB_MODE_PRX;
 		config.event_handler = event_handler;
-		// config.bitrate = ESB_BITRATE_2MBPS;
-		// config.crc = ESB_CRC_16BIT;
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		config.tx_capture_handler = radio_capture_record;
+#endif
 		config.tx_output_power = CONFIG_RADIO_TX_POWER;
 		config.retransmit_delay = RADIO_RETRANSMIT_DELAY;
-		// config.retransmit_count = 3;
-		// config.tx_mode = ESB_TXMODE_AUTO;
-		// config.payload_length = 252; // config by CONFIG_ESB_MAX_PAYLOAD_LENGTH
 		config.selective_auto_ack = true;
 		config.use_fast_ramp_up = true;
 	}
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	radio_capture_deinit();
+#endif
 
 	err = esb_init(&config);
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	if (!err) {
+		int capture_err = radio_capture_init();
+		if (capture_err) {
+			LOG_WRN("RADIO capture unavailable: %d", capture_err);
+		}
+	}
+#endif
 
 	if (!err) {
-		// Read and apply RF channel from retained/NVS
-		// 0xFF and 0 both indicate "use default"
-		if (retained->rf_channel != 0xFF && retained->rf_channel != 0 && retained->rf_channel <= 100) {
-			LOG_INF("Restoring RF channel from NVS: %u", retained->rf_channel);
-			esb_set_rf_channel(retained->rf_channel);
+		// Read and apply RF channel from retained/NVS (stored value is encoded).
+		uint8_t ch = esb_rf_channel_decode(retained->rf_channel);
+		if (ch != ESB_RF_CHANNEL_DEFAULT) {
+			LOG_INF("Restoring RF channel from NVS: %u", ch);
+			esb_set_rf_channel(ch);
 		} else {
 			LOG_INF("Using default RF channel: %u", RADIO_RF_CHANNEL);
 			esb_set_rf_channel(RADIO_RF_CHANNEL);
-			// Initialize with 0xFF to indicate default is being used
-			if (retained->rf_channel != 0xFF) {
-				retained->rf_channel = 0xFF;
+			if (retained->rf_channel != ESB_RF_CHANNEL_DEFAULT) {
+				retained->rf_channel = ESB_RF_CHANNEL_DEFAULT;
 				retained_update();
 			}
 		}
@@ -1484,8 +1622,10 @@ int esb_initialize(bool tx)
 void esb_deinitialize(void)
 {
 	if (esb_initialized) {
-		/* Clear first so esb_write / connection_thread stop before radio teardown. */
 		esb_initialized = false;
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		radio_capture_deinit();
+#endif
 		k_msleep(5); // wait for in-flight writers to observe flag + drain TX
 		esb_disable();
 	}
@@ -1585,6 +1725,7 @@ void esb_pair(void)
 	if (!paired_addr[0]) // zero, no receiver paired
 	{
 		LOG_INF("Pairing");
+		esb_conn_state = ESB_ST_PAIRING;
 		esb_set_addr_discovery();
 		esb_initialize(true);
 		//		timer_init(); // TODO: shouldn't be here!!!
@@ -1662,15 +1803,15 @@ void esb_pair(void)
 	set_tracker_id(paired_addr[1]);
 
 	esb_set_addr_paired();
-	esb_paired = true;
+	esb_conn_state = ESB_ST_PAIRED;
 	clocks_stop();
 }
 
 void esb_reset_pair(void)
 {
-	if (paired_addr[0] || esb_paired) {
+	if (paired_addr[0] || esb_conn_state != ESB_ST_PAIRING) {
 		esb_deinitialize(); // make sure esb is off
-		esb_paired = false;
+		esb_conn_state = ESB_ST_PAIRING;
 		memset(paired_addr, 0, sizeof(paired_addr));
 		LOG_INF("Pairing requested");
 	}
@@ -1699,10 +1840,10 @@ void esb_process_ota_rx_queue(void)
 	}
 }
 
-void esb_write(uint8_t *data, bool no_ack, size_t data_length)
+int esb_write(uint8_t *data, bool no_ack, size_t data_length)
 {
-	if (!esb_initialized || !esb_paired) {
-		return;
+	if (!esb_initialized || esb_conn_state == ESB_ST_PAIRING) {
+		return -EACCES;
 	}
 	if (!clock_status) {
 		clocks_start();
@@ -1710,7 +1851,7 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	drop_failed_tx_payload_if_pending();
 	if (data_length < 1) {
 		LOG_ERR("Invalid data length %u", data_length);
-		return;
+		return -EINVAL;
 	}
 
 	bool is_ping = data[0] == ESB_PING_TYPE;
@@ -1752,27 +1893,34 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	last_tx.timestamp = k_uptime_get();
 
 	/*
-	 * TDMA slot gating / random backoff for noack sensor-data packets.
-	 *
-	 * Wait BEFORE queuing: if the packet were queued first and the radio
-	 * were still auto-draining a previous TX, the new packet could be
-	 * transmitted before the TDMA slot (bypassing the wait entirely).
-	 *
-	 * PING / ACK packets bypass this (no_ack == false) so time-sync and
-	 * connection-health probes are never delayed.
-	 * Raw data-collection packets always bypass for minimum latency.
-	 *
-	 * When TDMA is disabled (compile-time or runtime), use random backoff
-	 * to reduce collision
+	 * Synchronized PING already claimed the shared own-slot frame in the
+	 * connection thread. Normal NoACK claims it here. Both must queue only while
+	 * ESB is idle: MANUAL_START auto-drains queued payloads once a TX chain runs.
 	 */
-	if (no_ack && !is_raw) {
+	if (is_ping && tdma_is_enabled() && esb_get_sync_age_ms() >= 0
+	    && esb_get_sync_age_ms() <= PING_INTERVAL_MS * 10) {
+		if (!esb_is_idle()) {
+			tdma_note_radio_busy();
+			return -EBUSY;
+		}
+	} else if (no_ack && !is_raw) {
 #if CONFIG_CONNECTION_TDMA
 		if (tdma_is_enabled()) {
-			tdma_wait_for_slot();
+			do {
+				if (!tdma_wait_for_slot((uint8_t)data_length)) {
+					return -EAGAIN;
+				}
+				if (esb_is_idle()) {
+					break;
+				}
+				tdma_note_radio_busy();
+			} while (esb_ready());
+			if (!esb_is_idle()) {
+				return -EBUSY;
+			}
 		} else
 #endif
 		{
-			/* Random backoff: 0-1ms jitter using low bits of cycle counter */
 			uint32_t jitter_us = (k_cycle_get_32() & 0x3FF) % 1000;
 			if (jitter_us > 100) {
 				k_usleep(jitter_us);
@@ -1788,7 +1936,7 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 		if (esb_is_idle()) {
 			esb_start_queued_tx();
 		}
-		return;
+		return queue_status;
 	}
 
 	if (queue_status == -ENOMEM) {
@@ -1933,8 +2081,12 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	 * moment the radio actually begins transmitting.
 	 */
 	if (tx_payload.data[0] == ESB_PING_TYPE && queue_status == 0) {
+		/* Single 64-bit T1 sample; low 32 bits stay the kernel-domain
+		 * RTT stamp, full value converts to network ticks. */
+		uint64_t t1_kernel64 = k_uptime_ticks();
 		unsigned key = irq_lock();
-		ping_history[ping_history_idx].ping_ticks = sys_clock_tick_get_32();
+		ping_history[ping_history_idx].ping_ticks = (uint32_t)net_ticks_from_kernel64(t1_kernel64);
+		ping_history[ping_history_idx].ping_ticks_kernel = (uint32_t)t1_kernel64;
 		ping_history_idx = (ping_history_idx + 1) % PING_HISTORY_SIZE;
 		irq_unlock(key);
 		ping_send_time = k_uptime_get();
@@ -1948,11 +2100,12 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	if (queue_status == 0) {
 		esb_start_queued_tx();
 	}
+	return queue_status;
 }
 
 bool esb_ready(void)
 {
-	return esb_initialized && esb_paired;
+	return esb_initialized && esb_conn_state != ESB_ST_PAIRING;
 }
 
 uint8_t esb_get_ping_ack_flag(void)
@@ -1979,19 +2132,22 @@ uint64_t esb_get_server_time_ticks_64(void)
 		return 0;
 	}
 
-	uint32_t local_now = sys_clock_tick_get_32();
+	uint64_t local_now = net_ticks_from_kernel64(k_uptime_ticks());
 	// Apply clock skew compensation only for time elapsed since last PONG
 	// (g_server_ticks_offset already incorporates all drift up to last measurement)
-	uint32_t elapsed = local_now - g_last_sync_local_ticks;
+	uint32_t elapsed = (uint32_t)local_now - g_last_sync_local_ticks;
 	int32_t skew_correction = (int32_t)((int64_t)g_clock_skew_ppb * elapsed / 1000000000LL);
-	return (uint32_t)(g_server_ticks_offset + local_now) + skew_correction;
+	/* 64-bit monotonic estimate; low 32 bits are the 32-bit wire-stamp
+	 * domain (PING data[3-6]) and stay wrap-safe. */
+	return local_now + (uint64_t)(int64_t)(int32_t)g_server_ticks_offset
+		+ (uint64_t)(int64_t)skew_correction;
 }
 
 uint64_t esb_get_server_time_us_64(void)
 {
 	uint64_t ticks = esb_get_server_time_ticks_64();
 
-	return k_ticks_to_us_near64(ticks);
+	return net_ticks_to_us_64(ticks);
 }
 
 uint32_t esb_get_server_time(void)
@@ -2029,16 +2185,26 @@ static void esb_thread(void)
 
 	while (1) {
 #if CONFIG_CONNECTION_OVER_HID
-		if (!esb_paired && get_status(SYS_STATUS_USB_CONNECTED) == false
+		if (esb_conn_state == ESB_ST_PAIRING && get_status(SYS_STATUS_USB_CONNECTED) == false
 			&& k_uptime_get() - 750 > start_time) // only automatically enter pairing while not
 												  // potentially communicating by usb
 #else
-		if (!esb_paired)
+		if (esb_conn_state == ESB_ST_PAIRING)
 #endif
 		{
 			esb_pair();
 			esb_initialize(true);
 		}
+#if defined(CONFIG_SOC_SERIES_NRF54L)
+		/* Stop HFCLK only after a longer idle period without any ESB TX.
+		 * Frequent XO/PLL restarts are unreliable on nRF54L (anomaly 20). */
+		if (clock_status && esb_conn_state != ESB_ST_PAIRING && !connection_get_data_collection() &&
+		    esb_is_idle() && last_tx_time != 0 &&
+		    (k_uptime_get() - last_tx_time) > ESB_CLOCK_IDLE_STOP_MS) {
+			clocks_stop();
+		}
+#endif
+
 		// Check for shutdown timeout if connection errors persist
 		if (ping_failures >= TX_ERROR_THRESHOLD && !test_mode_get()) {
 #if CONFIG_CONNECTION_OVER_HID
@@ -2062,16 +2228,36 @@ static void esb_thread(void)
 		}
 		int64_t now_idle = k_uptime_get();
 
-		if (received_remote_command != ESB_PONG_FLAG_NORMAL && received_remote_command != acked_remote_command
-			&& remote_command_receive_time > 0) {
+		bool command_pending = received_remote_command != ESB_PONG_FLAG_NORMAL
+			&& remote_command_receive_time > 0;
+		if (command_pending) {
+			if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) {
+				/* Same-flag payload change stays pending while the
+				 * applied (acked) target differs from the received
+				 * one; ack happens only after application below. */
+				command_pending = acked_remote_command != ESB_PONG_FLAG_TEST_MODE_ON
+					|| received_test_rate_tps != acked_test_rate_tps;
+			} else {
+				command_pending = received_remote_command != acked_remote_command;
+			}
+		}
+		if (command_pending) {
 			/* OTA commands (0x30-0x33) bypass the safety delay since they are
 			 * time-sensitive and not destructive like SHUTDOWN/CALIBRATE. */
 			bool is_ota_cmd = (received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
 					   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
 			if (is_ota_cmd || now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
+				/* Snapshot before executing: a PONG landing mid-execution
+				 * must not apply one rate while the ack records another. */
+				if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) {
+					executing_test_rate_tps = received_test_rate_tps;
+				}
 				esb_remote_command_execute(received_remote_command);
 
 				acked_remote_command = received_remote_command;
+				if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) {
+					acked_test_rate_tps = executing_test_rate_tps;
+				}
 
 				if (received_remote_command == ESB_PONG_FLAG_SHUTDOWN) {
 					return;
@@ -2088,6 +2274,7 @@ static void esb_thread(void)
 			LOG_WRN("PING timeout, failures=%u", ping_failures);
 			if (ping_failures == TX_ERROR_THRESHOLD) {
 				connection_error_start_time = now_idle;
+				esb_conn_state = ESB_ST_RECOVERING;
 				LOG_WRN(
 					"Ping failure threshold reached (%d failures), starting "
 					"timeout timer",

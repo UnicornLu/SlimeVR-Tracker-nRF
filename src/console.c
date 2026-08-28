@@ -8,7 +8,11 @@
 #include "sensor/fusion/vqf/vqf.h"
 #endif
 #include "connection/esb.h"
+#include "connection/connection.h"
 #include "connection/tdma.h"
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+#include "connection/radio_capture.h"
+#endif
 #include "build_defines.h"
 #include "parse_args.h"
 #include "zephyr/sys/printk.h"
@@ -20,9 +24,19 @@
 #define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
 #endif
 
-#if (USB_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
+/*
+ * Interactive console over the chosen console device when it is a plain
+ * (non-USB) UART, for example a UART bridged by an onboard USB-to-serial
+ * chip. The console thread then starts at boot and uses console_getline(),
+ * same as the USB path, but without the USB lifecycle handling.
+ */
+#define UART_CONSOLE_EXISTS \
+	(!USB_EXISTS && CONFIG_UART_CONSOLE && \
+	 DT_NODE_HAS_STATUS(DT_CHOSEN(zephyr_console), okay))
 
-#if USB_EXISTS
+#if (USB_EXISTS || UART_CONSOLE_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
+
+#if USB_EXISTS || UART_CONSOLE_EXISTS
 #include <zephyr/console/console.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/drivers/uart.h>
@@ -82,13 +96,8 @@ static void console_lifecycle_work_handler(struct k_work *work)
 K_THREAD_DEFINE(console_thread_id, 2048, console_thread, NULL, NULL, NULL, CONSOLE_THREAD_PRIORITY, 0, 0);
 #endif
 
-#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER)
-#define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
-#define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-
-#if NRF5_BOOTLOADER
-static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
-#endif
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
+#define ADAFRUIT_BOOTLOADER (CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
 
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(mag), okay)
 #define SENSOR_MAG_EXISTS true
@@ -310,10 +319,16 @@ static void print_sensor_detail(void)
 	);
 #endif
 	if (loop_ms > 0.0f) {
-		printk("  Loop:        ~%.1f ms\n", (double)loop_ms);
+		printk("  Work time:   ~%.1f ms/loop\n", (double)loop_ms);
 	} else {
-		printk("  Loop:        n/a\n");
+		printk("  Work time:   n/a\n");
 	}
+	printk(
+		"  Test mode:   %s (target=%u, effective=%u TPS)\n",
+		test_mode_get() ? "enabled" : "disabled",
+		test_mode_get_target_tps(),
+		test_mode_effective_tps()
+	);
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	printk("\nAccelerometer matrix:\n");
@@ -409,9 +424,10 @@ static void print_connection(void)
 		(*(uint64_t *)&retained->paired_addr[0] >> 16) & 0xFFFFFFFFFFFF
 	);
 
-	// Display RF channel info
-	if (retained->rf_channel != 0xFF && retained->rf_channel <= 100) {
-		printk("RF Channel: %u (custom)\n", retained->rf_channel);
+	// Display RF channel info (stored value is encoded)
+	uint8_t rf_ch = esb_rf_channel_decode(retained->rf_channel);
+	if (rf_ch != ESB_RF_CHANNEL_DEFAULT) {
+		printk("RF Channel: %u (custom)\n", rf_ch);
 	} else {
 		printk("RF Channel: %u (default)\n", CONFIG_RADIO_RF_CHANNEL);
 	}
@@ -663,9 +679,9 @@ static void print_help(void)
 	printk("  pair                       Enter pairing mode\n");
 	printk("  clear                      Clear pairing data\n");
 	printk("  tdma <on|off>              Enable/disable TDMA scheduling\n");
+	printk("  radio <on|off>             Stop/restart ESB radio (diagnostic A/B for IMU noise)\n");
 	printk("\n");
-	printk("RF Channel:\n");
-	printk("  channel <1-100>            Set RF channel (saved to NVS)\n");
+	printk("  channel <0-100>            Set RF channel (saved to NVS)\n");
 	printk("    Example: channel 25       Set RF channel to 25\n");
 	printk("  clearchannel               Clear RF channel (use default)\n");
 	printk("\n");
@@ -1327,18 +1343,18 @@ static void console_cmd_channel(size_t argc, char **argv)
 	char *arg = argc > 1 ? argv[1] : NULL;
 
 	if (!arg) {
-		printk("Usage: channel <1-100>\n");
+		printk("Usage: channel <0-100>\n");
 		printk("Example: channel 25 - Set RF channel to 25\n");
 	} else {
 		char *endptr;
 		long channel = strtol(arg, &endptr, 10);
 
-		if (*endptr != '\0' || channel < 1 || channel > 100) {
-			printk("Invalid channel. Must be a number between 1 and 100.\n");
+		if (*endptr != '\0' || channel < 0 || channel > 100) {
+			printk("Invalid channel. Must be a number between 0 and 100.\n");
 		} else {
 			printk("Setting RF channel to %d\n", (int)channel);
-			// Save to retained memory
-			retained->rf_channel = (uint8_t)channel;
+			// Save to retained memory (encoded)
+			retained->rf_channel = esb_rf_channel_encode((uint8_t)channel);
 			retained_update();
 			// Save to NVS
 			sys_write(
@@ -1347,11 +1363,11 @@ static void console_cmd_channel(size_t argc, char **argv)
 				&retained->rf_channel,
 				sizeof(retained->rf_channel)
 			);
-			printk("RF channel saved to NVS: %u\n", retained->rf_channel);
+			printk("RF channel saved to NVS: %d\n", (int)channel);
 			if (esb_reinitialize()) {
 				printk("Error: ESB reinitialize failed\n");
 			} else {
-				printk("ESB reinitialized with channel %u\n", retained->rf_channel);
+				printk("ESB reinitialized with channel %d\n", (int)channel);
 			}
 		}
 	}
@@ -1362,8 +1378,8 @@ static void console_cmd_clearchannel(size_t argc, char **argv)
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 	printk("Clearing RF channel setting (restore default)\n");
-	// Clear saved channel (set to 0xFF = use default)
-	retained->rf_channel = 0xFF;
+	// Clear saved channel (set to default marker)
+	retained->rf_channel = ESB_RF_CHANNEL_DEFAULT;
 	retained_update();
 	sys_write(RF_CHANNEL_ID, &retained->rf_channel, &retained->rf_channel, sizeof(retained->rf_channel));
 	printk("RF channel cleared, will use default on next boot\n");
@@ -1374,11 +1390,37 @@ static void console_cmd_clearchannel(size_t argc, char **argv)
 	}
 }
 
+static void console_cmd_radio(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (!arg) {
+		printk("Usage: radio <on|off>\n");
+		printk("Example: radio off - stop ESB radio for IMU noise A/B test\n");
+		return;
+	}
+
+	if (strcmp(arg, "off") == 0) {
+		esb_deinitialize();
+		printk("ESB radio disabled; sensor loop keeps running (diagnostic only)\n");
+	} else if (strcmp(arg, "on") == 0) {
+		if (esb_reinitialize()) {
+			printk("Error: ESB reinitialize failed\n");
+		} else {
+			printk("ESB radio reinitialized\n");
+		}
+	} else {
+		printk("Invalid radio argument: %s (use on/off)\n", arg);
+	}
+}
+
 #if DFU_EXISTS
 static void console_cmd_dfu(size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
 	char *arg = argc > 1 ? argv[1] : NULL;
+	bool ota = false;
 
 #if ADAFRUIT_BOOTLOADER
 	// Subcommands:
@@ -1387,31 +1429,33 @@ static void console_cmd_dfu(size_t argc, char **argv)
 	char *mode = arg;
 
 	if (mode && strcmp(mode, "ota") == 0) {
+		ota = true;
 		printk("Entering OTA DFU (BLE)...\n");
-		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_OTA_RESET;
 	} else if (mode == NULL) {
 		printk("Entering UF2 DFU...\n");
-		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
 	} else {
 		printk("Error: Unknown DFU mode '%s'. Use: dfu [ota]\n", mode);
 		return;
 	}
 
-	k_msleep(100); // Wait for GPREGRET to be written
-	sys_request_system_reboot(false);
 #else
-	ARG_UNUSED(arg);
+	if (arg != NULL) {
+		printk("Error: This bootloader does not support a DFU mode argument\n");
+		return;
+	}
 #endif
-#if NRF5_BOOTLOADER
-	gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-#endif
+
+	printk("Entering DFU bootloader...\n");
+	sys_enter_dfu(ota);
 }
 #endif
 
 static void console_cmd_ping(size_t argc, char **argv)
 {
-	ARG_UNUSED(argc);
-	ARG_UNUSED(argv);
+	if (argc > 1 && strcmp(argv[1], "stats") == 0) {
+		connection_print_ping_stats();
+		return;
+	}
 	cmd_ping_start();
 }
 
@@ -1528,6 +1572,28 @@ static void console_cmd_tdma(size_t argc, char **argv)
 	} else if (arg && strcmp(arg, "off") == 0) {
 		tdma_set_enabled(false);
 		printk("TDMA disabled\n");
+	} else if (arg && strcmp(arg, "capture") == 0) {
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		char *state = argc > 2 ? argv[2] : NULL;
+		if (state && strcmp(state, "on") == 0) {
+			radio_capture_set_enabled(true);
+			printk("RADIO capture enabled\n");
+		} else if (state && strcmp(state, "off") == 0) {
+			radio_capture_set_enabled(false);
+			printk("RADIO capture disabled\n");
+		} else {
+			printk("RADIO capture: %s\n", radio_capture_is_enabled() ? "enabled" : "disabled");
+			radio_capture_print_stats();
+		}
+#else
+		printk("tdma capture requires CONFIG_TDMA_DIAGNOSTICS=y\n");
+#endif
+	} else if (arg && strcmp(arg, "stats") == 0) {
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		tdma_print_stats();
+#else
+		printk("tdma stats requires CONFIG_TDMA_DIAGNOSTICS=y\n");
+#endif
 	} else {
 		printk("TDMA: %s\n", tdma_is_enabled() ? "enabled" : "disabled");
 	}
@@ -1573,6 +1639,7 @@ static const struct console_cmd console_cmds[] = {
 	{"clear", console_cmd_clear},
 	{"channel", console_cmd_channel},
 	{"clearchannel", console_cmd_clearchannel},
+	{"radio", console_cmd_radio},
 #if DFU_EXISTS
 	{"dfu", console_cmd_dfu},
 #endif
@@ -1591,41 +1658,16 @@ static const struct console_cmd console_cmds[] = {
 
 static void console_thread(void)
 {
-#if USB_EXISTS && DFU_EXISTS
-	if (button_read()) // button held on usb connect, enter DFU
-	{
-#if ADAFRUIT_BOOTLOADER
-		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
-		sys_request_system_reboot(false);
-#endif
-#if NRF5_BOOTLOADER
-		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-#endif
-	}
-#endif
+	// USB serial readiness is handled by usb.c usb_ctrl_thread via DTR;
+	// this thread starts only once the terminal has asserted DTR.
+	// DFU-on-button also lives in usb_ctrl_thread (needs button_read_filtered).
 
-#if USB_EXISTS
+#if USB_EXISTS || UART_CONSOLE_EXISTS
 	console_getline_init();
 
 	// Wait for any pending log data to be processed
 	while (log_data_pending()) {
 		k_usleep(1);
-	}
-
-	// Wait for USB CDC to be ready by checking DTR (Data Terminal Ready) signal
-	// This ensures the terminal is actually connected and ready to receive data
-	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-	if (device_is_ready(uart_dev)) {
-		uint32_t dtr = 0;
-		// Wait up to 5 seconds for DTR to be asserted (terminal connected)
-		for (int i = 0; i < 50; i++) {
-			if (uart_line_ctrl_get(uart_dev, UART_LINE_CTRL_DTR, &dtr) == 0 && dtr) {
-				break;
-			}
-			k_msleep(100);
-		}
-		// Give a bit more time for the terminal to be fully ready
-		k_msleep(100);
 	}
 
 	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
@@ -1636,7 +1678,7 @@ static void console_thread(void)
 	printk("Type 'help' to show available commands.\n");
 
 	while (1) {
-#if USB_EXISTS
+#if USB_EXISTS || UART_CONSOLE_EXISTS
 		char *line = console_getline();
 #else
 		char *line = rtt_console_getline();
