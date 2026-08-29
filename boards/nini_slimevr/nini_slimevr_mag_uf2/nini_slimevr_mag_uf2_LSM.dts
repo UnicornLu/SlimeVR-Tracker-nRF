@@ -4,4 +4,6 @@
 /dts-v1/;
 #include "nini_slimevr_mag_uf2.dts"
 
-/delete-node/ &clk-gpios;
+&{/zephyr,user} {
+	/delete-property/ clk-gpios;
+    };
