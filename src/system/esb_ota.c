@@ -595,14 +595,27 @@ int esb_ota_handle_data(const uint8_t *data, size_t len)
 
 int esb_ota_handle_verify(void)
 {
-	if (ota.bytes_written < ota.image_size) {
-		LOG_ERR("OTA VERIFY: not all data received (%u/%u bytes)",
-			ota.bytes_written, ota.image_size);
+	/* VERIFY is meaningful only for a live, non-empty session. Never let
+	 * the zeroed idle state look like a verified zero-byte image. Repeated
+	 * VERIFY remains supported. */
+	bool valid_session
+		= ota.state == OTA_STATE_READY || ota.state == OTA_STATE_RECEIVING || ota.state == OTA_STATE_VERIFYING;
+	if (!valid_session || ota.image_size == 0 || ota.bytes_written != ota.image_size) {
+		if (ota.state != OTA_STATE_IDLE && ota.state != OTA_STATE_ERROR) {
+			ota.error_code = OTA_STATUS_VERIFY_FAIL;
+		}
+		LOG_ERR(
+			"OTA VERIFY: incomplete or invalid session (state=%d, %u/%u bytes)",
+			ota.state,
+			ota.bytes_written,
+			ota.image_size
+		);
 		ota_send_status();
 		return -EINVAL;
 	}
-
-	LOG_INF("OTA: Verifying CRC32...");
+	/* A valid session may be re-verified after a prior success. Clear the
+	 * old marker before CRC work so a failed retry can never activate. */
+	ota.error_code = 0;
 	ota.state = OTA_STATE_VERIFYING;
 	ota_send_status();
 
@@ -618,7 +631,6 @@ int esb_ota_handle_verify(void)
 	}
 
 	LOG_INF("OTA: CRC32 verified OK (0x%08X)", calc_crc);
-	ota.state = OTA_STATE_VERIFYING; /* Stay in VERIFYING — get_status checks error_code */
 	ota.error_code = OTA_STATUS_VERIFY_OK;
 	ota.last_data_time = k_uptime_get(); /* Reset timeout — waiting for ACTIVATE */
 	k_msleep(100);
@@ -630,11 +642,10 @@ int esb_ota_handle_verify(void)
 int esb_ota_handle_activate(void)
 {
 	k_msleep(100);
-	if (ota.error_code != OTA_STATUS_VERIFY_OK) {
+	if (ota.state != OTA_STATE_VERIFYING || ota.error_code != OTA_STATUS_VERIFY_OK) {
 		LOG_ERR("OTA ACTIVATE: firmware not verified");
 		return -EINVAL;
 	}
-
 	LOG_WRN("OTA: Activating new firmware...");
 	ota.state = OTA_STATE_ACTIVATING;
 	ota_send_status();
