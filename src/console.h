@@ -3,8 +3,19 @@
 
 #include <stdint.h>
 
-void console_thread_create(void);
-void console_thread_abort(void);
+#if CONFIG_USE_SLIMENRF_CONSOLE
+int console_serial_start(void);
+void console_serial_stop(void);
+#else
+static inline int console_serial_start(void)
+{
+	return 0;
+}
+
+static inline void console_serial_stop(void)
+{
+}
+#endif
 
 // Command API for remote execution
 void cmd_sens_set(float x, float y, float z);
