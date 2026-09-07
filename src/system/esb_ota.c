@@ -61,7 +61,11 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/logging/log.h>
 #include <hal/nrf_radio.h>
+#include <zephyr/toolchain.h>
+#include <stddef.h>
 #include <string.h>
+
+
 
 LOG_MODULE_REGISTER(esb_ota, LOG_LEVEL_INF);
 
@@ -149,7 +153,7 @@ enum ota_state {
 	OTA_STATE_ERROR,
 };
 
-static struct {
+struct ota_context {
 	enum ota_state state;
 	uint32_t image_size;
 	uint32_t image_crc32;
@@ -162,8 +166,8 @@ static struct {
 	uint8_t  error_code;
 	char     expected_board[OTA_BOARD_TARGET_MAX];
 
-	/* Page write buffer: accumulate data until a full page (4 KB) is ready */
-	uint8_t  page_buf[OTA_FLASH_PAGE_SIZE];
+	/* Page write buffer shared by staging writes and the in-place RAM engine. */
+	uint8_t  page_buf[OTA_FLASH_PAGE_SIZE] __aligned(4);
 	uint16_t page_buf_offset;       /* Current position in page_buf */
 	uint32_t page_buf_flash_addr;   /* Flash address this buffer maps to (staging area) */
 
@@ -171,18 +175,21 @@ static struct {
 	 * then copied to the final location with interrupts disabled + reset. */
 	uint32_t staging_base;          /* Start of staging area in flash */
 	uint32_t target_flash_base;     /* Destination base address for the new firmware */
-} ota;
+};
+
+static struct ota_context ota;
+
+BUILD_ASSERT(offsetof(struct ota_context, page_buf) % __alignof__(uint32_t) == 0,
+	     "OTA page buffer member must be word-aligned");
+BUILD_ASSERT(sizeof(((struct ota_context *)0)->page_buf) >= OTA_FLASH_PAGE_SIZE,
+	     "OTA page buffer member is smaller than one flash page");
 
 /* ── Forward declarations ────────────────────────────────────────── */
-
 static void ota_send_status(void);
 static void ota_send_fw_info(void);
 static struct esb_ota_page_buf ota_page_buf_view(void);
 
 #if OTA_USE_RAM_ENGINE
-/* External: bare-metal RAM OTA engine (defined in ota_ram_engine.c) */
-struct ota_ram_engine_params;
-extern void ota_ram_engine(const struct ota_ram_engine_params *p);
 static void ota_launch_ram_engine(void);
 #endif
 
@@ -887,15 +894,8 @@ static struct esb_ota_page_buf ota_page_buf_view(void)
 		.pre_erased = OTA_USE_MCUBOOT,
 	};
 }
-
 #if OTA_USE_RAM_ENGINE
-/*
- * Launch the bare-metal RAM OTA engine.
- * Captures current RADIO configuration, stops the SDK ESB driver,
- * copies the engine function to RAM, and jumps to it with IRQs disabled.
- * This function never returns.
- */
-#include "ota_ram_engine.inc"  /* Include for struct definition + function body */
+#include "ota_ram_engine.inc"  /* Struct definition + native RAM function */
 
 static void ota_launch_ram_engine(void)
 {
@@ -904,7 +904,7 @@ static void ota_launch_ram_engine(void)
 		ota.target_flash_base, ota.image_size, ota.image_crc32);
 	k_msleep(200); /* Flush logs */
 
-	/* Capture RADIO configuration before stopping ESB */
+	/* Capture RADIO configuration before stopping ESB. */
 	static struct ota_ram_engine_params params;
 	params.radio_frequency   = NRF_RADIO->FREQUENCY;
 	params.radio_mode        = NRF_RADIO->MODE;
@@ -928,7 +928,7 @@ static void ota_launch_ram_engine(void)
 		params.radio_crccnf, params.radio_base0, params.radio_prefix0,
 		params.radio_txaddress, params.radio_rxaddresses);
 
-	/* OTA state */
+	/* OTA state. */
 	params.image_size        = ota.image_size;
 	params.image_crc32       = ota.image_crc32;
 	params.required_image_magic = IS_ENABLED(CONFIG_BOOTLOADER_MCUBOOT) ?
@@ -940,44 +940,30 @@ static void ota_launch_ram_engine(void)
 	params.bytes_received    = 0;
 	params.tracker_id        = connection_get_id();
 
-	/* Bootloader settings: pre-compute CRC16 is not possible since
-	 * data hasn't been written yet. The RAM engine will need to compute
-	 * CRC16 after writing. For now, prepare the settings template and
-	 * the RAM engine will fill in the CRC16 field. */
-	params.settings_addr  = BOOTLOADER_SETTINGS_ADDR;
+	/* Bootloader settings: CRC16 is computed by the RAM engine after writing. */
+	params.settings_addr = BOOTLOADER_SETTINGS_ADDR;
 
-	/* Provide page buffer (static, avoids stack overflow) */
-	static uint8_t __aligned(4) ota_page_buf[OTA_FLASH_PAGE_SIZE];
-	params.page_buf = ota_page_buf;
+	/* Reuse the OTA page buffer; its member alignment is asserted above. */
+	params.page_buf = ota.page_buf;
 
-	/* Stop ESB driver */
+	/* Stop ESB driver. */
 	LOG_WRN("OTA: Stopping ESB driver");
 	esb_disable();
 	k_msleep(50);
 
-	/* Copy RAM engine to RAM buffer */
-	/* The engine function is large (~3-4KB), allocate generous buffer.
-	 * Using static to avoid stack overflow. */
-	static uint8_t __aligned(4) ram_engine_buf[8192];
-	uintptr_t func_addr = (uintptr_t)ota_ram_engine;
-	uintptr_t func_start = func_addr & ~1U;
-	memcpy(ram_engine_buf, (void *)func_start, sizeof(ram_engine_buf));
-
-	LOG_WRN("OTA: RAM engine at %p, size up to %zu bytes", (void *)func_start, sizeof(ram_engine_buf));
+	/* The native __ramfunc section is copied to executable SRAM during Zephyr
+	 * early boot; do not duplicate it into a guessed-size local buffer. */
 	k_msleep(200);
 
-	/* Jump to RAM with IRQs disabled */
-	typedef void (*ram_engine_fn)(const struct ota_ram_engine_params *);
-	ram_engine_fn engine = (ram_engine_fn)((uintptr_t)ram_engine_buf | 1U);
-
+	/* Jump to the linked RAM engine with IRQs disabled. */
 	__disable_irq();
 
-	/* Disable MPU (SRAM is XN by default) */
+	/* Disable MPU (SRAM is XN by default with Zephyr's MPU config). */
 	MPU->CTRL = 0;
 	__DSB();
 	__ISB();
 
-	engine(&params);
-	/* Never reached */
+	ota_ram_engine(&params);
+	/* Never reached. */
 }
 #endif /* OTA_USE_RAM_ENGINE */
