@@ -1799,17 +1799,6 @@ int sensor_init(void)
 	sensor_fusion_init = true;
 	sensor_mag_timing_reset();
 
-	if (connection_get_data_collection() || connection_get_data_collection_batch()) {
-		sensor_send_raw_metadata();
-		connection_send_raw_calibration(true);
-		LOG_INF(
-			"Data collection mode: metadata + calibration sent (gyro %.0fdps, accel %.0fg, send %.0fHz, chip %.0fHz)",
-			(double)gyro_actual_range,
-			(double)accel_actual_range,
-			(double)raw_rate_plan.send_hz,
-			(double)raw_rate_plan.chip_hz
-		);
-	}
 
 	return 0;
 }
@@ -2302,24 +2291,11 @@ static void sensor_loop_handle_data_collection(bool *dc_active)
 		raw_gyr_quat[1] = 0.0f;
 		raw_gyr_quat[2] = 0.0f;
 		raw_gyr_quat[3] = 0.0f;
-		raw_rate_plan.emit_count = 0;
 		raw_rate_plan.batch_accum = 0.0f;
 		sensor_send_raw_metadata();
-		connection_send_raw_calibration(true);
-		LOG_INF(
-			"Data collection activated: send %.0fHz n_raw=%u chip %.0fHz%s",
-			(double)raw_rate_plan.send_hz,
-			raw_rate_plan.n_raw,
-			(double)raw_rate_plan.chip_hz,
-			raw_rate_plan.batch_active ? " batch" : ""
-		);
-	} else if (*dc_active && connection_raw_metadata_resend_due()) {
-		sensor_send_raw_metadata();
-		/* Batch re-sends skip T-Cal chunks: they are retained static data,
-		 * already delivered in full at session start, and re-dripping
-		 * ~28 chunks/tracker every 60 s floods the shared TDMA airtime. */
-		connection_send_raw_calibration(!connection_get_data_collection_batch());
+		LOG_INF("Data collection activated: metadata snapshot queued");
 	}
+	/* Metadata/calibration are session-stable; no periodic resend. */
 	last_batch_collect_generation = generation;
 	last_data_collection_state = *dc_active;
 }

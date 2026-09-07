@@ -163,10 +163,13 @@ static uint32_t received_test_rate_tps = 0; // Optional target TPS riding on TES
 static uint8_t received_batch_rate_hz;
 static uint8_t acked_batch_rate_hz;
 static uint8_t executing_batch_rate_hz;
-static float received_sens_data[3] = {0};   // Store sensitivity data
-static uint8_t received_sens_auto_axis = 0;
-static uint16_t received_sens_auto_revolutions = 0;
-#define REMOTE_COMMAND_DELAY_MS 1500
+static uint8_t received_metadata_mask;
+static uint8_t received_metadata_chunk;
+static uint16_t received_metadata_token;
+static bool metadata_echo_pending;
+static uint8_t received_sens_auto_axis;
+static uint16_t received_sens_auto_revolutions;
+static float received_sens_data[3] = {0};
 
 
 typedef void (*esb_remote_cmd_fn)(void);
@@ -576,6 +579,7 @@ static const struct esb_remote_cmd esb_remote_cmds[] = {
 	{ESB_PONG_FLAG_DATA_COLLECT_OFF, "DATA_COLLECT_OFF", esb_remote_cmd_data_collect_off},
 	{ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON, "DATA_COLLECT_BATCH_ON", esb_remote_cmd_data_collect_batch_on},
 	{ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF, "DATA_COLLECT_BATCH_OFF", esb_remote_cmd_data_collect_batch_off},
+	{ESB_PONG_FLAG_DATA_COLLECT_METADATA, "DATA_COLLECT_METADATA", NULL},
 	{ESB_PONG_FLAG_OTA_QUERY_INFO, "OTA_QUERY_INFO", esb_remote_cmd_ota_query_info},
 	{ESB_PONG_FLAG_OTA_ABORT, "OTA_ABORT", esb_remote_cmd_ota_abort},
 	{ESB_PONG_FLAG_OTA_SUPPRESS, "OTA_SUPPRESS", esb_remote_cmd_ota_suppress},
@@ -1430,30 +1434,34 @@ void event_handler(struct esb_evt const *event)
 						}
 					}
 
-					// handle remote commands and delayed execution
-					if (pong_flags != ESB_PONG_FLAG_NORMAL) {
+					if (pong_flags == ESB_PONG_FLAG_DATA_COLLECT_METADATA) {
+						received_metadata_mask = rx_payload.data[8];
+						received_metadata_chunk = rx_payload.data[9];
+						received_metadata_token = sys_get_be16(&rx_payload.data[10]);
+						connection_request_raw_metadata(
+							received_metadata_mask, received_metadata_chunk, received_metadata_token);
+						metadata_echo_pending = true;
+					} else if (pong_flags != ESB_PONG_FLAG_NORMAL) {
+						/* Real controls may supersede a pending metadata echo. */
+						metadata_echo_pending = false;
 						uint16_t pong_test_rate_tps = pong_flags == ESB_PONG_FLAG_TEST_MODE_ON
-							&& rx_payload.length >= 10
-							? ((uint16_t)rx_payload.data[8] << 8) | rx_payload.data[9] : 0;
+							&& rx_payload.length >= 10 ? sys_get_be16(&rx_payload.data[8]) : 0;
 						uint8_t pong_batch_rate_hz = pong_flags == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON
 							&& rx_payload.length >= 9 ? rx_payload.data[8] : 0;
 						bool test_rate_changed = pong_flags == ESB_PONG_FLAG_TEST_MODE_ON
 							&& pong_test_rate_tps != received_test_rate_tps;
 						bool batch_rate_changed = pong_flags == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON
 							&& pong_batch_rate_hz != received_batch_rate_hz;
-						if (received_remote_command == ESB_PONG_FLAG_NORMAL || test_rate_changed || batch_rate_changed ||
-						    (received_remote_command == acked_remote_command &&
-						     pong_flags != received_remote_command)) {
-							// New flag, a TEST_MODE_ON payload update, or override of
-							// an executed command whose confirmation was superseded.
+						if (received_remote_command == ESB_PONG_FLAG_NORMAL
+						    || test_rate_changed || batch_rate_changed
+						    || (received_remote_command == acked_remote_command
+						        && pong_flags != received_remote_command)) {
 							received_remote_command = pong_flags;
 							remote_command_receive_time = k_uptime_get();
-
-							// Extract command-specific PONG parameters before delayed execution.
 							if (pong_flags == ESB_PONG_FLAG_SET_CHANNEL) {
-								received_channel_value
-									= ((uint32_t)rx_payload.data[8] << 24) | ((uint32_t)rx_payload.data[9] << 16)
-									| ((uint32_t)rx_payload.data[10] << 8) | ((uint32_t)rx_payload.data[11]);
+								received_channel_value = ((uint32_t)rx_payload.data[8] << 24)
+									| ((uint32_t)rx_payload.data[9] << 16)
+									| ((uint32_t)rx_payload.data[10] << 8) | rx_payload.data[11];
 							} else if (pong_flags == ESB_PONG_FLAG_SENS_SET) {
 								memcpy(received_sens_data, pong_sens_data, sizeof(received_sens_data));
 							} else if (pong_flags == ESB_PONG_FLAG_SENS_AUTO) {
@@ -1464,31 +1472,12 @@ void event_handler(struct esb_evt const *event)
 							} else if (pong_flags == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
 								received_batch_rate_hz = pong_batch_rate_hz;
 							}
-							const char *cmd_name = esb_remote_cmd_name(pong_flags);
-							if (pong_flags == ESB_PONG_FLAG_SET_CHANNEL) {
-								LOG_INF(
-									"Remote command %s (0x%02X) received, channel=%u, will execute in %dms",
-									cmd_name,
-									pong_flags,
-									received_channel_value,
-									REMOTE_COMMAND_DELAY_MS
-								);
-							} else {
-								bool is_ota = (pong_flags >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
-									       pong_flags <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
-								LOG_INF(
-									"Remote command %s (0x%02X) received, %s",
-									cmd_name,
-									pong_flags,
-									is_ota ? "executing immediately" :
-									"will execute in 1500ms"
-								);
-							}
+							LOG_INF("Remote command %s (0x%02X) received",
+								esb_remote_cmd_name(pong_flags), pong_flags);
 						}
 					} else {
-						// received NORMAL flag, indicates the receiver has confirmed our echo
+						metadata_echo_pending = false;
 						if (acked_remote_command != ESB_PONG_FLAG_NORMAL) {
-							LOG_DBG("Receiver confirmed command 0x%02X, resetting state", acked_remote_command);
 							received_remote_command = ESB_PONG_FLAG_NORMAL;
 							acked_remote_command = ESB_PONG_FLAG_NORMAL;
 							remote_command_receive_time = 0;
@@ -1887,6 +1876,10 @@ int esb_write(uint8_t *data, bool no_ack, size_t data_length)
 	 * TDMA admission below still schedules them like batch stream data. */
 	bool is_batch_stream = is_batch_raw
 		&& data[0] != ESB_RAW_META_TYPE && data[0] != ESB_RAW_CAL_TYPE;
+	/* Batch stream loss is intentional: an ACK timeout plus hardware retry
+	 * can outlive the slot reserved for one raw packet. Keep ACK/retries for
+	 * metadata, calibration, PING, and reliable single-target collection. */
+	no_ack = no_ack || is_batch_stream;
 	bool drop_on_fifo_full = is_batch_stream || (no_ack && !is_raw);
 
 	tx_payload.pipe = 1 + (tracker_id % 7);
@@ -2142,6 +2135,11 @@ bool esb_ready(void)
 
 uint8_t esb_get_ping_ack_flag(void)
 {
+	/* A metadata PONG can replace the normal confirmation of a prior
+	 * control command; acknowledge its token before that older flag. */
+	if (metadata_echo_pending) {
+		return ESB_PONG_FLAG_DATA_COLLECT_METADATA;
+	}
 	if (acked_remote_command != ESB_PONG_FLAG_NORMAL) {
 		return acked_remote_command;
 	}
@@ -2149,6 +2147,19 @@ uint8_t esb_get_ping_ack_flag(void)
 		return received_remote_command;
 	}
 	return ESB_PONG_FLAG_NORMAL;
+}
+void esb_get_ping_request_data(uint8_t out[4])
+{
+	unsigned key = irq_lock();
+	if (metadata_echo_pending) {
+		out[0] = received_metadata_mask;
+		out[1] = received_metadata_chunk;
+		out[2] = (uint8_t)(received_metadata_token >> 8);
+		out[3] = (uint8_t)received_metadata_token;
+	} else {
+		memset(out, 0, 4);
+	}
+	irq_unlock(key);
 }
 
 uint64_t esb_get_server_time_ticks_64(void)
@@ -2261,11 +2272,10 @@ static void esb_thread(void)
 		int64_t now_idle = k_uptime_get();
 
 		bool command_pending = received_remote_command != ESB_PONG_FLAG_NORMAL
+			&& received_remote_command != ESB_PONG_FLAG_DATA_COLLECT_METADATA
 			&& remote_command_receive_time > 0;
 		if (command_pending) {
 			if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) {
-				/* Same-flag payload change stays pending while the applied target
-				 * differs from the latest PONG payload. */
 				command_pending = acked_remote_command != ESB_PONG_FLAG_TEST_MODE_ON
 					|| received_test_rate_tps != acked_test_rate_tps;
 			} else if (received_remote_command == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
@@ -2276,29 +2286,16 @@ static void esb_thread(void)
 			}
 		}
 		if (command_pending) {
-			/* OTA commands (0x30-0x33) bypass the safety delay since they are
-			 * time-sensitive and not destructive like SHUTDOWN/CALIBRATE. */
-			bool is_ota_cmd = (received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO &&
-					   received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS);
-			if (is_ota_cmd || now_idle - remote_command_receive_time >= REMOTE_COMMAND_DELAY_MS) {
-				/* Snapshot before executing: a PONG landing mid-execution
-				 * must not apply one rate while the ack records another. */
-				if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) {
-					executing_test_rate_tps = received_test_rate_tps;
-				} else if (received_remote_command == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
-					executing_batch_rate_hz = received_batch_rate_hz;
-				}
+			bool is_ota_cmd = received_remote_command >= ESB_PONG_FLAG_OTA_QUERY_INFO
+				&& received_remote_command <= ESB_PONG_FLAG_OTA_UNSUPPRESS;
+			if (is_ota_cmd || now_idle - remote_command_receive_time >= 100) {
+				if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) executing_test_rate_tps = received_test_rate_tps;
+				else if (received_remote_command == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) executing_batch_rate_hz = received_batch_rate_hz;
 				esb_remote_command_execute(received_remote_command);
-
 				acked_remote_command = received_remote_command;
-				if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) {
-					acked_test_rate_tps = executing_test_rate_tps;
-				} else if (received_remote_command == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
-					acked_batch_rate_hz = executing_batch_rate_hz;
-				}
-				if (received_remote_command == ESB_PONG_FLAG_SHUTDOWN) {
-					return;
-				}
+				if (received_remote_command == ESB_PONG_FLAG_TEST_MODE_ON) acked_test_rate_tps = executing_test_rate_tps;
+				else if (received_remote_command == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) acked_batch_rate_hz = executing_batch_rate_hz;
+				if (received_remote_command == ESB_PONG_FLAG_SHUTDOWN) return;
 			}
 		}
 
