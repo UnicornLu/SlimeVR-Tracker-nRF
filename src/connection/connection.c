@@ -1173,7 +1173,10 @@ bool connection_process_raw_data(void)
 
 		if (raw_ring_valid[idx] && raw_ring_seq[idx] == retx_seq) {
 			/* Retransmit from ring buffer */
-			esb_write(raw_ring[idx], false, RAW_PACKET_SIZE);
+			int err = esb_write(raw_ring[idx], false, RAW_PACKET_SIZE);
+			if (err != 0) {
+				k_msleep(1);
+			}
 			raw_retx_total++;
 		}
 		return true;
@@ -1198,11 +1201,15 @@ bool connection_process_raw_data(void)
 					raw_metadata_pending = false;
 					raw_metadata_sent = true;
 					raw_metadata_last_ms = now;
+				} else {
+					k_msleep(1);
 				}
 			} else {
 				sent = connection_cal_drip_send();
 				if (sent) {
 					k_usleep(600);
+				} else {
+					k_msleep(1);
 				}
 			}
 			raw_meta_cal_last_ms = now;
@@ -1274,7 +1281,12 @@ bool connection_process_raw_data(void)
 			raw_ring_valid[ring_idx] = true;
 		}
 
-		esb_write(buf, false, RAW_PACKET_SIZE);
+		int err = esb_write(buf, false, RAW_PACKET_SIZE);
+		if (err != 0) {
+			/* Batch mode intentionally drops FIFO/admission failures; all
+			 * failed sends still yield before the next queued sample. */
+			k_msleep(1);
+		}
 		return true;
 	}
 
@@ -1768,6 +1780,8 @@ void connection_thread(void)
 					test_rate_advance(k_ticks_to_us_near64(k_uptime_ticks()));
 				}
 				composite_commit_timestamps(&builder);
+			} else {
+				k_msleep(1);
 			}
 			continue;
 		}
@@ -1783,9 +1797,13 @@ void connection_thread(void)
 				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
 				if (send_composite_or_single(&builder, 4)) {
 					composite_commit_timestamps(&builder);
+				} else {
+					k_msleep(1);
 				}
 			} else if (connection_write_packet_4()) {
 				last_mag_time = now;
+			} else {
+				k_msleep(1);
 			}
 			continue;
 		}
@@ -1800,9 +1818,13 @@ void connection_thread(void)
 				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
 				if (send_composite_or_single(&builder, 0)) {
 					composite_commit_timestamps(&builder);
+				} else {
+					k_msleep(1);
 				}
 			} else if (connection_write_packet_0()) {
 				last_info_time = now;
+			} else {
+				k_msleep(1);
 			}
 			continue;
 		}
@@ -1815,9 +1837,13 @@ void connection_thread(void)
 				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
 				if (send_composite_or_single(&builder, 3)) {
 					composite_commit_timestamps(&builder);
+				} else {
+					k_msleep(1);
 				}
 			} else if (connection_write_packet_3()) {
 				last_status_time = now;
+			} else {
+				k_msleep(1);
 			}
 			continue;
 		}
@@ -1825,6 +1851,8 @@ void connection_thread(void)
 		if (runtime_due) {
 			if (connection_write_packet_5()) {
 				last_runtime_time = now;
+			} else {
+				k_msleep(1);
 			}
 			continue;
 		}
