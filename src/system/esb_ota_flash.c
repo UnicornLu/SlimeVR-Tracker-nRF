@@ -269,17 +269,31 @@ static void ota_flash_copy_from_ram(const struct flash_copy_params *p)
 		NRF_NVMC->ERASEPAGE = p->settings_addr;
 		while (!NRF_NVMC->READY) {}
 
-		/* Write settings */
+		/* Write metadata first while bank_0 remains invalid. The final word
+		 * commits BANK_VALID_APP only after all other settings are present. */
 		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
 		__DSB();
 		volatile uint32_t *dst = (volatile uint32_t *)p->settings_addr;
-		for (uint32_t w = 0; w < p->settings_words; w++) {
+		for (uint32_t w = 1; w < p->settings_words; w++) {
 			dst[w] = p->settings_data[w];
-			while (!NRF_NVMC->READY) {}
+			while (!NRF_NVMC->READY) {
+			}
+		}
+		dst[0] = p->settings_data[0];
+		while (!NRF_NVMC->READY) {
 		}
 
 		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
 		__DSB();
+		for (uint32_t w = 0; w < p->settings_words; w++) {
+			if (dst[w] != p->settings_data[w]) {
+				((volatile uint32_t *)0x4000051C)[0] = 0x57;
+				SCB->AIRCR = (0x5FA << SCB_AIRCR_VECTKEY_Pos) | SCB_AIRCR_SYSRESETREQ_Msk;
+				__DSB();
+				for (;;) {
+				}
+			}
+		}
 	}
 
 	/* Reset */

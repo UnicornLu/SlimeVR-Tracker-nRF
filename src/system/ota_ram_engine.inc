@@ -730,15 +730,13 @@ void ota_ram_engine(const struct ota_ram_engine_params *p)
 	}
 
 	/* ── Compute CRC16 and write bootloader settings ────────────── */
-	/* DISABLED: settings write crashes at 0xFF000 for unknown reason.
-	 * Bootloader boots the app without valid settings anyway.
-	 * Kept as reference for future investigation. */
-#if 0
+	/* Use the board-specific settings address (0x7F000 on nRF52833).
+	 * Keep this code self-contained in RAM after overwriting the application. */
 	*GPREGRET = 0xD4;  /* Starting CRC16 + settings write */
 	if (p->settings_addr != 0) {
 		*WDT_RR0 = 0x6E524635;
 
-		/* Compute Nordic SDK CRC-16 over written firmware */
+		/* Nordic SDK CRC-16 over exactly the written application bytes. */
 		uint16_t crc16 = 0xFFFF;
 		uint32_t rem16 = p->image_size;
 		uint32_t addr16 = p->flash_target;
@@ -751,55 +749,62 @@ void ota_ram_engine(const struct ota_ram_engine_params *p)
 				crc16 = (uint8_t)(crc16 >> 8) | (crc16 << 8);
 				crc16 ^= flash16[i];
 				crc16 ^= (uint8_t)(crc16 & 0xFF) >> 4;
-				crc16 ^= crc16 << 12;
-				crc16 ^= (crc16 & 0xFF) << 5;
+				crc16 ^= (crc16 << 8) << 4;
+				crc16 ^= ((crc16 & 0xFF) << 4) << 1;
 			}
 			addr16 += chunk16;
 			rem16 -= chunk16;
 		}
 
-		/* Build bootloader settings struct (28 bytes = 7 words):
-		 *   u16 bank_0 = 0x01 (BANK_VALID_APP)
-		 *   u16 bank_0_crc = crc16
-		 *   u16 bank_1 = 0x00 (BANK_INVALID_APP)
-		 *   u16 padding = 0
-		 *   u32 bank_0_size = image_size
-		 *   u32 sd_image_size = 0
-		 *   u32 bl_image_size = 0
-		 *   u32 app_image_size = 0
-		 *   u32 sd_image_start = 0
-		 */
-		uint32_t settings[7];
-		settings[0] = (uint32_t)crc16 << 16 | 0x0001;  /* bank_0_crc:bank_0 */
-		settings[1] = 0x00000000;  /* padding:bank_1 */
-		settings[2] = p->image_size;  /* bank_0_size */
-		settings[3] = 0;  /* sd_image_size */
-		settings[4] = 0;  /* bl_image_size */
-		settings[5] = 0;  /* app_image_size */
-		settings[6] = 0;  /* sd_image_start */
+		/* CRC16 values 0 and FFFF are legal. CRC32 already checked the complete
+		 * image; preserve the bootloader's CRC-zero semantics. */
 
-		/* Erase settings page */
+		/* Match struct bootloader_settings exactly (28 bytes / 7 words):
+		 * bank_0=VALID_APP, bank_0_crc=CRC16, bank_1=INVALID_APP,
+		 * padding=0, then bank_0_size and four zero image fields. */
+		uint32_t settings[7];
+		settings[0] = (uint32_t)crc16 << 16 | BANK_VALID_APP;
+		settings[1] = (uint32_t)BANK_INVALID_APP;
+		settings[2] = p->image_size;
+		settings[3] = 0;
+		settings[4] = 0;
+		settings[5] = 0;
+		settings[6] = 0;
+
+		/* Commit settings only after CRC succeeds and app contents are final. */
 		*GPREGRET = 0xD5;  /* Erasing settings page */
 		NVMC[N_CONFIG] = 2;  /* Een */
 		__asm volatile("dsb");
 		NVMC[N_ERASEPAGE] = p->settings_addr;
 		while (!NVMC[N_READY]) {}
 
-		/* Write settings */
 		*GPREGRET = 0xD6;  /* Writing settings words */
 		NVMC[N_CONFIG] = 1;  /* Wen */
 		__asm volatile("dsb");
 		volatile uint32_t *dst = (volatile uint32_t *)p->settings_addr;
-		for (uint32_t w = 0; w < 7; w++) {
+		/* Keep bank_0 invalid until every metadata word is present. */
+		for (uint32_t w = 1; w < 7; w++) {
 			dst[w] = settings[w];
 			while (!NVMC[N_READY]) {}
 		}
-
+		/* Final commit marker: bootloader may now validate the new image. */
+		dst[0] = settings[0];
+		while (!NVMC[N_READY]) {
+		}
 		NVMC[N_CONFIG] = 0;  /* Ren */
 		__asm volatile("dsb");
+		for (uint32_t w = 0; w < 7; w++) {
+			if (dst[w] != settings[w]) {
+				*GPREGRET = 0x57;
+				volatile uint32_t *SCB_AIRCR = (volatile uint32_t *)0xE000ED0C;
+				*SCB_AIRCR = (0x5FA << 16) | (1 << 2);
+				__asm volatile("dsb");
+				for (;;) {
+				}
+			}
+		}
 		*GPREGRET = 0xD7;  /* Settings write complete */
 	}
-#endif
 
 	/* ── Send COMPLETE status with TX+RX, then reset ────────────── */
 	*GPREGRET = 0xD8;  /* Sending COMPLETE */
