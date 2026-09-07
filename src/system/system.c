@@ -37,7 +37,7 @@ LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 static void button_thread(void);
 K_THREAD_DEFINE(
 	button_thread_id,
-	1024,
+	768,
 	button_thread,
 	NULL,
 	NULL,

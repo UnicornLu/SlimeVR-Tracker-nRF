@@ -63,7 +63,7 @@ static void console_thread(void);
 static const struct device *const console_uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 #if USB_EXISTS
 static struct k_thread console_thread_id;
-static K_THREAD_STACK_DEFINE(console_thread_stack, 2048);
+static K_THREAD_STACK_DEFINE(console_thread_stack, 1536);
 static bool console_thread_started;
 #endif
 static void console_uart_irq(const struct device *dev, void *user_data);
