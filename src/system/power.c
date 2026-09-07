@@ -558,7 +558,9 @@ static void power_thread(void)
 		if (!ota_gpregret_logged && system_uptime_since_boot_ms() > 5000) {
 			ota_gpregret_logged = true;
 			uint8_t gp = watchdog_get_ota_gpregret();
-			if (gp >= 0xD0 && gp <= 0xDE) {
+			if (gp == 0xDE) {
+				LOG_INF("OTA RAM engine completed (GPREGRET=0x%02X)", gp);
+			} else if (gp >= 0xD0 && gp < 0xDE) {
 				LOG_WRN("OTA RAM engine GPREGRET=0x%02X (last stage before reset)", gp);
 			}
 		}
