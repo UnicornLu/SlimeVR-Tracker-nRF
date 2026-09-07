@@ -43,6 +43,7 @@ struct ota_ram_engine_params {
 	uint32_t image_crc32;        /* Expected CRC32 of firmware */
 	uint32_t required_image_magic;
 	uint32_t flash_target;       /* Target flash address (e.g. 0x27000 or 0x1000) */
+	uint32_t flash_limit;        /* Exclusive app/NVS boundary; 0 disables check */
 	uint32_t page_size;          /* Flash page size (4096) */
 	uint16_t next_expected_seq;  /* Next sequence number to expect */
 	uint32_t bytes_received;     /* Bytes received so far */
@@ -131,10 +132,24 @@ void ota_ram_engine(const struct ota_ram_engine_params *p)
 	#define N_ERASEPAGE   (0x508/4)
 
 	/* ── Local state (all in stack / registers) ──────────────────── */
+	if (p->image_size == 0 || p->page_size == 0
+		|| (p->flash_limit != 0
+			&& (p->flash_target < 0x1000 || p->flash_target >= p->flash_limit
+				|| p->image_size > p->flash_limit - p->flash_target))) {
+		/* Invalid state cannot safely enter an in-place writer. */
+		*GPREGRET = 0x57; /* ADAFRUIT_DFU_MAGIC_UF2_RESET */
+		volatile uint32_t *SCB_AIRCR = (volatile uint32_t *)0xE000ED0C;
+		*SCB_AIRCR = (0x5FA << 16) | (1 << 2);
+		__asm volatile("dsb");
+		for (;;) {
+		}
+	}
+
+	/* ── Local state (all in stack / registers) ──────────────────── */
 	uint16_t next_seq = p->next_expected_seq;
 	uint32_t bytes_received = p->bytes_received;
 	uint32_t target_addr = p->flash_target + bytes_received;
-	uint8_t  pid = 0;  /* ESB packet ID (2-bit, cycles 0-3) */
+	uint8_t pid = 0; /* ESB packet ID (2-bit, cycles 0-3) */
 
 	/* Page buffer from caller (4KB, avoids stack overflow) */
 	uint8_t *page_buf = p->page_buf;

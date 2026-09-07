@@ -110,7 +110,11 @@ LOG_MODULE_REGISTER(esb_ota, LOG_LEVEL_INF);
 #define BOOTLOADER_SETTINGS_ADDR BOOTLOADER_SETTINGS_ADDR_52840
 #define OTA_SUPPORTED        1
 #elif CONFIG_SOC_NRF52833
-#define OTA_FLASH_END        0x74000
+#if DT_NODE_EXISTS(DT_NODELABEL(storage_partition))
+#define OTA_FLASH_END DT_REG_ADDR(DT_NODELABEL(storage_partition))
+#else
+#error "nRF52833 OTA requires a storage_partition DT app boundary"
+#endif
 #define OTA_USE_RAM_ENGINE   1  /* Use RAM engine for in-place writes */
 #define OTA_USE_MCUBOOT      0
 #define BOOTLOADER_SETTINGS_ADDR BOOTLOADER_SETTINGS_ADDR_52833
@@ -274,14 +278,14 @@ int esb_ota_handle_begin(const uint8_t *data, size_t len)
 		return -ENOTSUP;
 	}
 
-	/* Validate image size.
-	 * Use theoretical max (flash end - write base) as the early check.
-	 * The precise bounds check (flash_base + image_size > OTA_FLASH_END) and
-	 * the staging overlap check (nRF52840) below catch the real limits. */
 #if !OTA_USE_MCUBOOT
-	if (image_size == 0 || image_size > (OTA_FLASH_END - OTA_FLASH_BASE)) {
-		LOG_ERR("OTA BEGIN: invalid image size %u (max %u)", image_size,
-			OTA_FLASH_END - OTA_FLASH_BASE);
+	uint32_t target_base = flash_base != 0 ? flash_base : OTA_FLASH_BASE;
+
+	/* Validate image size against the actual DT app boundary. Keep the
+	 * subtraction guarded: malformed target addresses must not wrap it. */
+	uint32_t max_image_size = target_base < OTA_FLASH_END ? OTA_FLASH_END - target_base : 0;
+	if (image_size == 0 || max_image_size == 0 || image_size > max_image_size) {
+		LOG_ERR("OTA BEGIN: invalid image size %u (target 0x%X, max %u)", image_size, target_base, max_image_size);
 		ota.state = OTA_STATE_ERROR;
 		ota.error_code = OTA_STATUS_SIZE_ERROR;
 		ota_send_status();
@@ -331,7 +335,6 @@ int esb_ota_handle_begin(const uint8_t *data, size_t len)
 		ota_send_status();
 		return -EINVAL;
 	}
-#endif
 	if (flash_base != 0 && flash_base > OTA_FLASH_BASE) {
 		LOG_ERR("OTA BEGIN: flash base 0x%X > running base 0x%X — "
 			"target firmware requires SoftDevice not present",
@@ -341,14 +344,16 @@ int esb_ota_handle_begin(const uint8_t *data, size_t len)
 		ota_send_status();
 		return -EINVAL;
 	}
-	if (flash_base != 0 && (flash_base + image_size) > OTA_FLASH_END) {
-		LOG_ERR("OTA BEGIN: image at 0x%X + %u exceeds flash end 0x%X",
-			flash_base, image_size, OTA_FLASH_END);
+#endif
+#if !OTA_USE_MCUBOOT
+	if (target_base < 0x1000 || target_base > OTA_FLASH_END || image_size > OTA_FLASH_END - target_base) {
+		LOG_ERR("OTA BEGIN: image at 0x%X + %u exceeds flash end 0x%X", target_base, image_size, OTA_FLASH_END);
 		ota.state = OTA_STATE_ERROR;
 		ota.error_code = OTA_STATUS_SIZE_ERROR;
 		ota_send_status();
 		return -EINVAL;
 	}
+#endif
 
 	/* Validate flash device */
 	if (!esb_ota_flash_ready()) {
@@ -918,6 +923,7 @@ static void ota_launch_ram_engine(void)
 	params.required_image_magic = IS_ENABLED(CONFIG_BOOTLOADER_MCUBOOT) ?
 		OTA_MCUBOOT_IMAGE_MAGIC : 0;
 	params.flash_target      = ota.target_flash_base;
+	params.flash_limit = OTA_FLASH_END;
 	params.page_size         = OTA_FLASH_PAGE_SIZE;
 	params.next_expected_seq = 0;
 	params.bytes_received    = 0;
