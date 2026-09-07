@@ -16,6 +16,9 @@
 #include "build_defines.h"
 #include "parse_args.h"
 #include "zephyr/sys/printk.h"
+#if CONFIG_THREAD_ANALYZER
+#include <zephyr/debug/thread_analyzer.h>
+#endif
 
 #define USB_EXISTS 0
 #if CONFIG_USB_DEVICE_STACK_NEXT
@@ -1209,6 +1212,9 @@ static void print_help(void)
 	printk("  ping                       Flash LED (same as remote PING command)\n");
 	printk("  meow                       Meow!\n");
 	printk("  nvs                        Show NVS usage statistics\n");
+#if CONFIG_THREAD_ANALYZER
+	printk("  stack                      Print thread and ISR stack high-water usage\n");
+#endif
 	printk("  help                       Show this help message\n");
 	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 1s)\n");
 	printk("  range                      Show sensor range statistics (min/max values)\n");
@@ -1976,6 +1982,17 @@ static void console_cmd_nvs(size_t argc, char **argv)
 	sys_nvs_stats();
 }
 
+#if CONFIG_THREAD_ANALYZER
+static void console_cmd_stack(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	printk("Thread/ISR stack high-water usage:\n");
+	thread_analyzer_print(0);
+}
+#endif
+
 static void console_cmd_meow(size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
@@ -2157,6 +2174,9 @@ static const struct console_cmd console_cmds[] = {
 	{"nvs", console_cmd_nvs},
 	{"meow", console_cmd_meow},
 	{"debug", console_cmd_debug},
+#if CONFIG_THREAD_ANALYZER
+	{"stack", console_cmd_stack},
+#endif
 	{"range", console_cmd_range},
 #if CONFIG_VQF_BENCH
 	{"vqfbench", console_cmd_vqfbench},
