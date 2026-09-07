@@ -653,6 +653,15 @@ config TDMA_DIAGNOSTICS
 
 endmenu
 
+config ESB_OTA_FORCE_RAM_ENGINE
+    bool "Force nRF52840 OTA RAM engine test profile"
+    default n
+    depends on SOC_NRF52840 && !BOOTLOADER_MCUBOOT
+    help
+        Use the native in-place RAM OTA engine on nRF52840 for reliability
+        testing. Production nRF52840 OTA keeps the staging-area path unless
+        this opt-in test profile is explicitly enabled.
+
 rsource "Kconfig.sensors_drivers"
 
 source "Kconfig.zephyr"

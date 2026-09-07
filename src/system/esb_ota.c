@@ -107,6 +107,12 @@ LOG_MODULE_REGISTER(esb_ota, LOG_LEVEL_INF);
 #endif
 #define OTA_USE_MCUBOOT      0
 #define BOOTLOADER_SETTINGS_ADDR 0
+#elif CONFIG_SOC_NRF52840 && CONFIG_ESB_OTA_FORCE_RAM_ENGINE
+#define OTA_FLASH_END        0xEE000 /* Same 52840 app boundary as staging OTA */
+#define OTA_USE_RAM_ENGINE   1
+#define OTA_USE_MCUBOOT      0
+#define BOOTLOADER_SETTINGS_ADDR BOOTLOADER_SETTINGS_ADDR_52840
+#define OTA_SUPPORTED        1
 #elif CONFIG_SOC_NRF52840
 #define OTA_FLASH_END        0xEE000 /* End of app partition (before NVS) */
 #define OTA_USE_RAM_ENGINE   0
@@ -899,7 +905,11 @@ static struct esb_ota_page_buf ota_page_buf_view(void)
 
 static void ota_launch_ram_engine(void)
 {
+#if CONFIG_ESB_OTA_FORCE_RAM_ENGINE
+	LOG_WRN("OTA TEST: Launching forced nRF52840 native RAM engine (in-place)");
+#else
 	LOG_WRN("OTA: Launching RAM engine for in-place update");
+#endif
 	LOG_WRN("OTA: target=0x%05X size=%u crc32=0x%08X",
 		ota.target_flash_base, ota.image_size, ota.image_crc32);
 	k_msleep(200); /* Flush logs */
