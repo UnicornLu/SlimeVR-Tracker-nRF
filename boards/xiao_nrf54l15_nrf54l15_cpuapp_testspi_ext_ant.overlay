@@ -1,0 +1,10 @@
+/*
+ * External-antenna SPI test variant (-DFILE_SUFFIX=testspi_ext_ant).
+ * Keep the testspi wiring and select the external antenna with P2.05 HIGH,
+ * matching xiao_nrf54l15_nrf54l15_cpuapp_ext_ant.overlay.
+ */
+#include "xiao_nrf54l15_nrf54l15_cpuapp_testspi.overlay"
+
+&rfsw_ctl {
+	enable-gpios = <&gpio2 5 GPIO_ACTIVE_HIGH>;
+};

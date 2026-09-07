@@ -4,7 +4,7 @@
  *
  * Wiring (XIAO pin -> external IMU module):
  *   GND  -> GND
- *   3V3  -> 3V3
+ *   P1.00 (D0)  -> 3V3 (active-high sensor power)
  *   P1.06 (D10) -> SCL  (SPI SCK)
  *   P1.05 (D9)  -> SDA  (SPI MOSI / SDI)
  *   P1.04 (D8)  -> CS
@@ -56,6 +56,7 @@
 / {
 	zephyr,user {
 		int0-gpios = <&xiao_d 6 GPIO_ACTIVE_HIGH>;
+		pwr-gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
 	};
 };
 
