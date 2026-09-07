@@ -414,7 +414,11 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 	// Gate accelerometer by magnitude as well: skip the direction check
 	// entirely when the device is under strong linear acceleration, falling
 	// back to mag-only for that sample.
-	float accel_mag_sq = aBuf[0] * aBuf[0] + aBuf[1] * aBuf[1] + aBuf[2] * aBuf[2];
+	float accel_snapshot[3];
+	bool have_accel = sensor_peek_accel(accel_snapshot);
+	float accel_mag_sq = have_accel ? accel_snapshot[0] * accel_snapshot[0] + accel_snapshot[1] * accel_snapshot[1]
+										  + accel_snapshot[2] * accel_snapshot[2]
+									: 0.0f;
 	bool accel_trustworthy = (accel_mag_sq >= MAG_CAL_ACCEL_MAG_MIN_SQ && accel_mag_sq <= MAG_CAL_ACCEL_MAG_MAX_SQ);
 
 	float raw_mag[3] = {m[0], m[1], m[2]};
@@ -431,9 +435,9 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 	float cur_accel_dir[3] = {0};
 	if (accel_trustworthy) {
 		float accel_inv = 1.0f / sqrtf(accel_mag_sq);
-		cur_accel_dir[0] = aBuf[0] * accel_inv;
-		cur_accel_dir[1] = aBuf[1] * accel_inv;
-		cur_accel_dir[2] = aBuf[2] * accel_inv;
+		cur_accel_dir[0] = accel_snapshot[0] * accel_inv;
+		cur_accel_dir[1] = accel_snapshot[1] * accel_inv;
+		cur_accel_dir[2] = accel_snapshot[2] * accel_inv;
 	}
 
 	if (sample_count > 0) {

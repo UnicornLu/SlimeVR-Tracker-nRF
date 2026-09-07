@@ -32,6 +32,7 @@
 #include "sensor/magneto/magneto1_4.h"
 
 #include "calibration.h"
+#include "cal_sample.h"
 #include "mag_common.h"
 #include "online_mag.h"
 
@@ -772,7 +773,12 @@ void sensor_calibration_online_mag_sample(const float m[3])
 	}
 
 	// Gate by accel magnitude: reject samples under strong linear acceleration
-	float accel_mag_sq = aBuf[0] * aBuf[0] + aBuf[1] * aBuf[1] + aBuf[2] * aBuf[2];
+	float accel_snapshot[3];
+	if (!sensor_peek_accel(accel_snapshot)) {
+		return;
+	}
+	float accel_mag_sq = accel_snapshot[0] * accel_snapshot[0] + accel_snapshot[1] * accel_snapshot[1]
+					   + accel_snapshot[2] * accel_snapshot[2];
 	if (accel_mag_sq < MAG_CAL_ACCEL_MAG_MIN_SQ || accel_mag_sq > MAG_CAL_ACCEL_MAG_MAX_SQ) {
 		return;
 	}
@@ -794,11 +800,10 @@ void sensor_calibration_online_mag_sample(const float m[3])
 		return;
 	}
 
-	// Normalize accelerometer to get gravity direction
-	// aBuf magnitude already validated (~1g) by the accel gate above
+	// Normalize accelerometer (validated above).
 	float accel_norm = sqrtf(accel_mag_sq);
 	float accel_inv = 1.0f / accel_norm;
-	float cur_accel_dir[3] = {aBuf[0] * accel_inv, aBuf[1] * accel_inv, aBuf[2] * accel_inv};
+	float cur_accel_dir[3] = {accel_snapshot[0] * accel_inv, accel_snapshot[1] * accel_inv, accel_snapshot[2] * accel_inv};
 
 	if ((uint32_t)atomic_get(&online_total_sample_count) > 0) {
 		float mag_dot = cur_dir[0] * online_last_dir[0]

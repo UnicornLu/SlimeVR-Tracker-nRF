@@ -40,10 +40,8 @@ typedef struct {
 	float max[3];
 	bool initialized;
 } mag_center_estimator_t;
-
-/* magBAinv: calibration.c; aBuf: cal_sample.c; magneto_progress: cal_mag.c */
+/* magBAinv: calibration.c; magneto_progress: cal_mag.c */
 extern float magBAinv[4][3];
-extern float aBuf[3];
 extern uint8_t magneto_progress;
 
 void magneto_center_reset(mag_center_estimator_t *estimator);

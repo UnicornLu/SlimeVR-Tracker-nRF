@@ -571,6 +571,7 @@ static void calibration_thread(void)
 		int requested = sensor_calibration_request(0);
 		switch (requested) {
 		case 1:
+			sensor_calibration_samples_reset();
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_calibrate_imu();
 			sensor_calibration_request(-1); // clear request
@@ -578,6 +579,7 @@ static void calibration_thread(void)
 			break;
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 		case 2:
+			sensor_calibration_samples_reset();
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_calibrate_6_side();
 			sensor_calibration_request(-1); // clear request
@@ -586,12 +588,14 @@ static void calibration_thread(void)
 #endif
 #if CONFIG_SENSOR_USE_TCAL
 		case 3: // Boot calibration
+			sensor_calibration_samples_reset();
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_perform_boot_calibration();
 			sensor_calibration_request(-1); // clear request
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 			break;
 		case 4: // Runtime periodic calibration
+			sensor_calibration_samples_reset();
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_perform_runtime_calibration();
 			sensor_calibration_request(-1); // clear request
@@ -600,6 +604,7 @@ static void calibration_thread(void)
 #endif
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 		case 5: // Gyro sensitivity calibration
+			sensor_calibration_samples_reset();
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 			sensor_calibrate_sens();
 			sensor_calibration_request(-1); // clear request
@@ -617,6 +622,7 @@ static void calibration_thread(void)
 				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
 				k_msleep(800);
 				watchdog_feed(WDT_CHANNEL_CALIBRATION);
+				sensor_calibration_samples_reset();
 				magneto_reset();
 				magneto_online_reset();
 				magneto_progress |= 1 << 7;
