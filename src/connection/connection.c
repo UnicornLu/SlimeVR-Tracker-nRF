@@ -680,18 +680,43 @@ static int64_t ota_suppress_start_time = 0;  /* Timestamp when suppress was enab
 #define OTA_SUPPRESS_TIMEOUT_MS (10 * 60 * 1000)
 
 /*
- * ARQ ring buffer: stores last RAW_RING_SIZE sent packets for retransmission.
- * Indexed by (sequence % RAW_RING_SIZE).
+ * ARQ ring buffer: stores the last RAW_RING_SIZE sent packets for
+ * retransmission. The packet's existing big-endian sequence at bytes 2..3 is
+ * authoritative; the bitmap only records whether a slot contains a published
+ * packet for the current collection session.
  */
-#define RAW_RING_SIZE 256
+#define RAW_RING_SIZE 128
 #define RAW_PACKET_SIZE 52 /* Fixed size for raw meta / gyrQuat / cal payloads */
 static uint8_t raw_ring[RAW_RING_SIZE][RAW_PACKET_SIZE];
-static bool raw_ring_valid[RAW_RING_SIZE];
-static uint16_t raw_ring_seq[RAW_RING_SIZE];
+static uint8_t raw_ring_valid_bits[(RAW_RING_SIZE + 7) / 8];
+static uint8_t *raw_ring_get(uint16_t sequence)
+{
+	uint16_t index = sequence % RAW_RING_SIZE;
+	uint8_t mask = (uint8_t)BIT(index & 7U);
+	if ((raw_ring_valid_bits[index >> 3] & mask) == 0
+		|| sys_get_be16(&raw_ring[index][2]) != sequence) {
+		return NULL;
+	}
+	return raw_ring[index];
+}
+
+static void raw_ring_store(const uint8_t packet[RAW_PACKET_SIZE])
+{
+	uint16_t sequence = sys_get_be16(&packet[2]);
+	uint16_t index = sequence % RAW_RING_SIZE;
+	uint8_t mask = (uint8_t)BIT(index & 7U);
+	uint8_t *valid_byte = &raw_ring_valid_bits[index >> 3];
+
+	/* Invalidate before overwrite, then publish only after the complete
+	 * packet (including its BE sequence) is in the slot. */
+	*valid_byte &= (uint8_t)~mask;
+	memcpy(raw_ring[index], packet, RAW_PACKET_SIZE);
+	*valid_byte |= mask;
+}
 
 /*
  * Retransmit queue: filled by ESB event handler when ACK payload carries
- * retransmit requests (RAW_ARQ_MARKER).  Up to RAW_RETX_MAX entries.
+ * retransmit requests (RAW_ARQ_MARKER). Up to RAW_RETX_MAX entries.
  * Connection thread drains this before sending new data.
  */
 #define RAW_RETX_MAX 16
@@ -716,6 +741,7 @@ static uint8_t raw_request_chunk;
 static uint16_t raw_request_token;
 static bool raw_cal_points_all;
 static bool raw_request_token_valid;
+
 
 #define RAW_META_MASK_BASIC      0x01
 #define RAW_META_MASK_ACCEL      0x02
@@ -899,14 +925,13 @@ static void connection_reset_raw_collection(bool reset_arq)
 	latest_mag_valid = false;
 	k_spin_unlock(&latest_mag_lock, mag_key);
 	if (reset_arq) {
-		memset(raw_ring_valid, 0, sizeof(raw_ring_valid));
+		memset(raw_ring_valid_bits, 0, sizeof(raw_ring_valid_bits));
 		unsigned key = irq_lock();
 		raw_retx_count = 0;
 		irq_unlock(key);
 		raw_retx_total = 0;
 	}
 }
-
 void connection_set_data_collection(bool enable)
 {
 	bool was_active = connection_get_data_collection();
@@ -1180,11 +1205,10 @@ bool connection_process_raw_data(void)
 		irq_unlock(irq_key);
 	}
 	if (have_retx) {
-		uint16_t idx = retx_seq % RAW_RING_SIZE;
-
-		if (raw_ring_valid[idx] && raw_ring_seq[idx] == retx_seq) {
+		uint8_t *packet = raw_ring_get(retx_seq);
+		if (packet != NULL) {
 			/* Retransmit from ring buffer */
-			int err = esb_write(raw_ring[idx], false, RAW_PACKET_SIZE);
+			int err = esb_write(packet, false, RAW_PACKET_SIZE);
 			if (err != 0) {
 				k_msleep(1);
 			}
@@ -1211,7 +1235,6 @@ bool connection_process_raw_data(void)
 			k_msleep(1);
 		}
 	}
-
 
 	/* Wait for metadata before sending data */
 	/* Metadata may be queued immediately, but raw samples are not admitted
@@ -1268,10 +1291,7 @@ bool connection_process_raw_data(void)
 
 		/* Only reliable single-target collection retains ARQ history. */
 		if (!connection_get_data_collection_batch()) {
-			uint16_t ring_idx = seq % RAW_RING_SIZE;
-			memcpy(raw_ring[ring_idx], buf, RAW_PACKET_SIZE);
-			raw_ring_seq[ring_idx] = seq;
-			raw_ring_valid[ring_idx] = true;
+			raw_ring_store(buf);
 		}
 
 		int err = esb_write(buf, false, RAW_PACKET_SIZE);
