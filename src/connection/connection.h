@@ -64,30 +64,36 @@ struct raw_imu_sample {
 void connection_set_data_collection(bool enable);
 bool connection_get_data_collection(void);
 
+// Batch raw sensor data collection (runtime controlled via PONG command)
+void connection_set_data_collection_batch(bool enable, uint16_t rate_hz);
+bool connection_get_data_collection_batch(void);
+uint16_t connection_get_data_collection_batch_rate(void);
+
 // OTA suppression: reduce poll rate when another tracker is being updated
 void connection_set_ota_suppressed(bool suppressed);
 bool connection_get_ota_suppressed(void);
 
-// Queue a raw IMU sample for transmission (called from sensor thread)
+// Queue a raw IMU sample for transmission (called from sensor thread).
+// Samples during the first five seconds of a session are intentionally
+// discarded while metadata/calibration establishes the recording baseline.
 void connection_queue_raw_sample(const struct raw_imu_sample *sample);
+bool connection_raw_collection_startup_done(void);
 
-// Queue uncalibrated magnetometer data for body-frame raw transport
+// Queue uncalibrated magnetometer data for body-frame raw transport.
 void connection_queue_raw_mag(const float mag[3]);
-
 /* Raw meta: gyro_odr = raw TX rate (fusion INT_merge Hz); chip/fusion Hz after mag_id. */
 void connection_send_raw_metadata(float gyro_range, float accel_range,
 				  float gyro_odr, float accel_odr,
 				  float mag_odr, uint8_t imu_id, uint8_t mag_id,
 				  float chip_gyro_hz, float fusion_gyro_hz);
 
-/* Send calibration drip packets (after metadata). */
-void connection_send_raw_calibration(void);
-
-// Check if metadata needs periodic re-send (returns true if due)
-bool connection_raw_metadata_resend_due(void);
+/* Queue a receiver-requested metadata/calibration subset. The connection
+ * thread owns transmission; calls are safe from ESB event context. */
+void connection_request_raw_metadata(uint8_t mask, uint8_t chunk, uint16_t token);
 
 // Drain queued raw data and transmit (called from connection thread)
-// Returns true if a packet was sent
+// Returns true if a packet was sent or an admission was deliberately retried.
 bool connection_process_raw_data(void);
+
 
 #endif

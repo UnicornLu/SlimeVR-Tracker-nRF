@@ -37,7 +37,7 @@ LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 static void button_thread(void);
 K_THREAD_DEFINE(
 	button_thread_id,
-	1024,
+	768,
 	button_thread,
 	NULL,
 	NULL,
@@ -575,7 +575,12 @@ static struct gpio_callback button_cb_data;
 static int sys_button_init(void)
 {
 #ifdef NRF_RESET
+#ifdef RESET_RESETREAS_VBUS_Msk
 	bool reset_vbus_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_VBUS_Msk;
+#else
+	/* SoCs without USB (e.g. nRF54L15) have no VBUS reset reason. */
+	bool reset_vbus_reset = false;
+#endif
 #else
 	bool reset_vbus_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_VBUS_Msk;
 #endif

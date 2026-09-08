@@ -61,7 +61,11 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/logging/log.h>
 #include <hal/nrf_radio.h>
+#include <zephyr/toolchain.h>
+#include <stddef.h>
 #include <string.h>
+
+
 
 LOG_MODULE_REGISTER(esb_ota, LOG_LEVEL_INF);
 
@@ -103,6 +107,12 @@ LOG_MODULE_REGISTER(esb_ota, LOG_LEVEL_INF);
 #endif
 #define OTA_USE_MCUBOOT      0
 #define BOOTLOADER_SETTINGS_ADDR 0
+#elif CONFIG_SOC_NRF52840 && CONFIG_ESB_OTA_FORCE_RAM_ENGINE
+#define OTA_FLASH_END        0xEE000 /* Same 52840 app boundary as staging OTA */
+#define OTA_USE_RAM_ENGINE   1
+#define OTA_USE_MCUBOOT      0
+#define BOOTLOADER_SETTINGS_ADDR BOOTLOADER_SETTINGS_ADDR_52840
+#define OTA_SUPPORTED        1
 #elif CONFIG_SOC_NRF52840
 #define OTA_FLASH_END        0xEE000 /* End of app partition (before NVS) */
 #define OTA_USE_RAM_ENGINE   0
@@ -110,7 +120,11 @@ LOG_MODULE_REGISTER(esb_ota, LOG_LEVEL_INF);
 #define BOOTLOADER_SETTINGS_ADDR BOOTLOADER_SETTINGS_ADDR_52840
 #define OTA_SUPPORTED        1
 #elif CONFIG_SOC_NRF52833
-#define OTA_FLASH_END        0x74000
+#if DT_NODE_EXISTS(DT_NODELABEL(storage_partition))
+#define OTA_FLASH_END DT_REG_ADDR(DT_NODELABEL(storage_partition))
+#else
+#error "nRF52833 OTA requires a storage_partition DT app boundary"
+#endif
 #define OTA_USE_RAM_ENGINE   1  /* Use RAM engine for in-place writes */
 #define OTA_USE_MCUBOOT      0
 #define BOOTLOADER_SETTINGS_ADDR BOOTLOADER_SETTINGS_ADDR_52833
@@ -145,7 +159,7 @@ enum ota_state {
 	OTA_STATE_ERROR,
 };
 
-static struct {
+struct ota_context {
 	enum ota_state state;
 	uint32_t image_size;
 	uint32_t image_crc32;
@@ -158,8 +172,8 @@ static struct {
 	uint8_t  error_code;
 	char     expected_board[OTA_BOARD_TARGET_MAX];
 
-	/* Page write buffer: accumulate data until a full page (4 KB) is ready */
-	uint8_t  page_buf[OTA_FLASH_PAGE_SIZE];
+	/* Page write buffer shared by staging writes and the in-place RAM engine. */
+	uint8_t  page_buf[OTA_FLASH_PAGE_SIZE] __aligned(4);
 	uint16_t page_buf_offset;       /* Current position in page_buf */
 	uint32_t page_buf_flash_addr;   /* Flash address this buffer maps to (staging area) */
 
@@ -167,18 +181,21 @@ static struct {
 	 * then copied to the final location with interrupts disabled + reset. */
 	uint32_t staging_base;          /* Start of staging area in flash */
 	uint32_t target_flash_base;     /* Destination base address for the new firmware */
-} ota;
+};
+
+static struct ota_context ota;
+
+BUILD_ASSERT(offsetof(struct ota_context, page_buf) % __alignof__(uint32_t) == 0,
+	     "OTA page buffer member must be word-aligned");
+BUILD_ASSERT(sizeof(((struct ota_context *)0)->page_buf) >= OTA_FLASH_PAGE_SIZE,
+	     "OTA page buffer member is smaller than one flash page");
 
 /* ── Forward declarations ────────────────────────────────────────── */
-
 static void ota_send_status(void);
 static void ota_send_fw_info(void);
 static struct esb_ota_page_buf ota_page_buf_view(void);
 
 #if OTA_USE_RAM_ENGINE
-/* External: bare-metal RAM OTA engine (defined in ota_ram_engine.c) */
-struct ota_ram_engine_params;
-extern void ota_ram_engine(const struct ota_ram_engine_params *p);
 static void ota_launch_ram_engine(void);
 #endif
 
@@ -274,14 +291,14 @@ int esb_ota_handle_begin(const uint8_t *data, size_t len)
 		return -ENOTSUP;
 	}
 
-	/* Validate image size.
-	 * Use theoretical max (flash end - write base) as the early check.
-	 * The precise bounds check (flash_base + image_size > OTA_FLASH_END) and
-	 * the staging overlap check (nRF52840) below catch the real limits. */
 #if !OTA_USE_MCUBOOT
-	if (image_size == 0 || image_size > (OTA_FLASH_END - OTA_FLASH_BASE)) {
-		LOG_ERR("OTA BEGIN: invalid image size %u (max %u)", image_size,
-			OTA_FLASH_END - OTA_FLASH_BASE);
+	uint32_t target_base = flash_base != 0 ? flash_base : OTA_FLASH_BASE;
+
+	/* Validate image size against the actual DT app boundary. Keep the
+	 * subtraction guarded: malformed target addresses must not wrap it. */
+	uint32_t max_image_size = target_base < OTA_FLASH_END ? OTA_FLASH_END - target_base : 0;
+	if (image_size == 0 || max_image_size == 0 || image_size > max_image_size) {
+		LOG_ERR("OTA BEGIN: invalid image size %u (target 0x%X, max %u)", image_size, target_base, max_image_size);
 		ota.state = OTA_STATE_ERROR;
 		ota.error_code = OTA_STATUS_SIZE_ERROR;
 		ota_send_status();
@@ -331,7 +348,6 @@ int esb_ota_handle_begin(const uint8_t *data, size_t len)
 		ota_send_status();
 		return -EINVAL;
 	}
-#endif
 	if (flash_base != 0 && flash_base > OTA_FLASH_BASE) {
 		LOG_ERR("OTA BEGIN: flash base 0x%X > running base 0x%X — "
 			"target firmware requires SoftDevice not present",
@@ -341,14 +357,16 @@ int esb_ota_handle_begin(const uint8_t *data, size_t len)
 		ota_send_status();
 		return -EINVAL;
 	}
-	if (flash_base != 0 && (flash_base + image_size) > OTA_FLASH_END) {
-		LOG_ERR("OTA BEGIN: image at 0x%X + %u exceeds flash end 0x%X",
-			flash_base, image_size, OTA_FLASH_END);
+#endif
+#if !OTA_USE_MCUBOOT
+	if (target_base < 0x1000 || target_base > OTA_FLASH_END || image_size > OTA_FLASH_END - target_base) {
+		LOG_ERR("OTA BEGIN: image at 0x%X + %u exceeds flash end 0x%X", target_base, image_size, OTA_FLASH_END);
 		ota.state = OTA_STATE_ERROR;
 		ota.error_code = OTA_STATUS_SIZE_ERROR;
 		ota_send_status();
 		return -EINVAL;
 	}
+#endif
 
 	/* Validate flash device */
 	if (!esb_ota_flash_ready()) {
@@ -590,14 +608,27 @@ int esb_ota_handle_data(const uint8_t *data, size_t len)
 
 int esb_ota_handle_verify(void)
 {
-	if (ota.bytes_written < ota.image_size) {
-		LOG_ERR("OTA VERIFY: not all data received (%u/%u bytes)",
-			ota.bytes_written, ota.image_size);
+	/* VERIFY is meaningful only for a live, non-empty session. Never let
+	 * the zeroed idle state look like a verified zero-byte image. Repeated
+	 * VERIFY remains supported. */
+	bool valid_session
+		= ota.state == OTA_STATE_READY || ota.state == OTA_STATE_RECEIVING || ota.state == OTA_STATE_VERIFYING;
+	if (!valid_session || ota.image_size == 0 || ota.bytes_written != ota.image_size) {
+		if (ota.state != OTA_STATE_IDLE && ota.state != OTA_STATE_ERROR) {
+			ota.error_code = OTA_STATUS_VERIFY_FAIL;
+		}
+		LOG_ERR(
+			"OTA VERIFY: incomplete or invalid session (state=%d, %u/%u bytes)",
+			ota.state,
+			ota.bytes_written,
+			ota.image_size
+		);
 		ota_send_status();
 		return -EINVAL;
 	}
-
-	LOG_INF("OTA: Verifying CRC32...");
+	/* A valid session may be re-verified after a prior success. Clear the
+	 * old marker before CRC work so a failed retry can never activate. */
+	ota.error_code = 0;
 	ota.state = OTA_STATE_VERIFYING;
 	ota_send_status();
 
@@ -613,7 +644,6 @@ int esb_ota_handle_verify(void)
 	}
 
 	LOG_INF("OTA: CRC32 verified OK (0x%08X)", calc_crc);
-	ota.state = OTA_STATE_VERIFYING; /* Stay in VERIFYING — get_status checks error_code */
 	ota.error_code = OTA_STATUS_VERIFY_OK;
 	ota.last_data_time = k_uptime_get(); /* Reset timeout — waiting for ACTIVATE */
 	k_msleep(100);
@@ -625,11 +655,10 @@ int esb_ota_handle_verify(void)
 int esb_ota_handle_activate(void)
 {
 	k_msleep(100);
-	if (ota.error_code != OTA_STATUS_VERIFY_OK) {
+	if (ota.state != OTA_STATE_VERIFYING || ota.error_code != OTA_STATUS_VERIFY_OK) {
 		LOG_ERR("OTA ACTIVATE: firmware not verified");
 		return -EINVAL;
 	}
-
 	LOG_WRN("OTA: Activating new firmware...");
 	ota.state = OTA_STATE_ACTIVATING;
 	ota_send_status();
@@ -871,24 +900,21 @@ static struct esb_ota_page_buf ota_page_buf_view(void)
 		.pre_erased = OTA_USE_MCUBOOT,
 	};
 }
-
 #if OTA_USE_RAM_ENGINE
-/*
- * Launch the bare-metal RAM OTA engine.
- * Captures current RADIO configuration, stops the SDK ESB driver,
- * copies the engine function to RAM, and jumps to it with IRQs disabled.
- * This function never returns.
- */
-#include "ota_ram_engine.inc"  /* Include for struct definition + function body */
+#include "ota_ram_engine.inc"  /* Struct definition + native RAM function */
 
 static void ota_launch_ram_engine(void)
 {
+#if CONFIG_ESB_OTA_FORCE_RAM_ENGINE
+	LOG_WRN("OTA TEST: Launching forced nRF52840 native RAM engine (in-place)");
+#else
 	LOG_WRN("OTA: Launching RAM engine for in-place update");
+#endif
 	LOG_WRN("OTA: target=0x%05X size=%u crc32=0x%08X",
 		ota.target_flash_base, ota.image_size, ota.image_crc32);
 	k_msleep(200); /* Flush logs */
 
-	/* Capture RADIO configuration before stopping ESB */
+	/* Capture RADIO configuration before stopping ESB. */
 	static struct ota_ram_engine_params params;
 	params.radio_frequency   = NRF_RADIO->FREQUENCY;
 	params.radio_mode        = NRF_RADIO->MODE;
@@ -912,55 +938,42 @@ static void ota_launch_ram_engine(void)
 		params.radio_crccnf, params.radio_base0, params.radio_prefix0,
 		params.radio_txaddress, params.radio_rxaddresses);
 
-	/* OTA state */
+	/* OTA state. */
 	params.image_size        = ota.image_size;
 	params.image_crc32       = ota.image_crc32;
 	params.required_image_magic = IS_ENABLED(CONFIG_BOOTLOADER_MCUBOOT) ?
 		OTA_MCUBOOT_IMAGE_MAGIC : 0;
 	params.flash_target      = ota.target_flash_base;
+	params.flash_limit = OTA_FLASH_END;
 	params.page_size         = OTA_FLASH_PAGE_SIZE;
 	params.next_expected_seq = 0;
 	params.bytes_received    = 0;
 	params.tracker_id        = connection_get_id();
 
-	/* Bootloader settings: pre-compute CRC16 is not possible since
-	 * data hasn't been written yet. The RAM engine will need to compute
-	 * CRC16 after writing. For now, prepare the settings template and
-	 * the RAM engine will fill in the CRC16 field. */
-	params.settings_addr  = BOOTLOADER_SETTINGS_ADDR;
+	/* Bootloader settings: CRC16 is computed by the RAM engine after writing. */
+	params.settings_addr = BOOTLOADER_SETTINGS_ADDR;
 
-	/* Provide page buffer (static, avoids stack overflow) */
-	static uint8_t __aligned(4) ota_page_buf[OTA_FLASH_PAGE_SIZE];
-	params.page_buf = ota_page_buf;
+	/* Reuse the OTA page buffer; its member alignment is asserted above. */
+	params.page_buf = ota.page_buf;
 
-	/* Stop ESB driver */
+	/* Stop ESB driver. */
 	LOG_WRN("OTA: Stopping ESB driver");
 	esb_disable();
 	k_msleep(50);
 
-	/* Copy RAM engine to RAM buffer */
-	/* The engine function is large (~3-4KB), allocate generous buffer.
-	 * Using static to avoid stack overflow. */
-	static uint8_t __aligned(4) ram_engine_buf[8192];
-	uintptr_t func_addr = (uintptr_t)ota_ram_engine;
-	uintptr_t func_start = func_addr & ~1U;
-	memcpy(ram_engine_buf, (void *)func_start, sizeof(ram_engine_buf));
-
-	LOG_WRN("OTA: RAM engine at %p, size up to %zu bytes", (void *)func_start, sizeof(ram_engine_buf));
+	/* The native __ramfunc section is copied to executable SRAM during Zephyr
+	 * early boot; do not duplicate it into a guessed-size local buffer. */
 	k_msleep(200);
 
-	/* Jump to RAM with IRQs disabled */
-	typedef void (*ram_engine_fn)(const struct ota_ram_engine_params *);
-	ram_engine_fn engine = (ram_engine_fn)((uintptr_t)ram_engine_buf | 1U);
-
+	/* Jump to the linked RAM engine with IRQs disabled. */
 	__disable_irq();
 
-	/* Disable MPU (SRAM is XN by default) */
+	/* Disable MPU (SRAM is XN by default with Zephyr's MPU config). */
 	MPU->CTRL = 0;
 	__DSB();
 	__ISB();
 
-	engine(&params);
-	/* Never reached */
+	ota_ram_engine(&params);
+	/* Never reached. */
 }
 #endif /* OTA_USE_RAM_ENGINE */

@@ -2,8 +2,6 @@
 
 Zephyr/NCS firmware for SlimeNRF motion trackers on Nordic nRF52 and nRF54L SoCs.
 
-Official usage docs for the broader SlimeNRF ecosystem live at [docs.slimevr.dev/smol-slimes](https://docs.slimevr.dev/smol-slimes).
-
 ## Project history
 
 This firmware is originally based on [SlimeVR/SlimeVR-Tracker-nRF](https://github.com/SlimeVR/SlimeVR-Tracker-nRF). Thanks for their work and for maintaining the project.

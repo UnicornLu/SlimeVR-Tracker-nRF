@@ -14,6 +14,9 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/dt-bindings/adc/nrf-saadc.h>
+#ifdef CONFIG_ADC_NRFX_SAADC
+#include <hal/nrf_saadc.h>
+#endif
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/sensor/npm13xx_charger.h>
 #include <zephyr/logging/log.h>
@@ -79,6 +82,50 @@ static struct divider_data divider_data = {
 #endif
 
 #if !USE_PMIC_CHARGER
+#ifdef CONFIG_ADC_NRFX_SAADC
+struct battery_adc_gain {
+	enum adc_gain gain;
+	uint8_t numerator;
+	uint8_t denominator;
+};
+
+static int battery_select_gain(float max_adc_voltage, uint16_t reference_mv,
+			       enum adc_gain *gain)
+{
+	static const struct battery_adc_gain gains[] = {
+#if NRF_SAADC_HAS_GAIN_1_6
+		{ ADC_GAIN_1_6, 1, 6 },
+#endif
+#if NRF_SAADC_HAS_GAIN_1_5
+		{ ADC_GAIN_1_5, 1, 5 },
+#endif
+#if NRF_SAADC_HAS_GAIN_1_4
+		{ ADC_GAIN_1_4, 1, 4 },
+#endif
+#if NRF_SAADC_HAS_GAIN_1_3
+		{ ADC_GAIN_1_3, 1, 3 },
+#endif
+#if NRF_SAADC_HAS_GAIN_1_2
+		{ ADC_GAIN_1_2, 1, 2 },
+#endif
+		{ ADC_GAIN_1, 1, 1 },
+	};
+
+	for (size_t i = ARRAY_SIZE(gains); i > 0; --i) {
+		const struct battery_adc_gain *candidate = &gains[i - 1];
+
+		/* Use the highest supported gain that covers the input range. */
+		if (max_adc_voltage * 1000.0f * candidate->numerator <=
+		    (float)reference_mv * candidate->denominator) {
+			*gain = candidate->gain;
+			return 0;
+		}
+	}
+
+	return -ERANGE;
+}
+#endif
+
 static int divider_setup(void) {
 	const struct divider_config* cfg = &divider_config;
 	const struct io_channel_config* iocp = &cfg->io_channel;
@@ -114,23 +161,20 @@ static int divider_setup(void) {
 	};
 
 #ifdef CONFIG_ADC_NRFX_SAADC
-	enum adc_gain battery_adc_gain = ADC_GAIN_1_6;
+	enum adc_gain battery_adc_gain;
 
 	float max_adc_voltage = cfg->output_ohm != 0 ? 5.0f * cfg->output_ohm / cfg->full_ohm : 3.6f; // Maximum voltage on input
+	uint16_t reference_mv = adc_ref_internal(ddp->adc);
 
-	if (max_adc_voltage < 0.6f)
-		battery_adc_gain = ADC_GAIN_1;
-	else if (max_adc_voltage < 1.2f)
-		battery_adc_gain = ADC_GAIN_1_2;
-	else if (max_adc_voltage < 1.8f)
-		battery_adc_gain = ADC_GAIN_1_3;
-	else if (max_adc_voltage < 2.4f)
-		battery_adc_gain = ADC_GAIN_1_4;
-	else if (max_adc_voltage < 3.0f)
-		battery_adc_gain = ADC_GAIN_1_5;
+	rc = battery_select_gain(max_adc_voltage, reference_mv, &battery_adc_gain);
+	if (rc != 0) {
+		LOG_ERR("No ADC gain fits max voltage %.2f mV at %u mV reference: %d",
+			(double)(max_adc_voltage * 1000.0f), reference_mv, rc);
+		return rc;
+	}
 
-	LOG_INF("ADC gain enum: %d, max voltage: %.2f mV",
-		battery_adc_gain, (double)(max_adc_voltage * 1000.0f));
+	LOG_INF("ADC gain enum: %d, max voltage: %.2f mV, reference: %u mV",
+		battery_adc_gain, (double)(max_adc_voltage * 1000.0f), reference_mv);
 
 	*accp = (struct adc_channel_cfg){
 		.channel_id = 0,

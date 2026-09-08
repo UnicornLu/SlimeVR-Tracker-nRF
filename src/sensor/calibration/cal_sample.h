@@ -27,6 +27,9 @@
 
 #include <stdbool.h>
 
+/* Discard queued samples at a calibration boundary; preserve the live accel peek. */
+void sensor_calibration_samples_reset(void);
+
 void sensor_sample_accel(const float a[3]);
 int sensor_wait_accel(float a[3], k_timeout_t timeout);
 /* Non-blocking: copy last accel sample if any has been published. */

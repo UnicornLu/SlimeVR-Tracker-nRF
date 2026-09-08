@@ -16,19 +16,22 @@
 #include "build_defines.h"
 #include "parse_args.h"
 #include "zephyr/sys/printk.h"
+#if CONFIG_THREAD_ANALYZER
+#include <zephyr/debug/thread_analyzer.h>
+#endif
 
 #define USB_EXISTS 0
 #if CONFIG_USB_DEVICE_STACK_NEXT
 #undef USB_EXISTS
 #define USB DT_NODELABEL(zephyr_udc0)
-#define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
+#define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE && \
+	DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_console), zephyr_cdc_acm_uart))
 #endif
 
 /*
- * Interactive console over the chosen console device when it is a plain
- * (non-USB) UART, for example a UART bridged by an onboard USB-to-serial
- * chip. The console thread then starts at boot and uses console_getline(),
- * same as the USB path, but without the USB lifecycle handling.
+ * Interactive console over the chosen console device. UART input is parsed
+ * by the private IRQ line editor below; the worker stays blocked on its queue
+ * while USB is disconnected.
  */
 #define UART_CONSOLE_EXISTS \
 	(!USB_EXISTS && CONFIG_UART_CONSOLE && \
@@ -37,8 +40,6 @@
 #if (USB_EXISTS || UART_CONSOLE_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
 
 #if USB_EXISTS || UART_CONSOLE_EXISTS
-#include <zephyr/console/console.h>
-#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/drivers/uart.h>
 #else
 #include "system/rtt_console.h"
@@ -54,45 +55,506 @@
 LOG_MODULE_REGISTER(console, LOG_LEVEL_INF);
 
 static void console_thread(void);
+
+#if USB_EXISTS || UART_CONSOLE_EXISTS
+#include <zephyr/device.h>
+#include <errno.h>
+
+static const struct device *const console_uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 #if USB_EXISTS
 static struct k_thread console_thread_id;
-static K_THREAD_STACK_DEFINE(console_thread_id_stack, 2048);
-static bool console_thread_running;
-static bool console_thread_joinable;
-static bool console_start_pending;
-static void console_lifecycle_work_handler(struct k_work *work);
-static K_WORK_DEFINE(console_lifecycle_work, console_lifecycle_work_handler);
+static K_THREAD_STACK_DEFINE(console_thread_stack, 1536);
+static bool console_thread_started;
+#endif
+static void console_uart_irq(const struct device *dev, void *user_data);
 
-static void console_thread_start_now(void)
+#define CONSOLE_LINE_QUEUE_DEPTH 4
+#define CONSOLE_ECHO_BUFFER_SIZE 512
+#define CONSOLE_INPUT_DRAIN_MAX 4096
+#define CONSOLE_LINE_MAX_LEN CONFIG_CONSOLE_INPUT_MAX_LINE_LEN
+
+BUILD_ASSERT(CONSOLE_LINE_MAX_LEN >= 2, "Console line buffer must hold an empty line");
+
+struct console_line_message {
+	uint32_t epoch;
+	char line[CONSOLE_LINE_MAX_LEN];
+};
+
+enum console_escape_state {
+	CONSOLE_ESCAPE_NONE,
+	CONSOLE_ESCAPE_START,
+	CONSOLE_ESCAPE_CSI,
+	CONSOLE_ESCAPE_SS3,
+};
+
+struct console_input_state {
+	struct k_spinlock lock;
+	bool initialized;
+	bool active;
+	bool overflow;
+	bool last_was_cr;
+	enum console_escape_state escape_state;
+	bool escape_has_value;
+	bool escape_ignore_value;
+	uint16_t escape_value;
+	uint16_t cursor;
+	uint16_t tail;
+	uint32_t epoch;
+	char line[CONSOLE_LINE_MAX_LEN];
+	uint8_t echo[CONSOLE_ECHO_BUFFER_SIZE];
+	uint16_t echo_head;
+	uint16_t echo_tail;
+};
+K_MSGQ_DEFINE(console_line_msgq, sizeof(struct console_line_message), CONSOLE_LINE_QUEUE_DEPTH, 4);
+
+static struct console_input_state console_input;
+static bool console_echo_has_data_locked(void)
 {
-	k_thread_create(
-		&console_thread_id,
-		console_thread_id_stack,
-		K_THREAD_STACK_SIZEOF(console_thread_id_stack),
-		(k_thread_entry_t)console_thread,
-		NULL,
-		NULL,
-		NULL,
-		CONSOLE_THREAD_PRIORITY,
-		0,
-		K_NO_WAIT
-	);
-	console_thread_running = true;
+	return console_input.echo_head != console_input.echo_tail;
 }
 
-static void console_lifecycle_work_handler(struct k_work *work)
+static void console_echo_put_locked(uint8_t byte)
 {
-	ARG_UNUSED(work);
-	if (console_thread_joinable) {
-		(void)k_thread_join(&console_thread_id, K_FOREVER);
-		console_thread_joinable = false;
+	uint16_t next = (uint16_t)((console_input.echo_head + 1U) % CONSOLE_ECHO_BUFFER_SIZE);
+
+	if (next == console_input.echo_tail) {
+		return;
 	}
-	if (console_start_pending && !console_thread_running) {
-		console_start_pending = false;
-		console_thread_start_now();
+
+	console_input.echo[console_input.echo_head] = byte;
+	console_input.echo_head = next;
+}
+
+static void console_echo_text_locked(const char *text)
+{
+	while (*text != '\0') {
+		console_echo_put_locked((uint8_t)*text++);
 	}
 }
-#else
+
+static void console_echo_cursor_locked(uint8_t direction, uint16_t count)
+{
+	if (count == 0U) {
+		return;
+	}
+
+	console_echo_put_locked(0x1b);
+	console_echo_put_locked('[');
+	if (count >= 100U) {
+		console_echo_put_locked((uint8_t)('0' + count / 100U));
+		count %= 100U;
+		console_echo_put_locked((uint8_t)('0' + count / 10U));
+		console_echo_put_locked((uint8_t)('0' + count % 10U));
+	} else if (count >= 10U) {
+		console_echo_put_locked((uint8_t)('0' + count / 10U));
+		console_echo_put_locked((uint8_t)('0' + count % 10U));
+	} else {
+		console_echo_put_locked((uint8_t)('0' + count));
+	}
+	console_echo_put_locked(direction);
+}
+
+static void console_reset_line_locked(void)
+{
+	console_input.overflow = false;
+	console_input.last_was_cr = false;
+	console_input.escape_state = CONSOLE_ESCAPE_NONE;
+	console_input.escape_has_value = false;
+	console_input.escape_ignore_value = false;
+	console_input.escape_value = 0;
+	console_input.cursor = 0;
+	console_input.tail = 0;
+}
+
+static void console_drop_queued_lines_locked(void)
+{
+	struct console_line_message dropped;
+
+	while (k_msgq_get(&console_line_msgq, &dropped, K_NO_WAIT) == 0) {
+	}
+}
+
+static void console_finish_line_locked(void)
+{
+	struct console_line_message message = {0};
+	uint16_t length = (uint16_t)(console_input.cursor + console_input.tail);
+
+	if (!console_input.overflow) {
+		message.epoch = console_input.epoch;
+		memcpy(message.line, console_input.line, length);
+		message.line[length] = '\0';
+		if (k_msgq_put(&console_line_msgq, &message, K_NO_WAIT) != 0) {
+			console_echo_put_locked('\a');
+		}
+	}
+
+	console_echo_text_locked("\r\n");
+	console_reset_line_locked();
+}
+
+static void console_insert_char_locked(uint8_t byte)
+{
+	uint16_t length = (uint16_t)(console_input.cursor + console_input.tail);
+
+	if (length >= CONSOLE_LINE_MAX_LEN - 1U) {
+		if (!console_input.overflow) {
+			console_input.overflow = true;
+			console_echo_put_locked('\a');
+		}
+		return;
+	}
+
+	for (uint16_t i = length; i > console_input.cursor; i--) {
+		console_input.line[i] = console_input.line[i - 1U];
+	}
+	console_input.line[console_input.cursor++] = (char)byte;
+
+	console_echo_put_locked(byte);
+	if (console_input.tail != 0U) {
+		console_echo_text_locked("\x1b[s");
+		for (uint16_t i = console_input.cursor; i < console_input.cursor + console_input.tail; i++) {
+			console_echo_put_locked((uint8_t)console_input.line[i]);
+		}
+		console_echo_text_locked("\x1b[u");
+	}
+}
+
+static void console_backspace_locked(void)
+{
+	uint16_t length;
+
+	if (console_input.cursor == 0U) {
+		return;
+	}
+
+	length = (uint16_t)(console_input.cursor + console_input.tail);
+	console_input.cursor--;
+	for (uint16_t i = console_input.cursor; i + 1U < length; i++) {
+		console_input.line[i] = console_input.line[i + 1U];
+	}
+
+	console_echo_put_locked('\b');
+	if (console_input.tail == 0U) {
+		console_echo_text_locked(" \b");
+	} else {
+		console_echo_text_locked("\x1b[s");
+		for (uint16_t i = console_input.cursor; i < console_input.cursor + console_input.tail; i++) {
+			console_echo_put_locked((uint8_t)console_input.line[i]);
+		}
+		console_echo_text_locked(" \x1b[u");
+	}
+}
+
+static void console_delete_locked(void)
+{
+	uint16_t length;
+
+	if (console_input.tail == 0U) {
+		return;
+	}
+
+	length = (uint16_t)(console_input.cursor + console_input.tail);
+	for (uint16_t i = console_input.cursor; i + 1U < length; i++) {
+		console_input.line[i] = console_input.line[i + 1U];
+	}
+	console_input.tail--;
+
+	console_echo_cursor_locked('C', 1);
+	console_echo_put_locked('\b');
+	if (console_input.tail == 0U) {
+		console_echo_text_locked(" \b");
+	} else {
+		console_echo_text_locked("\x1b[s");
+		for (uint16_t i = console_input.cursor; i < console_input.cursor + console_input.tail; i++) {
+			console_echo_put_locked((uint8_t)console_input.line[i]);
+		}
+		console_echo_text_locked(" \x1b[u");
+	}
+}
+
+static void console_move_home_locked(void)
+{
+	console_echo_cursor_locked('D', console_input.cursor);
+	console_input.tail = (uint16_t)(console_input.tail + console_input.cursor);
+	console_input.cursor = 0;
+}
+
+static void console_move_end_locked(void)
+{
+	console_echo_cursor_locked('C', console_input.tail);
+	console_input.cursor = (uint16_t)(console_input.cursor + console_input.tail);
+	console_input.tail = 0;
+}
+
+static void console_apply_escape_locked(uint8_t final)
+{
+	uint16_t count
+		= console_input.escape_has_value && console_input.escape_value != 0U ? console_input.escape_value : 1U;
+
+	switch (final) {
+	case 'D':
+		count = MIN(count, console_input.cursor);
+		console_input.cursor -= count;
+		console_input.tail = (uint16_t)(console_input.tail + count);
+		console_echo_cursor_locked('D', count);
+		break;
+	case 'C':
+		count = MIN(count, console_input.tail);
+		console_input.cursor = (uint16_t)(console_input.cursor + count);
+		console_input.tail -= count;
+		console_echo_cursor_locked('C', count);
+		break;
+	case 'H':
+		console_move_home_locked();
+		break;
+	case 'F':
+		console_move_end_locked();
+		break;
+	case '~':
+		if (console_input.escape_value == 3U) {
+			console_delete_locked();
+		} else if (console_input.escape_value == 1U || console_input.escape_value == 7U) {
+			console_move_home_locked();
+		} else if (console_input.escape_value == 4U || console_input.escape_value == 8U) {
+			console_move_end_locked();
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static bool console_handle_escape_locked(uint8_t byte)
+{
+	switch (console_input.escape_state) {
+	case CONSOLE_ESCAPE_START:
+		if (byte == '[') {
+			console_input.escape_state = CONSOLE_ESCAPE_CSI;
+			console_input.escape_has_value = false;
+			console_input.escape_ignore_value = false;
+			console_input.escape_value = 0;
+		} else if (byte == 'O') {
+			console_input.escape_state = CONSOLE_ESCAPE_SS3;
+		} else {
+			console_input.escape_state = CONSOLE_ESCAPE_NONE;
+		}
+		return true;
+	case CONSOLE_ESCAPE_CSI:
+		if (byte >= 0x30 && byte <= 0x3f) {
+			if (byte >= '0' && byte <= '9') {
+				if (!console_input.escape_ignore_value) {
+					console_input.escape_has_value = true;
+					if (console_input.escape_value < 999U) {
+						console_input.escape_value
+							= (uint16_t)MIN(999U, console_input.escape_value * 10U + (uint16_t)(byte - '0'));
+					}
+				}
+			} else if (byte == ';') {
+				console_input.escape_ignore_value = true;
+			}
+			return true;
+		}
+		if (byte >= 0x20 && byte <= 0x2f) {
+			return true;
+		}
+		if (byte >= 0x40 && byte <= 0x7e) {
+			console_apply_escape_locked(byte);
+		}
+		console_input.escape_state = CONSOLE_ESCAPE_NONE;
+		return true;
+	case CONSOLE_ESCAPE_SS3:
+		if (byte >= 0x20 && byte <= 0x2f) {
+			return true;
+		}
+		if (byte >= 0x40 && byte <= 0x7e) {
+			console_apply_escape_locked(byte);
+		}
+		console_input.escape_state = CONSOLE_ESCAPE_NONE;
+		return true;
+	case CONSOLE_ESCAPE_NONE:
+	default:
+		return false;
+	}
+}
+
+static void console_input_byte_locked(uint8_t byte)
+{
+	if (byte == '\n' && console_input.last_was_cr) {
+		console_input.last_was_cr = false;
+		return;
+	}
+
+	if (byte == '\r' || byte == '\n') {
+		console_finish_line_locked();
+		console_input.last_was_cr = byte == '\r';
+		return;
+	}
+
+	console_input.last_was_cr = false;
+	if (console_input.overflow) {
+		return;
+	}
+
+	if (console_input.escape_state != CONSOLE_ESCAPE_NONE) {
+		(void)console_handle_escape_locked(byte);
+		return;
+	}
+
+	if (byte == 0x1b) {
+		console_input.escape_state = CONSOLE_ESCAPE_START;
+		console_input.escape_has_value = false;
+		console_input.escape_ignore_value = false;
+		console_input.escape_value = 0;
+		return;
+	}
+
+	switch (byte) {
+	case 0x08:
+	case 0x7f:
+		console_backspace_locked();
+		break;
+	case '\t':
+		break;
+	default:
+		if (isprint((unsigned char)byte) != 0) {
+			console_insert_char_locked(byte);
+		}
+		break;
+	}
+}
+
+static void console_echo_flush(const struct device *dev)
+{
+	while (true) {
+		int ready = uart_irq_tx_ready(dev);
+		if (ready <= 0) {
+			return;
+		}
+
+		k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+		if (!console_echo_has_data_locked()) {
+			k_spin_unlock(&console_input.lock, key);
+			uart_irq_tx_disable(dev);
+			return;
+		}
+
+		uint16_t head = console_input.echo_head;
+		uint16_t tail = console_input.echo_tail;
+		uint16_t contiguous = head > tail ? (uint16_t)(head - tail) : (uint16_t)(CONSOLE_ECHO_BUFFER_SIZE - tail);
+		int count = (int)contiguous;
+		int sent = uart_fifo_fill(dev, &console_input.echo[tail], count);
+		if (sent > 0) {
+			console_input.echo_tail = (uint16_t)((tail + (uint16_t)sent) % CONSOLE_ECHO_BUFFER_SIZE);
+		}
+		bool empty = !console_echo_has_data_locked();
+		k_spin_unlock(&console_input.lock, key);
+
+		if (sent <= 0) {
+			return;
+		}
+		if (empty) {
+			uart_irq_tx_disable(dev);
+			return;
+		}
+	}
+}
+
+static void console_uart_irq(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (dev != console_uart_dev) {
+		return;
+	}
+
+	while (uart_irq_update(dev) > 0 && uart_irq_is_pending(dev) > 0) {
+		if (uart_irq_rx_ready(dev) > 0) {
+			do {
+				uint8_t byte;
+				k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+				int received = uart_fifo_read(dev, &byte, 1);
+
+				if (received > 0 && console_input.initialized && console_input.active) {
+					console_input_byte_locked(byte);
+				}
+				k_spin_unlock(&console_input.lock, key);
+
+				if (received <= 0) {
+					break;
+				}
+			} while (uart_irq_rx_ready(dev) > 0);
+		}
+
+		if (uart_irq_tx_ready(dev) > 0) {
+			console_echo_flush(dev);
+		}
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	bool echo_pending = console_echo_has_data_locked();
+	k_spin_unlock(&console_input.lock, key);
+	if (echo_pending) {
+		uart_irq_tx_enable(dev);
+	} else {
+		uart_irq_tx_disable(dev);
+	}
+}
+
+static void console_drain_uart_locked(void)
+{
+	unsigned char byte;
+
+	for (size_t i = 0; i < CONSOLE_INPUT_DRAIN_MAX; i++) {
+		if (uart_poll_in(console_uart_dev, &byte) != 0) {
+			break;
+		}
+	}
+}
+
+static int console_input_install(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	bool initialized = console_input.initialized;
+	k_spin_unlock(&console_input.lock, key);
+	if (initialized) {
+		return 0;
+	}
+
+	if (!device_is_ready(console_uart_dev)) {
+		LOG_ERR("Console UART is not ready");
+		return -ENODEV;
+	}
+
+	uart_irq_rx_disable(console_uart_dev);
+	uart_irq_tx_disable(console_uart_dev);
+	key = k_spin_lock(&console_input.lock);
+	console_drain_uart_locked();
+	k_spin_unlock(&console_input.lock, key);
+
+	int ret = uart_irq_callback_user_data_set(console_uart_dev, console_uart_irq, NULL);
+	if (ret != 0) {
+		LOG_ERR("Failed to install console UART input callback: %d", ret);
+		return ret;
+	}
+
+	key = k_spin_lock(&console_input.lock);
+	console_input.initialized = true;
+	k_spin_unlock(&console_input.lock, key);
+	uart_irq_rx_enable(console_uart_dev);
+	return 0;
+}
+
+static bool console_line_is_current(uint32_t epoch)
+{
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	bool current = console_input.active && console_input.epoch == epoch;
+	k_spin_unlock(&console_input.lock, key);
+	return current;
+}
+
+#endif
+
+#if !USB_EXISTS && (UART_CONSOLE_EXISTS || CONFIG_RTT_CONSOLE)
 K_THREAD_DEFINE(console_thread_id, 2048, console_thread, NULL, NULL, NULL, CONSOLE_THREAD_PRIORITY, 0, 0);
 #endif
 
@@ -120,33 +582,84 @@ static const char *meow_punctuations[] = {".", "?", "!", "-", "~", ""};
 static const char *meow_suffixes[]
 	= {" :3", " :3c", " ;3", " ;3c", " x3", " x3c", " X3", " X3c", " >:3", " >:3c", " >;3", " >;3c", ""};
 
-void console_thread_create(void)
+int console_serial_start(void)
 {
+#if USB_EXISTS || UART_CONSOLE_EXISTS
 #if USB_EXISTS
-	if (console_thread_running) {
-		return;
+	bool create_thread = false;
+#endif
+
+	int ret = console_input_install();
+	if (ret != 0) {
+		return ret;
 	}
-	if (console_thread_joinable) {
-		console_start_pending = true;
-		k_work_submit(&console_lifecycle_work);
-		return;
+
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	if (console_input.active) {
+		k_spin_unlock(&console_input.lock, key);
+		return 0;
 	}
-	console_thread_start_now();
+
+	uart_irq_rx_disable(console_uart_dev);
+	uart_irq_tx_disable(console_uart_dev);
+	console_drain_uart_locked();
+	console_input.active = true;
+	console_input.epoch++;
+	console_reset_line_locked();
+	console_drop_queued_lines_locked();
+	console_input.echo_head = 0;
+	console_input.echo_tail = 0;
+#if USB_EXISTS
+	if (!console_thread_started) {
+		console_thread_started = true;
+		create_thread = true;
+	}
+#endif
+	uart_irq_rx_enable(console_uart_dev);
+	k_spin_unlock(&console_input.lock, key);
+
+#if USB_EXISTS
+	if (create_thread) {
+		k_thread_create(
+			&console_thread_id,
+			console_thread_stack,
+			K_THREAD_STACK_SIZEOF(console_thread_stack),
+			(k_thread_entry_t)console_thread,
+			NULL,
+			NULL,
+			NULL,
+			CONSOLE_THREAD_PRIORITY,
+			0,
+			K_NO_WAIT
+		);
+	}
+#endif
+	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
+	printk(FW_STRING);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
+	printk("Type 'help' to show available commands.\n");
+	return 0;
+#else
+	return 0;
 #endif
 }
 
-void console_thread_abort(void)
+void console_serial_stop(void)
 {
-#if USB_EXISTS
-	if (!console_thread_running) {
-		return;
+#if USB_EXISTS || UART_CONSOLE_EXISTS
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	console_input.active = false;
+	console_input.epoch++;
+	console_reset_line_locked();
+	console_drop_queued_lines_locked();
+	console_input.echo_head = 0;
+	console_input.echo_tail = 0;
+	if (console_input.initialized) {
+		uart_irq_tx_disable(console_uart_dev);
+		uart_irq_rx_disable(console_uart_dev);
+		console_drain_uart_locked();
 	}
-	console_start_pending = false;
-	k_thread_abort(&console_thread_id);
-	console_thread_running = false;
-	console_thread_joinable = true;
-	/* Join on system workqueue — USB status_cb must not block forever. */
-	k_work_submit(&console_lifecycle_work);
+	k_spin_unlock(&console_input.lock, key);
 #endif
 }
 
@@ -699,6 +1212,9 @@ static void print_help(void)
 	printk("  ping                       Flash LED (same as remote PING command)\n");
 	printk("  meow                       Meow!\n");
 	printk("  nvs                        Show NVS usage statistics\n");
+#if CONFIG_THREAD_ANALYZER
+	printk("  stack                      Print thread and ISR stack high-water usage\n");
+#endif
 	printk("  help                       Show this help message\n");
 	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 1s)\n");
 	printk("  range                      Show sensor range statistics (min/max values)\n");
@@ -1466,6 +1982,17 @@ static void console_cmd_nvs(size_t argc, char **argv)
 	sys_nvs_stats();
 }
 
+#if CONFIG_THREAD_ANALYZER
+static void console_cmd_stack(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	printk("Thread/ISR stack high-water usage:\n");
+	thread_analyzer_print(0);
+}
+#endif
+
 static void console_cmd_meow(size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
@@ -1647,6 +2174,9 @@ static const struct console_cmd console_cmds[] = {
 	{"nvs", console_cmd_nvs},
 	{"meow", console_cmd_meow},
 	{"debug", console_cmd_debug},
+#if CONFIG_THREAD_ANALYZER
+	{"stack", console_cmd_stack},
+#endif
 	{"range", console_cmd_range},
 #if CONFIG_VQF_BENCH
 	{"vqfbench", console_cmd_vqfbench},
@@ -1658,28 +2188,23 @@ static const struct console_cmd console_cmds[] = {
 
 static void console_thread(void)
 {
-	// USB serial readiness is handled by usb.c usb_ctrl_thread via DTR;
-	// this thread starts only once the terminal has asserted DTR.
-	// DFU-on-button also lives in usb_ctrl_thread (needs button_read_filtered).
-
-#if USB_EXISTS || UART_CONSOLE_EXISTS
-	console_getline_init();
-
-	// Wait for any pending log data to be processed
-	while (log_data_pending()) {
-		k_usleep(1);
+#if UART_CONSOLE_EXISTS
+	if (console_serial_start() != 0) {
+		return;
 	}
-
-	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
-#endif
+#elif !USB_EXISTS
 	printk(FW_STRING);
 	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
-
 	printk("Type 'help' to show available commands.\n");
+#endif
 
 	while (1) {
 #if USB_EXISTS || UART_CONSOLE_EXISTS
-		char *line = console_getline();
+		struct console_line_message message;
+		if (k_msgq_get(&console_line_msgq, &message, K_FOREVER) != 0 || !console_line_is_current(message.epoch)) {
+			continue;
+		}
+		char *line = message.line;
 #else
 		char *line = rtt_console_getline();
 #endif
