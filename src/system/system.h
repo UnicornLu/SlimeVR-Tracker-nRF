@@ -1,6 +1,10 @@
 #ifndef SLIMENRF_SYSTEM
 #define SLIMENRF_SYSTEM
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "led.h"
 #include "power.h"
 #include "status.h"
@@ -20,6 +24,12 @@
 #define MAIN_SENSOR_DATA_ID 30
 #define RF_CHANNEL_ID 31
 #define MAG_ENABLED_ID 37
+#define TCAL_ENABLED_ID 38
+#define MAG_ONLINE_CALIBRATION_ID 39
+
+#define MAG_ONLINE_CALIBRATION_DEFAULT 0
+#define MAG_ONLINE_CALIBRATION_ENABLED 1
+#define MAG_ONLINE_CALIBRATION_DISABLED 2
 
 #if CONFIG_SENSOR_USE_TCAL
 #define MAIN_GYRO_TEMP_ID 32
@@ -35,18 +45,29 @@ uint8_t reboot_counter_read(void);
 void reboot_counter_write(uint8_t reboot_counter);
 
 void sys_write(uint16_t id, void *ptr, const void *data, size_t len);
+void sys_write_warm(uint16_t id, void *retained_ptr, const void *data, size_t len);
+void sys_warm_transaction_begin(void);
+void sys_warm_transaction_mark(uint16_t id, void *retained_ptr, size_t len);
+void sys_warm_transaction_end(bool retained_changed);
+void sys_flush_warm(void);
+bool sys_warm_is_dirty(void);
 void sys_read(uint16_t id, void *data, size_t len);
 void sys_clear(void);
+void sys_nvs_stats(void);
 
 int set_sensor_clock(bool enable, float rate, float* actual_rate);
 
 bool button_read(void);
+bool button_read_filtered(void);
 
 bool dock_read(void);
 bool chg_read(void);
 bool stby_read(void);
 
 int sys_user_shutdown(void);
+void sys_command_shutdown(void);
+void sys_enter_dfu(bool ota);
+void sys_skip_dfu(void);
 void sys_reset_mode(uint8_t mode);
 
 #endif

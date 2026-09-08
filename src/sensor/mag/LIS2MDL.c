@@ -1,5 +1,6 @@
 #include <math.h>
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include "LIS2MDL.h"
@@ -7,22 +8,77 @@
 
 static const float sensitivity = 1.5 / 1000; // ~1.5 mgauss/LSB -> 0.0015 G/LSB
 
-static uint8_t last_odr = 0xff;
+/* High-resolution continuous turn-on ~9.4 ms (AN5069). */
+#define LIS2MDL_TURN_ON_MS 10
+
+static uint8_t last_cfg_a = 0xff;
 
 LOG_MODULE_REGISTER(LIS2MDL, LOG_LEVEL_DBG);
 
+// CFG_REG_C: BDU always set; 4WSPI + I2C_DIS only in SPI mode
+// (I2C mode must not set I2C_DIS or it cuts off the bus)
+static uint8_t lis2_cfg_c(void)
+{
+	uint8_t cfg_c = CFG_C_BDU;
+	if (sensor_interface_get_spec(SENSOR_INTERFACE_DEV_MAG) == SENSOR_INTERFACE_SPEC_SPI)
+		cfg_c |= CFG_C_4WSPI | CFG_C_I2C_DIS;
+	return cfg_c;
+}
+
+static int lis2_soft_reset(void)
+{
+	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, CFG_A_SOFT_RST);
+	if (err)
+		return err;
+
+	/* Datasheet: SOFT_RST self-clears after ~5 µs. */
+	k_busy_wait(10);
+
+	for (int i = 0; i < 20; i++) {
+		uint8_t cfg_a = 0;
+		err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, &cfg_a);
+		if (err)
+			return err;
+		if (!(cfg_a & CFG_A_SOFT_RST))
+			return 0;
+		k_busy_wait(10);
+	}
+
+	LOG_WRN("SOFT_RST did not clear");
+	return -1;
+}
+
 int lis2_init(float time, float *actual_time)
 {
-	// nothing to initialize..
-	last_odr = 0xff; // reset last odr
-	int err = lis2_update_odr(time, actual_time);
+	last_cfg_a = 0xff;
+
+	int err = lis2_soft_reset();
+	if (err) {
+		LOG_ERR("Soft reset failed");
+		return err;
+	}
+
+	err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_C, lis2_cfg_c());
+	if (err) {
+		LOG_ERR("Communication error");
+		return err;
+	}
+
+	// CFG_REG_B: LPF (ODR/4 bandwidth) + OFF_CANC (internal bias cancellation)
+	err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_B, CFG_B_LPF | CFG_B_OFF_CANC);
+	if (err) {
+		LOG_ERR("Communication error");
+		return err;
+	}
+
+	err = lis2_update_odr(time, actual_time);
 	return (err < 0 ? err : 0);
 }
 
 void lis2_shutdown(void)
 {
-	last_odr = 0xff; // reset last odr
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, 0x20);
+	last_cfg_a = 0xff;
+	int err = lis2_soft_reset();
 	if (err)
 		LOG_ERR("Communication error");
 }
@@ -38,11 +94,9 @@ int lis2_update_odr(float time, float *actual_time)
 		MD = MD_IDLE;
 		ODR = 0;
 	}
-	else if (time == INFINITY) // oneshot/single
+	else if (time == INFINITY) // oneshot/single — keep continuous + fixed ODR
 	{
-//		MD = MD_SINGLE;
-//		ODR = 0;
-		MD = MD_IDLE; // No idea if single measurements will be fast enough, so just use continuous anyway
+		MD = MD_CONTINUOUS;
 		ODR = 0;
 	}
 	else
@@ -78,57 +132,81 @@ int lis2_update_odr(float time, float *actual_time)
 	}
 	else
 	{
-		MODR = 0;
-		time = INFINITY;
+		/* INFINITY path: continuous at lowest fixed ODR */
+		MODR = ODR_10Hz;
+		time = 1.0 / 10;
 	}
 
-	if (last_odr == MODR)
-		return 1;
+	uint8_t cfg_a;
+	if (MD == MD_IDLE)
+		cfg_a = MD_IDLE;
 	else
-		last_odr = MODR;
+		cfg_a = CFG_A_COMP_TEMP_EN | (MODR << 2) | MD_CONTINUOUS;
 
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, MODR << 2 | MD); // set mag ODR and MD
+	if (last_cfg_a == cfg_a) {
+		*actual_time = time;
+		return 0; /* already configured */
+	}
+
+	bool was_idle = (last_cfg_a == 0xff) || ((last_cfg_a & 0x03) == MD_IDLE);
+	int err;
+
+	if (MD == MD_CONTINUOUS) {
+		err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_C, lis2_cfg_c());
+		if (err)
+			goto error;
+	}
+
+	err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, cfg_a);
 	if (err)
-		LOG_ERR("Communication error");
+		goto error;
 
+	/* First sample after continuous enable needs turn-on delay. */
+	if (MD == MD_CONTINUOUS && was_idle)
+		k_msleep(LIS2MDL_TURN_ON_MS);
+
+	last_cfg_a = cfg_a;
 	*actual_time = time;
+	return 0;
+error:
+	last_cfg_a = 0xff;
+	LOG_ERR("Communication error");
 	return err;
 }
 
 void lis2_mag_oneshot(void)
 {
-	// write MD_SINGLE again to trigger a measurement
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, last_odr << 2 | MD_SINGLE); // set mag ODR and MD
-	if (err)
-		LOG_ERR("Communication error");
+	/* Continuous driver: no single-shot trigger. Kept for sensor_mag_t ABI. */
 }
 
-void lis2_mag_read(float m[3])
+bool lis2_mag_read(float m[3])
 {
-	int err = 0;
-	uint8_t status;
-	while ((status & 0x03) == MD_SINGLE) // wait for oneshot to complete
-		err |= ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, &status);
-	uint8_t rawData[6];
-	err |= ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_OUTX_L_REG, &rawData[0], 6);
-	if (err)
+	uint8_t frame[7];
+	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_STATUS_REG, frame, sizeof(frame));
+	if (err) {
 		LOG_ERR("Communication error");
-	lis2_mag_process(rawData, m);
+		return false;
+	}
+	if (!(frame[0] & STATUS_ZYXDA))
+		return false;
+	lis2_mag_process(&frame[1], m);
+	return true;
 }
 
 float lis2_temp_read(float bias[3])
 {
+	(void)bias;
 	uint8_t rawTemp[2];
 	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_TEMP_OUT_L_REG, &rawTemp[0], 2);
+	if (err) {
+		LOG_ERR("Communication error");
+		return NAN;
+	}
 	// The output value is expressed as a signed 16-bit byte in two’s complement.
 	// The four most significant bits contain a copy of the sign bit.
 	// The nominal sensitivity is 8 LSB/°C
 	float temp = (int16_t)((((uint16_t)rawTemp[1]) << 8) | rawTemp[0]);
-	temp /= 8;
-	// No value offset?
-	if (err)
-		LOG_ERR("Communication error");
-	return temp;
+	return 25.0f + temp / 8.0f;
 }
 
 void lis2_mag_process(uint8_t *raw_m, float m[3])
@@ -151,5 +229,5 @@ const sensor_mag_t sensor_mag_lis2mdl = {
 	*lis2_temp_read,
 
 	*lis2_mag_process,
-	6, 6
+	7, 7
 };

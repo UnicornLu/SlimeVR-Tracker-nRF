@@ -1,0 +1,56 @@
+/*
+ * External SPI IMU test variant (-DFILE_SUFFIX=testspi).
+ * Same XIAO connector positions as the LM20A testspi variant, with the
+ * nRF54L15 GPIO mapping:
+ *   D0  (P1.04) -> 3V3 (active-high sensor power)
+ *   D10 (P2.02) -> SCL (SPI SCK)
+ *   D9  (P2.04) -> SDA (SPI MOSI / SDI)
+ *   D8  (P2.01) -> CS
+ *   D7  (P2.07) -> SDO (SPI MISO)
+ *   D6  (P2.08) -> INT
+ *   GND         -> GND
+ * The base overlay already disables uart21 on D6/D7; the uart20 console
+ * remains available through the SAMD11 bridge.
+ */
+#include "xiao_nrf54l15_nrf54l15_cpuapp.overlay"
+
+&spi00_default {
+	group1 {
+		psels = <NRF_PSEL(SPIM_SCK, 2, 2)>,
+			<NRF_PSEL(SPIM_MOSI, 2, 4)>,
+			<NRF_PSEL(SPIM_MISO, 2, 7)>;
+	};
+};
+
+&spi00_sleep {
+	group1 {
+		psels = <NRF_PSEL(SPIM_SCK, 2, 2)>,
+			<NRF_PSEL(SPIM_MOSI, 2, 4)>,
+			<NRF_PSEL(SPIM_MISO, 2, 7)>;
+		low-power-enable;
+	};
+};
+
+&spi00 {
+	cs-gpios = <&xiao_d 8 GPIO_ACTIVE_LOW>;
+};
+
+/ {
+	zephyr,user {
+		int0-gpios = <&xiao_d 6 GPIO_ACTIVE_HIGH>;
+		pwr-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* SPI-only sensor scan, matching the LM20A test variant. */
+&i2c22 {
+	status = "disabled";
+};
+
+&imu {
+	status = "disabled";
+};
+
+&mag {
+	status = "disabled";
+};

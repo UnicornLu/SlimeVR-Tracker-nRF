@@ -1,8 +1,10 @@
 #include "globals.h"
+#include "test_mode.h"
 #include "sensor/sensor.h"
-#include "sensor/calibration.h"
+#include "sensor/calibration/calibration.h"
 #include "connection/connection.h"
 #include "connection/esb.h"
+#include "system/esb_ota.h"
 #include "watchdog.h"
 
 #include <zephyr/drivers/gpio.h>
@@ -11,16 +13,22 @@
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
 #include <zephyr/fs/nvs.h>
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+#include <zephyr/retention/bootmode.h>
+#endif
 #include <hal/nrf_gpio.h>
 
 #include "system.h"
+#include "battery_tracker.h"
 #include "build_defines.h"
 
 static struct nvs_fs fs;
+static K_MUTEX_DEFINE(sys_storage_lock);
 
 #define NVS_PARTITION storage_partition
 #define NVS_PARTITION_DEVICE FIXED_PARTITION_DEVICE(NVS_PARTITION)
 #define NVS_PARTITION_OFFSET FIXED_PARTITION_OFFSET(NVS_PARTITION)
+#define NVS_PARTITION_SIZE FIXED_PARTITION_SIZE(NVS_PARTITION)
 
 LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 
@@ -29,12 +37,12 @@ LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
 static void button_thread(void);
 K_THREAD_DEFINE(
 	button_thread_id,
-	1024,
+	768,
 	button_thread,
 	NULL,
 	NULL,
 	NULL,
-	6,
+	BUTTON_THREAD_PRIORITY,
 	0,
 	0
 ); // TODO: stack increased because of reboot request (to 512) and sensor scan (to 1024)
@@ -76,9 +84,9 @@ static const struct pwm_dt_spec clk_out = PWM_DT_SPEC_GET(CLKOUT_NODE);
 static const struct pwm_dt_spec clk_out = {0};
 #endif
 
-#define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-#define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
-#define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
+#define ADAFRUIT_BOOTLOADER (CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
+#define NRF5_BOOTLOADER (CONFIG_BOARD_HAS_NRF5_BOOTLOADER && !CONFIG_BOOTLOADER_MCUBOOT)
 
 #if NRF5_BOOTLOADER
 static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
@@ -100,21 +108,29 @@ void configure_sense_pins(void)
 #endif
 	// Configure chgstat sense
 	if (!docked) {
+		bool ignore_charge_wake = IGNORE_CHARGE_WAKE_ON_VBUS && vbus_read();
+		if (ignore_charge_wake) {
+			LOG_INF("Skipped charge wake sense while VBUS is present");
+		}
 #if CHG_EXISTS
-		nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios), NRF_GPIO_PIN_PULLUP);
-		nrf_gpio_cfg_sense_set(
-			NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios),
-			chg_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
-		);
-		LOG_INF("Configured chg sense");
+		if (!ignore_charge_wake) {
+			nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios), NRF_GPIO_PIN_PULLUP);
+			nrf_gpio_cfg_sense_set(
+				NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, chg_gpios),
+				chg_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
+			);
+			LOG_INF("Configured chg sense");
+		}
 #endif
 #if STBY_EXISTS
-		nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios), NRF_GPIO_PIN_PULLUP);
-		nrf_gpio_cfg_sense_set(
-			NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios),
-			stby_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
-		);
-		LOG_INF("Configured stby sense");
+		if (!ignore_charge_wake) {
+			nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios), NRF_GPIO_PIN_PULLUP);
+			nrf_gpio_cfg_sense_set(
+				NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, stby_gpios),
+				stby_read() ? NRF_GPIO_PIN_SENSE_HIGH : NRF_GPIO_PIN_SENSE_LOW
+			);
+			LOG_INF("Configured stby sense");
+		}
 #endif
 	}
 	// Configure sw0 sense
@@ -182,11 +198,11 @@ static int sys_retained_init(void)
 		sys_read(MAIN_MAG_BIAS_ID, &retained->magBAinv, sizeof(retained->magBAinv));
 		sys_read(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, sizeof(retained->accBAinv));
 		sys_read(BATT_STATS_CURVE_ID, &retained->battery_pptt_curve, sizeof(retained->battery_pptt_curve));
+		sys_migrate_battery_curve();
 		sys_read(MAIN_GYRO_SENS_ID, &retained->gyroSensScale, sizeof(retained->gyroSensScale));
 		// If gyroSensScale was never set in NVS (all zeros), restore default values
-		if (retained->gyroSensScale[0] == 0.0f &&
-		    retained->gyroSensScale[1] == 0.0f &&
-		    retained->gyroSensScale[2] == 0.0f) {
+		if (retained->gyroSensScale[0] == 0.0f && retained->gyroSensScale[1] == 0.0f
+			&& retained->gyroSensScale[2] == 0.0f) {
 			retained->gyroSensScale[0] = 1.0f;
 			retained->gyroSensScale[1] = 1.0f;
 			retained->gyroSensScale[2] = 1.0f;
@@ -197,15 +213,39 @@ static int sys_retained_init(void)
 		sys_read(MAIN_GYRO_TCAL_COEFFS_ID, &retained->tempCalCoeffs, sizeof(retained->tempCalCoeffs));
 		// tempCalCorrectionOffset is retained for compatibility only; no longer used.
 		sys_read(MAIN_GYRO_TCAL_STATE_ID, &retained->tempCalState, sizeof(retained->tempCalState));
+		/*
+		 * TCAL_ENABLED_ID:
+		 * - Present: honor stored flag
+		 * - ENOENT: default on (apply still ZRO-fallback until enough points)
+		 * Blind sys_read would zero → look explicitly disabled.
+		 */
+		{
+			bool tcal_en = true;
+			int tcal_en_err = nvs_read(&fs, TCAL_ENABLED_ID, &tcal_en, sizeof(tcal_en));
+			if (tcal_en_err >= 0) {
+				retained->tcal_enabled = tcal_en;
+			} else {
+				retained->tcal_enabled = true;
+			}
+		}
 #endif
 		sys_read(RF_CHANNEL_ID, &retained->rf_channel, sizeof(retained->rf_channel));
 		sys_read(MAG_ENABLED_ID, &retained->mag_enabled, sizeof(retained->mag_enabled));
+		sys_read(
+			MAG_ONLINE_CALIBRATION_ID,
+			&retained->mag_online_calibration_mode,
+			sizeof(retained->mag_online_calibration_mode)
+		);
+		if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
+			retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
+		}
 		retained_update();
 	} else {
 		LOG_INF("Validated RAM");
 		ram_retention_valid = true;
 		// Still need to init NVS for later sys_read/sys_write calls (e.g., battery_tracker)
 		sys_nvs_init();
+		sys_migrate_battery_curve();
 	}
 	return 0;
 }
@@ -215,18 +255,22 @@ SYS_INIT(sys_retained_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 // read from retained
 uint8_t reboot_counter_read(void)
 {
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
 	if (!ram_retention_valid) // system cannot trust retained state, read from nvs
 	{
 		sys_nvs_init();
 		nvs_read(&fs, RBT_CNT_ID, &retained->reboot_counter, sizeof(retained->reboot_counter));
 		retained_update();
 	}
-	return retained->reboot_counter;
+	uint8_t reboot_counter = retained->reboot_counter;
+	k_mutex_unlock(&sys_storage_lock);
+	return reboot_counter;
 }
 
 // write to retained
 void reboot_counter_write(uint8_t reboot_counter)
 {
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
 	retained->reboot_counter = reboot_counter;
 	if (!ram_retention_valid) // system cannot trust retained state, write to nvs
 	{
@@ -234,17 +278,144 @@ void reboot_counter_write(uint8_t reboot_counter)
 		nvs_write(&fs, RBT_CNT_ID, &retained->reboot_counter, sizeof(retained->reboot_counter));
 	}
 	retained_update();
+	k_mutex_unlock(&sys_storage_lock);
 }
 
-// write to retained and nvs
+/* Deferred NVS slots for warm-durable IDs (coalesced until sys_flush_warm). */
+#define WARM_DIRTY_MAX 8
+struct warm_dirty_slot {
+	uint16_t id;
+	void *ptr;
+	size_t len;
+};
+static struct warm_dirty_slot warm_dirty[WARM_DIRTY_MAX];
+static uint8_t warm_dirty_count;
+
+static void sys_flush_warm_locked(void);
+
+static void warm_dirty_clear_id_locked(uint16_t id)
+{
+	for (uint8_t i = 0; i < warm_dirty_count;) {
+		if (warm_dirty[i].id != id) {
+			i++;
+			continue;
+		}
+		warm_dirty[i] = warm_dirty[warm_dirty_count - 1];
+		warm_dirty_count--;
+	}
+}
+
+static void warm_dirty_mark_locked(uint16_t id, void *ptr, size_t len)
+{
+	if (!ptr || len == 0) {
+		return;
+	}
+	for (uint8_t i = 0; i < warm_dirty_count; i++) {
+		if (warm_dirty[i].id == id) {
+			warm_dirty[i].ptr = ptr;
+			warm_dirty[i].len = len;
+			return;
+		}
+	}
+	if (warm_dirty_count >= WARM_DIRTY_MAX) {
+		LOG_ERR("Warm dirty table full, forcing flush before mark ID %u", id);
+		sys_flush_warm_locked();
+		if (warm_dirty_count >= WARM_DIRTY_MAX) {
+			LOG_ERR("Warm dirty table still full after flush, dropping ID %u", id);
+			return;
+		}
+	}
+	warm_dirty[warm_dirty_count++] = (struct warm_dirty_slot){
+		.id = id,
+		.ptr = ptr,
+		.len = len,
+	};
+}
+
+bool sys_warm_is_dirty(void)
+{
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
+	bool dirty = warm_dirty_count > 0;
+	k_mutex_unlock(&sys_storage_lock);
+	return dirty;
+}
+
+void sys_warm_transaction_begin(void)
+{
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
+}
+
+void sys_warm_transaction_mark(uint16_t id, void *retained_ptr, size_t len)
+{
+	warm_dirty_mark_locked(id, retained_ptr, len);
+}
+
+void sys_warm_transaction_end(bool retained_changed)
+{
+	if (retained_changed) {
+		retained_update();
+	}
+	k_mutex_unlock(&sys_storage_lock);
+}
+
+void sys_write_warm(uint16_t id, void *retained_ptr, const void *data, size_t len)
+{
+	if (!retained_ptr) {
+		LOG_ERR("sys_write_warm: retained_ptr required for ID %u", id);
+		return;
+	}
+	sys_warm_transaction_begin();
+	if (data && retained_ptr != data) {
+		memcpy(retained_ptr, data, len);
+	}
+	sys_warm_transaction_mark(id, retained_ptr, len);
+	sys_warm_transaction_end(true);
+}
+
+static void sys_flush_warm_locked(void)
+{
+	if (warm_dirty_count == 0) {
+		return;
+	}
+	if (!sys_nvs_init()) {
+		LOG_ERR("sys_flush_warm: NVS init failed, keeping %u dirty IDs", warm_dirty_count);
+		return;
+	}
+
+	LOG_INF("Flushing %u warm NVS ID(s)", warm_dirty_count);
+	for (uint8_t i = 0; i < warm_dirty_count; i++) {
+		int err = nvs_write(&fs, warm_dirty[i].id, warm_dirty[i].ptr, warm_dirty[i].len);
+		if (err < 0) {
+			LOG_ERR("sys_flush_warm: NVS write ID %u failed: %d", warm_dirty[i].id, err);
+			/* Keep remaining dirty; drop only successfully written prefix next time. */
+			if (i > 0) {
+				memmove(&warm_dirty[0], &warm_dirty[i], (warm_dirty_count - i) * sizeof(warm_dirty[0]));
+			}
+			warm_dirty_count -= i;
+			return;
+		}
+	}
+	warm_dirty_count = 0;
+}
+
+void sys_flush_warm(void)
+{
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
+	sys_flush_warm_locked();
+	k_mutex_unlock(&sys_storage_lock);
+}
+
+// write to retained and nvs (cold / eager)
 void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 {
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
 	if (!sys_nvs_init()) {
 		LOG_ERR("sys_write: NVS init failed, cannot write ID %d", id);
 		if (retained_ptr) {
 			memcpy(retained_ptr, data, len);
 			retained_update();
 		}
+		k_mutex_unlock(&sys_storage_lock);
 		return;
 	}
 	if (retained_ptr) {
@@ -253,18 +424,29 @@ void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 	int err = nvs_write(&fs, id, data, len);
 	if (err < 0) {
 		LOG_ERR("Failed to write to NVS, error: %d", err);
+		/* RAM already updated; seal CRC so soft-reset trusts retained. */
+		if (retained_ptr) {
+			retained_update();
+		}
+		k_mutex_unlock(&sys_storage_lock);
 		return;
 	}
+	/* Eager NVS write supersedes any deferred warm copy of this ID. */
+	warm_dirty_clear_id_locked(id);
 	if (retained_ptr) {
 		retained_update();
 	}
+	k_mutex_unlock(&sys_storage_lock);
 }
 
 void sys_read(uint16_t id, void *data, size_t len)
 {
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
+	memset(data, 0, len);
+
 	if (!sys_nvs_init()) {
 		LOG_ERR("sys_read: NVS init failed, cannot read ID %d", id);
-		memset(data, 0, len);
+		k_mutex_unlock(&sys_storage_lock);
 		return;
 	}
 	int err = nvs_read(&fs, id, data, len);
@@ -276,9 +458,13 @@ void sys_read(uint16_t id, void *data, size_t len)
 			LOG_ERR("Failed to read from NVS, error: %d", err);
 			LOG_WRN("Read data set to zero");
 		}
-		memset(data, 0, len);
+		k_mutex_unlock(&sys_storage_lock);
 		return;
 	}
+	if ((size_t)err < len) {
+		LOG_WRN("Short NVS read for ID %d: got %d bytes, expected %zu", id, err, len);
+	}
+	k_mutex_unlock(&sys_storage_lock);
 }
 
 void sys_clear(void)
@@ -295,7 +481,9 @@ void sys_clear(void)
 	}
 	printk("Resetting NVS and retained\n");
 
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
 	sys_nvs_init();
+	warm_dirty_count = 0;
 	memset(retained, 0, sizeof(*retained));
 	nvs_clear(&fs);
 	nvs_init = false;
@@ -307,8 +495,24 @@ void sys_clear(void)
 	retained->gyroSensScale[2] = 1.0f;
 	retained->build_timestamp = BUILD_TIMESTAMP;
 	retained_update();
+	k_mutex_unlock(&sys_storage_lock);
 
 	LOG_INF("NVS and retained reset");
+}
+
+void sys_nvs_stats(void)
+{
+	k_mutex_lock(&sys_storage_lock, K_FOREVER);
+	if (!sys_nvs_init()) {
+		printk("NVS init failed\n");
+		k_mutex_unlock(&sys_storage_lock);
+		return;
+	}
+
+	printk("Storage partition: %u bytes\n", NVS_PARTITION_SIZE);
+	printk("Allocated NVS: %u * %u = %u bytes\n", fs.sector_size, fs.sector_count, fs.sector_size * fs.sector_count);
+	printk("NVS free: %d bytes, max item: %d bytes\n", nvs_calc_free_space(&fs), nvs_sector_max_data_size(&fs));
+	k_mutex_unlock(&sys_storage_lock);
 }
 
 // return 0 if clock applied, -1 if failed (because there is no clk_en or clk_out)
@@ -349,11 +553,15 @@ int set_sensor_clock(bool enable, float rate, float *actual_rate)
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static int64_t press_time = 0;
 static int64_t last_press_duration = 0;
+bool button_held_from_init;
 
 static void button_interrupt_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	bool pressed = button_read();
 	int64_t current_time = k_uptime_get();
+	if (!pressed && button_held_from_init) { // after first depress, now allow events that need unambiguous button hold
+		button_held_from_init = false;
+	}
 	if (press_time && !pressed && current_time - press_time > 50) { // debounce
 		last_press_duration = current_time - press_time;
 	} else if (press_time && pressed) { // unusual press event on button already pressed
@@ -366,15 +574,37 @@ static struct gpio_callback button_cb_data;
 
 static int sys_button_init(void)
 {
+#ifdef NRF_RESET
+#ifdef RESET_RESETREAS_VBUS_Msk
+	bool reset_vbus_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_VBUS_Msk;
+#else
+	/* SoCs without USB (e.g. nRF54L15) have no VBUS reset reason. */
+	bool reset_vbus_reset = false;
+#endif
+#else
+	bool reset_vbus_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_VBUS_Msk;
+#endif
 	gpio_pin_configure_dt(&button0, GPIO_INPUT);
 	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
 	gpio_init_callback(&button_cb_data, button_interrupt_handler, BIT(button0.pin));
 	gpio_add_callback(button0.port, &button_cb_data);
+	if (!reset_vbus_reset) { // button held at init is only a deliberate hold if reset was not caused by VBUS (USB plug-in wake)
+		button_held_from_init = gpio_pin_get_dt(&button0);
+	}
 	return 0;
 }
 
 SYS_INIT(sys_button_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 #endif
+
+bool button_read_filtered(void) // ignores initial press only if button was held since boot (e.g. wake key)
+{
+#if BUTTON_EXISTS // Alternate button if available to use as "reset key"
+	return button_held_from_init ? false : gpio_pin_get_dt(&button0);
+#else
+	return false;
+#endif
+}
 
 bool button_read(void)
 {
@@ -413,14 +643,25 @@ static void button_thread(void)
 			last_press = k_uptime_get();
 			set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_HIGHEST);
 		}
+		/* Block all button actions during OTA (active or suppressed) */
+		bool ota_busy = esb_ota_is_active() || connection_get_ota_suppressed();
 		if (last_press && k_uptime_get() - last_press > 1000) {
 			LOG_INF("Button was pressed %d times", num_presses);
 			last_press = 0;
-			if (num_presses == 1) {
-				sys_request_system_reboot(false);
+			if (ota_busy) {
+				LOG_INF("Button action blocked by OTA");
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+			} else if (num_presses == 1) {
+				if (test_mode_get()) {
+					LOG_INF("Button reboot blocked by test mode");
+				} else {
+					sys_request_system_reboot(false);
+				}
 			}
 #if CONFIG_USER_EXTRA_ACTIONS // TODO: extra actions are default until server can send commands to trackers
-			sys_reset_mode(num_presses - 1);
+			if (!ota_busy) {
+				sys_reset_mode(num_presses - 1);
+			}
 #endif
 			num_presses = 0;
 			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
@@ -428,14 +669,21 @@ static void button_thread(void)
 		}
 		if (press_time && k_uptime_get() - press_time > 1000 && button_read()) // Button is being held
 		{
-			if (sys_user_shutdown()) // held for 5 seconds, reset pairing
-			{
+			if (ota_busy) {
+				LOG_INF("Button hold blocked by OTA");
+				press_time = 0;
+				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
+				set_status(SYS_STATUS_BUTTON_PRESSED, false);
+			} else if (sys_user_shutdown()) {
+#if CONFIG_USER_EXTRA_ACTIONS
+				LOG_INF("Button hold timeout, shutdown canceled");
+#else
 				LOG_INF("Pairing requested");
 				esb_reset_pair();
+#endif
 				press_time = 0;
 				set_status(SYS_STATUS_BUTTON_PRESSED, false); // TODO: is needed?
-			}
-			else // shutting down or rebooting
+			} else                                            // shutting down or rebooting
 			{
 				k_thread_abort(button_thread_id);
 			}
@@ -538,6 +786,49 @@ int sys_user_shutdown(void)
 	return 0;
 }
 
+void sys_command_shutdown(void)
+{
+	LOG_INF("Command shutdown requested");
+	reboot_counter_write(0);
+	set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
+	k_msleep(1500);
+	sys_request_system_off(false);
+}
+
+void sys_enter_dfu(bool ota)
+{
+#if defined(CONFIG_BOOTLOADER_MCUBOOT)
+	ARG_UNUSED(ota);
+	int err = bootmode_set(BOOT_MODE_TYPE_BOOTLOADER);
+	if (err) {
+		LOG_ERR("Failed to request MCUboot recovery: %d", err);
+		return;
+	}
+	LOG_INF("MCUboot serial recovery requested");
+	sys_request_system_reboot(false);
+#elif ADAFRUIT_BOOTLOADER
+	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
+	k_msleep(100);
+	sys_request_system_reboot(false);
+#elif NRF5_BOOTLOADER
+	ARG_UNUSED(ota);
+	gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
+	k_msleep(100);
+	sys_request_system_reboot(false);
+#else
+	ARG_UNUSED(ota);
+#endif
+}
+
+void sys_skip_dfu(void)
+{
+#if ADAFRUIT_BOOTLOADER
+	if (NRF_POWER->GPREGRET == 0) {
+		NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_SKIP; // Skip DFU
+	}
+#endif
+}
+
 void sys_reset_mode(uint8_t mode)
 {
 	switch (mode) {
@@ -560,13 +851,12 @@ void sys_reset_mode(uint8_t mode)
 	case 6: // Reset mode DFU
 #endif
 		LOG_INF("DFU requested");
-#if ADAFRUIT_BOOTLOADER
-		NRF_POWER->GPREGRET = 0x57; // DFU_MAGIC_UF2_RESET
-		sys_request_system_reboot(false);
-#endif
-#if NRF5_BOOTLOADER
-		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-#endif
+		sys_enter_dfu(false);
+		break;
+	case 7:
+	case 8: // Reset mode DFU OTA
+		LOG_INF("DFU OTA requested");
+		sys_enter_dfu(true);
 #endif
 	default:
 		break;

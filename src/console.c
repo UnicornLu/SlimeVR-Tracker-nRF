@@ -1,132 +1,45 @@
 #include "globals.h"
 #include "system/system.h"
 #include "system/battery_tracker.h"
+#include "system/test_mode.h"
 #include "sensor/sensor.h"
-#include "sensor/calibration.h"
+#include "sensor/calibration/calibration.h"
+#if CONFIG_VQF_BENCH
+#include "sensor/fusion/vqf/vqf.h"
+#endif
 #include "connection/esb.h"
+#include "connection/connection.h"
 #include "connection/tdma.h"
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+#include "connection/radio_capture.h"
+#endif
 #include "build_defines.h"
+#include "parse_args.h"
 #include "zephyr/sys/printk.h"
+#if CONFIG_THREAD_ANALYZER
+#include <zephyr/debug/thread_analyzer.h>
+#endif
 
-#if CONFIG_USB_DEVICE_STACK
-#define USB DT_NODELABEL(usbd)
-#define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE)
-#else
 #define USB_EXISTS 0
+#if CONFIG_USB_DEVICE_STACK_NEXT
+#undef USB_EXISTS
+#define USB DT_NODELABEL(zephyr_udc0)
+#define USB_EXISTS (DT_NODE_HAS_STATUS(USB, okay) && CONFIG_UART_CONSOLE && \
+	DT_NODE_HAS_COMPAT(DT_CHOSEN(zephyr_console), zephyr_cdc_acm_uart))
 #endif
 
-// --- Command Implementations (always available for ESB remote commands) ---
+/*
+ * Interactive console over the chosen console device. UART input is parsed
+ * by the private IRQ line editor below; the worker stays blocked on its queue
+ * while USB is disconnected.
+ */
+#define UART_CONSOLE_EXISTS \
+	(!USB_EXISTS && CONFIG_UART_CONSOLE && \
+	 DT_NODE_HAS_STATUS(DT_CHOSEN(zephyr_console), okay))
 
-void cmd_sens_set(float x, float y, float z)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		float deg_x = x;
-		float deg_y = y;
-		float deg_z = z;
+#if (USB_EXISTS || UART_CONSOLE_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
 
-		float den_x = 1.0f - (deg_x / (360.0f * CONFIG_SENSOR_SENS_REV));
-		float den_y = 1.0f - (deg_y / (360.0f * CONFIG_SENSOR_SENS_REV));
-		float den_z = 1.0f - (deg_z / (360.0f * CONFIG_SENSOR_SENS_REV));
-
-		// Prevent division by zero or near-zero
-		if (fabsf(den_x) < 1e-6f || fabsf(den_y) < 1e-6f || fabsf(den_z) < 1e-6f) {
-			printk("Error: Invalid input degrees leading to division by zero. Calibration not applied.\n");
-		} else {
-			retained->gyroSensScale[0] = 1.0f / den_x;
-			retained->gyroSensScale[1] = 1.0f / den_y;
-			retained->gyroSensScale[2] = 1.0f / den_z;
-			retained_update();
-			sys_write(
-				MAIN_GYRO_SENS_ID,
-				&retained->gyroSensScale,
-				retained->gyroSensScale,
-				sizeof(retained->gyroSensScale)
-			);
-			printk(
-				"Gyro sensitivity difference set to: %.3f, %.3f, %.3f\n",
-				(double)deg_x,
-				(double)deg_y,
-				(double)deg_z
-			);
-		}
-	} else {
-		printk("Error: Retained data not available.\n");
-	}
-#else
-	(void)x; (void)y; (void)z;
-	printk("Error: Sensitivity calibration not enabled.\n");
-#endif
-}
-
-void cmd_sens_reset(void)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	if (retained) {
-		printk("Resetting gyro sensitivity calibration.\n");
-		retained->gyroSensScale[0] = 1.0f;
-		retained->gyroSensScale[1] = 1.0f;
-		retained->gyroSensScale[2] = 1.0f;
-		retained_update(); // Save changes
-		sys_write(
-			MAIN_GYRO_SENS_ID,
-			&retained->gyroSensScale,
-			retained->gyroSensScale,
-			sizeof(retained->gyroSensScale)
-		);
-		printk("Gyro sensitivity reset.\n");
-	} else {
-		printk("Error: Retained data not available.\n");
-	}
-#else
-	printk("Error: Sensitivity calibration not enabled.\n");
-#endif
-}
-
-void cmd_reset_zro(void)
-{
-	sensor_calibration_clear(NULL, NULL, true);
-}
-
-void cmd_reset_acc(void)
-{
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	sensor_calibration_clear_6_side(NULL, true);
-#else
-	printk("Error: 6-side calibration not enabled.\n");
-#endif
-}
-
-void cmd_reset_tcal(void)
-{
-#if CONFIG_SENSOR_USE_TCAL_MANUAL_POLYNOMIAL
-	sensor_tcal_clear_poly();
-#else
-	printk("Error: Temperature calibration not enabled.\n");
-#endif
-}
-
-void cmd_reset_bat(void)
-{
-	sys_reset_battery_tracker();
-}
-
-void cmd_bat_debug(void)
-{
-	sys_print_battery_tracker_debug();
-}
-
-void cmd_ping_start(void)
-{
-	printk("Ping received! Flashing LED.\n");
-	set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
-}
-
-#if (USB_EXISTS || CONFIG_RTT_CONSOLE) && CONFIG_USE_SLIMENRF_CONSOLE
-
-#if USB_EXISTS
-#include <zephyr/console/console.h>
-#include <zephyr/logging/log_ctrl.h>
+#if USB_EXISTS || UART_CONSOLE_EXISTS
 #include <zephyr/drivers/uart.h>
 #else
 #include "system/rtt_console.h"
@@ -135,8 +48,6 @@ void cmd_ping_start(void)
 #include <zephyr/sys/reboot.h>
 
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
@@ -144,24 +55,522 @@ void cmd_ping_start(void)
 LOG_MODULE_REGISTER(console, LOG_LEVEL_INF);
 
 static void console_thread(void);
+
+#if USB_EXISTS || UART_CONSOLE_EXISTS
+#include <zephyr/device.h>
+#include <errno.h>
+
+static const struct device *const console_uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 #if USB_EXISTS
 static struct k_thread console_thread_id;
-static K_THREAD_STACK_DEFINE(console_thread_id_stack, 2048);
-#else
-K_THREAD_DEFINE(console_thread_id, 2048, console_thread, NULL, NULL, NULL, 6, 0, 0);
+static K_THREAD_STACK_DEFINE(console_thread_stack, 1536);
+static bool console_thread_started;
+#endif
+static void console_uart_irq(const struct device *dev, void *user_data);
+
+#define CONSOLE_LINE_QUEUE_DEPTH 4
+#define CONSOLE_ECHO_BUFFER_SIZE 512
+#define CONSOLE_INPUT_DRAIN_MAX 4096
+#define CONSOLE_LINE_MAX_LEN CONFIG_CONSOLE_INPUT_MAX_LINE_LEN
+
+BUILD_ASSERT(CONSOLE_LINE_MAX_LEN >= 2, "Console line buffer must hold an empty line");
+
+struct console_line_message {
+	uint32_t epoch;
+	char line[CONSOLE_LINE_MAX_LEN];
+};
+
+enum console_escape_state {
+	CONSOLE_ESCAPE_NONE,
+	CONSOLE_ESCAPE_START,
+	CONSOLE_ESCAPE_CSI,
+	CONSOLE_ESCAPE_SS3,
+};
+
+struct console_input_state {
+	struct k_spinlock lock;
+	bool initialized;
+	bool active;
+	bool overflow;
+	bool last_was_cr;
+	enum console_escape_state escape_state;
+	bool escape_has_value;
+	bool escape_ignore_value;
+	uint16_t escape_value;
+	uint16_t cursor;
+	uint16_t tail;
+	uint32_t epoch;
+	char line[CONSOLE_LINE_MAX_LEN];
+	uint8_t echo[CONSOLE_ECHO_BUFFER_SIZE];
+	uint16_t echo_head;
+	uint16_t echo_tail;
+};
+K_MSGQ_DEFINE(console_line_msgq, sizeof(struct console_line_message), CONSOLE_LINE_QUEUE_DEPTH, 4);
+
+static struct console_input_state console_input;
+static bool console_echo_has_data_locked(void)
+{
+	return console_input.echo_head != console_input.echo_tail;
+}
+
+static void console_echo_put_locked(uint8_t byte)
+{
+	uint16_t next = (uint16_t)((console_input.echo_head + 1U) % CONSOLE_ECHO_BUFFER_SIZE);
+
+	if (next == console_input.echo_tail) {
+		return;
+	}
+
+	console_input.echo[console_input.echo_head] = byte;
+	console_input.echo_head = next;
+}
+
+static void console_echo_text_locked(const char *text)
+{
+	while (*text != '\0') {
+		console_echo_put_locked((uint8_t)*text++);
+	}
+}
+
+static void console_echo_cursor_locked(uint8_t direction, uint16_t count)
+{
+	if (count == 0U) {
+		return;
+	}
+
+	console_echo_put_locked(0x1b);
+	console_echo_put_locked('[');
+	if (count >= 100U) {
+		console_echo_put_locked((uint8_t)('0' + count / 100U));
+		count %= 100U;
+		console_echo_put_locked((uint8_t)('0' + count / 10U));
+		console_echo_put_locked((uint8_t)('0' + count % 10U));
+	} else if (count >= 10U) {
+		console_echo_put_locked((uint8_t)('0' + count / 10U));
+		console_echo_put_locked((uint8_t)('0' + count % 10U));
+	} else {
+		console_echo_put_locked((uint8_t)('0' + count));
+	}
+	console_echo_put_locked(direction);
+}
+
+static void console_reset_line_locked(void)
+{
+	console_input.overflow = false;
+	console_input.last_was_cr = false;
+	console_input.escape_state = CONSOLE_ESCAPE_NONE;
+	console_input.escape_has_value = false;
+	console_input.escape_ignore_value = false;
+	console_input.escape_value = 0;
+	console_input.cursor = 0;
+	console_input.tail = 0;
+}
+
+static void console_drop_queued_lines_locked(void)
+{
+	struct console_line_message dropped;
+
+	while (k_msgq_get(&console_line_msgq, &dropped, K_NO_WAIT) == 0) {
+	}
+}
+
+static void console_finish_line_locked(void)
+{
+	struct console_line_message message = {0};
+	uint16_t length = (uint16_t)(console_input.cursor + console_input.tail);
+
+	if (!console_input.overflow) {
+		message.epoch = console_input.epoch;
+		memcpy(message.line, console_input.line, length);
+		message.line[length] = '\0';
+		if (k_msgq_put(&console_line_msgq, &message, K_NO_WAIT) != 0) {
+			console_echo_put_locked('\a');
+		}
+	}
+
+	console_echo_text_locked("\r\n");
+	console_reset_line_locked();
+}
+
+static void console_insert_char_locked(uint8_t byte)
+{
+	uint16_t length = (uint16_t)(console_input.cursor + console_input.tail);
+
+	if (length >= CONSOLE_LINE_MAX_LEN - 1U) {
+		if (!console_input.overflow) {
+			console_input.overflow = true;
+			console_echo_put_locked('\a');
+		}
+		return;
+	}
+
+	for (uint16_t i = length; i > console_input.cursor; i--) {
+		console_input.line[i] = console_input.line[i - 1U];
+	}
+	console_input.line[console_input.cursor++] = (char)byte;
+
+	console_echo_put_locked(byte);
+	if (console_input.tail != 0U) {
+		console_echo_text_locked("\x1b[s");
+		for (uint16_t i = console_input.cursor; i < console_input.cursor + console_input.tail; i++) {
+			console_echo_put_locked((uint8_t)console_input.line[i]);
+		}
+		console_echo_text_locked("\x1b[u");
+	}
+}
+
+static void console_backspace_locked(void)
+{
+	uint16_t length;
+
+	if (console_input.cursor == 0U) {
+		return;
+	}
+
+	length = (uint16_t)(console_input.cursor + console_input.tail);
+	console_input.cursor--;
+	for (uint16_t i = console_input.cursor; i + 1U < length; i++) {
+		console_input.line[i] = console_input.line[i + 1U];
+	}
+
+	console_echo_put_locked('\b');
+	if (console_input.tail == 0U) {
+		console_echo_text_locked(" \b");
+	} else {
+		console_echo_text_locked("\x1b[s");
+		for (uint16_t i = console_input.cursor; i < console_input.cursor + console_input.tail; i++) {
+			console_echo_put_locked((uint8_t)console_input.line[i]);
+		}
+		console_echo_text_locked(" \x1b[u");
+	}
+}
+
+static void console_delete_locked(void)
+{
+	uint16_t length;
+
+	if (console_input.tail == 0U) {
+		return;
+	}
+
+	length = (uint16_t)(console_input.cursor + console_input.tail);
+	for (uint16_t i = console_input.cursor; i + 1U < length; i++) {
+		console_input.line[i] = console_input.line[i + 1U];
+	}
+	console_input.tail--;
+
+	console_echo_cursor_locked('C', 1);
+	console_echo_put_locked('\b');
+	if (console_input.tail == 0U) {
+		console_echo_text_locked(" \b");
+	} else {
+		console_echo_text_locked("\x1b[s");
+		for (uint16_t i = console_input.cursor; i < console_input.cursor + console_input.tail; i++) {
+			console_echo_put_locked((uint8_t)console_input.line[i]);
+		}
+		console_echo_text_locked(" \x1b[u");
+	}
+}
+
+static void console_move_home_locked(void)
+{
+	console_echo_cursor_locked('D', console_input.cursor);
+	console_input.tail = (uint16_t)(console_input.tail + console_input.cursor);
+	console_input.cursor = 0;
+}
+
+static void console_move_end_locked(void)
+{
+	console_echo_cursor_locked('C', console_input.tail);
+	console_input.cursor = (uint16_t)(console_input.cursor + console_input.tail);
+	console_input.tail = 0;
+}
+
+static void console_apply_escape_locked(uint8_t final)
+{
+	uint16_t count
+		= console_input.escape_has_value && console_input.escape_value != 0U ? console_input.escape_value : 1U;
+
+	switch (final) {
+	case 'D':
+		count = MIN(count, console_input.cursor);
+		console_input.cursor -= count;
+		console_input.tail = (uint16_t)(console_input.tail + count);
+		console_echo_cursor_locked('D', count);
+		break;
+	case 'C':
+		count = MIN(count, console_input.tail);
+		console_input.cursor = (uint16_t)(console_input.cursor + count);
+		console_input.tail -= count;
+		console_echo_cursor_locked('C', count);
+		break;
+	case 'H':
+		console_move_home_locked();
+		break;
+	case 'F':
+		console_move_end_locked();
+		break;
+	case '~':
+		if (console_input.escape_value == 3U) {
+			console_delete_locked();
+		} else if (console_input.escape_value == 1U || console_input.escape_value == 7U) {
+			console_move_home_locked();
+		} else if (console_input.escape_value == 4U || console_input.escape_value == 8U) {
+			console_move_end_locked();
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static bool console_handle_escape_locked(uint8_t byte)
+{
+	switch (console_input.escape_state) {
+	case CONSOLE_ESCAPE_START:
+		if (byte == '[') {
+			console_input.escape_state = CONSOLE_ESCAPE_CSI;
+			console_input.escape_has_value = false;
+			console_input.escape_ignore_value = false;
+			console_input.escape_value = 0;
+		} else if (byte == 'O') {
+			console_input.escape_state = CONSOLE_ESCAPE_SS3;
+		} else {
+			console_input.escape_state = CONSOLE_ESCAPE_NONE;
+		}
+		return true;
+	case CONSOLE_ESCAPE_CSI:
+		if (byte >= 0x30 && byte <= 0x3f) {
+			if (byte >= '0' && byte <= '9') {
+				if (!console_input.escape_ignore_value) {
+					console_input.escape_has_value = true;
+					if (console_input.escape_value < 999U) {
+						console_input.escape_value
+							= (uint16_t)MIN(999U, console_input.escape_value * 10U + (uint16_t)(byte - '0'));
+					}
+				}
+			} else if (byte == ';') {
+				console_input.escape_ignore_value = true;
+			}
+			return true;
+		}
+		if (byte >= 0x20 && byte <= 0x2f) {
+			return true;
+		}
+		if (byte >= 0x40 && byte <= 0x7e) {
+			console_apply_escape_locked(byte);
+		}
+		console_input.escape_state = CONSOLE_ESCAPE_NONE;
+		return true;
+	case CONSOLE_ESCAPE_SS3:
+		if (byte >= 0x20 && byte <= 0x2f) {
+			return true;
+		}
+		if (byte >= 0x40 && byte <= 0x7e) {
+			console_apply_escape_locked(byte);
+		}
+		console_input.escape_state = CONSOLE_ESCAPE_NONE;
+		return true;
+	case CONSOLE_ESCAPE_NONE:
+	default:
+		return false;
+	}
+}
+
+static void console_input_byte_locked(uint8_t byte)
+{
+	if (byte == '\n' && console_input.last_was_cr) {
+		console_input.last_was_cr = false;
+		return;
+	}
+
+	if (byte == '\r' || byte == '\n') {
+		console_finish_line_locked();
+		console_input.last_was_cr = byte == '\r';
+		return;
+	}
+
+	console_input.last_was_cr = false;
+	if (console_input.overflow) {
+		return;
+	}
+
+	if (console_input.escape_state != CONSOLE_ESCAPE_NONE) {
+		(void)console_handle_escape_locked(byte);
+		return;
+	}
+
+	if (byte == 0x1b) {
+		console_input.escape_state = CONSOLE_ESCAPE_START;
+		console_input.escape_has_value = false;
+		console_input.escape_ignore_value = false;
+		console_input.escape_value = 0;
+		return;
+	}
+
+	switch (byte) {
+	case 0x08:
+	case 0x7f:
+		console_backspace_locked();
+		break;
+	case '\t':
+		break;
+	default:
+		if (isprint((unsigned char)byte) != 0) {
+			console_insert_char_locked(byte);
+		}
+		break;
+	}
+}
+
+static void console_echo_flush(const struct device *dev)
+{
+	while (true) {
+		int ready = uart_irq_tx_ready(dev);
+		if (ready <= 0) {
+			return;
+		}
+
+		k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+		if (!console_echo_has_data_locked()) {
+			k_spin_unlock(&console_input.lock, key);
+			uart_irq_tx_disable(dev);
+			return;
+		}
+
+		uint16_t head = console_input.echo_head;
+		uint16_t tail = console_input.echo_tail;
+		uint16_t contiguous = head > tail ? (uint16_t)(head - tail) : (uint16_t)(CONSOLE_ECHO_BUFFER_SIZE - tail);
+		int count = (int)contiguous;
+		int sent = uart_fifo_fill(dev, &console_input.echo[tail], count);
+		if (sent > 0) {
+			console_input.echo_tail = (uint16_t)((tail + (uint16_t)sent) % CONSOLE_ECHO_BUFFER_SIZE);
+		}
+		bool empty = !console_echo_has_data_locked();
+		k_spin_unlock(&console_input.lock, key);
+
+		if (sent <= 0) {
+			return;
+		}
+		if (empty) {
+			uart_irq_tx_disable(dev);
+			return;
+		}
+	}
+}
+
+static void console_uart_irq(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (dev != console_uart_dev) {
+		return;
+	}
+
+	while (uart_irq_update(dev) > 0 && uart_irq_is_pending(dev) > 0) {
+		if (uart_irq_rx_ready(dev) > 0) {
+			do {
+				uint8_t byte;
+				k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+				int received = uart_fifo_read(dev, &byte, 1);
+
+				if (received > 0 && console_input.initialized && console_input.active) {
+					console_input_byte_locked(byte);
+				}
+				k_spin_unlock(&console_input.lock, key);
+
+				if (received <= 0) {
+					break;
+				}
+			} while (uart_irq_rx_ready(dev) > 0);
+		}
+
+		if (uart_irq_tx_ready(dev) > 0) {
+			console_echo_flush(dev);
+		}
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	bool echo_pending = console_echo_has_data_locked();
+	k_spin_unlock(&console_input.lock, key);
+	if (echo_pending) {
+		uart_irq_tx_enable(dev);
+	} else {
+		uart_irq_tx_disable(dev);
+	}
+}
+
+static void console_drain_uart_locked(void)
+{
+	unsigned char byte;
+
+	for (size_t i = 0; i < CONSOLE_INPUT_DRAIN_MAX; i++) {
+		if (uart_poll_in(console_uart_dev, &byte) != 0) {
+			break;
+		}
+	}
+}
+
+static int console_input_install(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	bool initialized = console_input.initialized;
+	k_spin_unlock(&console_input.lock, key);
+	if (initialized) {
+		return 0;
+	}
+
+	if (!device_is_ready(console_uart_dev)) {
+		LOG_ERR("Console UART is not ready");
+		return -ENODEV;
+	}
+
+	uart_irq_rx_disable(console_uart_dev);
+	uart_irq_tx_disable(console_uart_dev);
+	key = k_spin_lock(&console_input.lock);
+	console_drain_uart_locked();
+	k_spin_unlock(&console_input.lock, key);
+
+	int ret = uart_irq_callback_user_data_set(console_uart_dev, console_uart_irq, NULL);
+	if (ret != 0) {
+		LOG_ERR("Failed to install console UART input callback: %d", ret);
+		return ret;
+	}
+
+	key = k_spin_lock(&console_input.lock);
+	console_input.initialized = true;
+	k_spin_unlock(&console_input.lock, key);
+	uart_irq_rx_enable(console_uart_dev);
+	return 0;
+}
+
+static bool console_line_is_current(uint32_t epoch)
+{
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	bool current = console_input.active && console_input.epoch == epoch;
+	k_spin_unlock(&console_input.lock, key);
+	return current;
+}
+
 #endif
 
-#define DFU_EXISTS CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-#define ADAFRUIT_BOOTLOADER CONFIG_BUILD_OUTPUT_UF2
-#define NRF5_BOOTLOADER CONFIG_BOARD_HAS_NRF5_BOOTLOADER
-
-#if NRF5_BOOTLOADER
-static const struct device *gpio_dev = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+#if !USB_EXISTS && (UART_CONSOLE_EXISTS || CONFIG_RTT_CONSOLE)
+K_THREAD_DEFINE(console_thread_id, 2048, console_thread, NULL, NULL, NULL, CONSOLE_THREAD_PRIORITY, 0, 0);
 #endif
+
+#define DFU_EXISTS (CONFIG_BUILD_OUTPUT_UF2 || CONFIG_BOARD_HAS_NRF5_BOOTLOADER || CONFIG_BOOTLOADER_MCUBOOT)
+#define ADAFRUIT_BOOTLOADER (CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
 
 #if DT_NODE_HAS_STATUS(DT_NODELABEL(mag), okay)
 #define SENSOR_MAG_EXISTS true
 #endif
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+#define SENS_CAL_DEFAULT_REVOLUTIONS CONFIG_SENSOR_SENS_REV
+#define SENS_CAL_MAX_REVOLUTIONS     100
+#endif
+
+#define CONSOLE_BUTTON_EXISTS DT_NODE_HAS_PROP(DT_ALIAS(sw0), gpios)
 
 static const char *meows[] = {
 	"Mew", "Meww", "Meow", "Meow meow", "Mrrrp", "Mrrf", "Mreow", "Mrrrow", "Mrrr", "Purr",
@@ -173,45 +582,135 @@ static const char *meow_punctuations[] = {".", "?", "!", "-", "~", ""};
 static const char *meow_suffixes[]
 	= {" :3", " :3c", " ;3", " ;3c", " x3", " x3c", " X3", " X3c", " >:3", " >:3c", " >;3", " >;3c", ""};
 
-void console_thread_create(void)
+int console_serial_start(void)
 {
+#if USB_EXISTS || UART_CONSOLE_EXISTS
 #if USB_EXISTS
-	k_thread_create(
-		&console_thread_id,
-		console_thread_id_stack,
-		K_THREAD_STACK_SIZEOF(console_thread_id_stack),
-		(k_thread_entry_t)console_thread,
-		NULL,
-		NULL,
-		NULL,
-		6,
-		0,
-		K_NO_WAIT
-	);
+	bool create_thread = false;
+#endif
+
+	int ret = console_input_install();
+	if (ret != 0) {
+		return ret;
+	}
+
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	if (console_input.active) {
+		k_spin_unlock(&console_input.lock, key);
+		return 0;
+	}
+
+	uart_irq_rx_disable(console_uart_dev);
+	uart_irq_tx_disable(console_uart_dev);
+	console_drain_uart_locked();
+	console_input.active = true;
+	console_input.epoch++;
+	console_reset_line_locked();
+	console_drop_queued_lines_locked();
+	console_input.echo_head = 0;
+	console_input.echo_tail = 0;
+#if USB_EXISTS
+	if (!console_thread_started) {
+		console_thread_started = true;
+		create_thread = true;
+	}
+#endif
+	uart_irq_rx_enable(console_uart_dev);
+	k_spin_unlock(&console_input.lock, key);
+
+#if USB_EXISTS
+	if (create_thread) {
+		k_thread_create(
+			&console_thread_id,
+			console_thread_stack,
+			K_THREAD_STACK_SIZEOF(console_thread_stack),
+			(k_thread_entry_t)console_thread,
+			NULL,
+			NULL,
+			NULL,
+			CONSOLE_THREAD_PRIORITY,
+			0,
+			K_NO_WAIT
+		);
+	}
+#endif
+	printk("*** " CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT " ***\n");
+	printk(FW_STRING);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
+	printk("Type 'help' to show available commands.\n");
+	return 0;
+#else
+	return 0;
 #endif
 }
 
-void console_thread_abort(void)
+void console_serial_stop(void)
 {
-#if USB_EXISTS
-	k_thread_abort(&console_thread_id);
+#if USB_EXISTS || UART_CONSOLE_EXISTS
+	k_spinlock_key_t key = k_spin_lock(&console_input.lock);
+	console_input.active = false;
+	console_input.epoch++;
+	console_reset_line_locked();
+	console_drop_queued_lines_locked();
+	console_input.echo_head = 0;
+	console_input.echo_tail = 0;
+	if (console_input.initialized) {
+		uart_irq_tx_disable(console_uart_dev);
+		uart_irq_rx_disable(console_uart_dev);
+		console_drain_uart_locked();
+	}
+	k_spin_unlock(&console_input.lock, key);
 #endif
 }
 
 static void print_board(void)
 {
 #if USB_EXISTS
-	printk(CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT "\n");
+	printk(CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER " " CONFIG_SLIMEVR_USB_DEVICE_PRODUCT "\n");
 #endif
 	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
 
 	printk("\nBoard: " CONFIG_BOARD "\n");
 	printk("SOC: " CONFIG_SOC "\n");
 	printk("Target: " CONFIG_BOARD_TARGET "\n");
 }
 
-static void print_sensor(void)
+static void print_sens_calibration_info(void)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	// Display Gyro sensitivity
+	if (retained) {
+		float scale_x = retained->gyroSensScale[0];
+		float scale_y = retained->gyroSensScale[1];
+		float scale_z = retained->gyroSensScale[2];
+
+		// Calculate the approximate input degrees difference based on the stored scale factor
+		// degrees = (1.0 - (1.0 / scale)) * 360.0 * number of revolutions
+		float deg_x = (1.0f - (1.0f / scale_x)) * (360.0f * CONFIG_SENSOR_SENS_REV);
+		float deg_y = (1.0f - (1.0f / scale_y)) * (360.0f * CONFIG_SENSOR_SENS_REV);
+		float deg_z = (1.0f - (1.0f / scale_z)) * (360.0f * CONFIG_SENSOR_SENS_REV);
+
+		printk(
+			"Gyroscope sensitivity (degrees diff over %u rev): %.3f %.3f %.3f\n",
+			(int)CONFIG_SENSOR_SENS_REV,
+			(double)deg_x,
+			(double)deg_y,
+			(double)deg_z
+		);
+		printk(
+			"Gyroscope sensitivity scale: %.5f %.5f %.5f\n",
+			(double)scale_x,
+			(double)scale_y,
+			(double)scale_z
+		);
+	} else {
+		printk("Gyroscope sensitivity: Retained data unavailable.\n");
+	}
+#endif
+}
+
+static void print_sensor_identity(void)
 {
 	printk("IMU: %s\n", (retained->imu_addr & 0x7F) != 0x7F ? sensor_get_sensor_imu_name() : "Not searching");
 	if (retained->imu_reg != 0xFF) {
@@ -239,6 +738,110 @@ static void print_sensor(void)
 		printk("Interface: %s\n", mag_interface);
 	}
 	printk("Address: 0x%02X%02X\n", retained->mag_addr, retained->mag_reg);
+}
+
+static void print_odr_summary_line(void)
+{
+	float gyro_hz = sensor_get_gyro_odr();
+	float accel_hz = sensor_get_accel_odr();
+	float mag_hz = sensor_get_mag_odr();
+	float fusion_hz = sensor_get_fusion_rate();
+
+	if (mag_hz > 0.0f) {
+		printk(
+			"\nODR: gyro %.1fHz / accel %.1fHz / mag %.1fHz | fusion %.1fHz\n",
+			(double)gyro_hz,
+			(double)accel_hz,
+			(double)mag_hz,
+			(double)fusion_hz
+		);
+	} else {
+		printk(
+			"\nODR: gyro %.1fHz / accel %.1fHz / mag n/a | fusion %.1fHz\n",
+			(double)gyro_hz,
+			(double)accel_hz,
+			(double)fusion_hz
+		);
+	}
+}
+
+static void print_sensor_summary(void)
+{
+	print_sensor_identity();
+	print_odr_summary_line();
+
+	printk(
+		"Gyroscope bias: %.5f %.5f %.5f\n",
+		(double)retained->gyroBias[0],
+		(double)retained->gyroBias[1],
+		(double)retained->gyroBias[2]
+	);
+#if CONFIG_SENSOR_USE_TCAL
+	float current_gyro_offset[3];
+	sensor_calibration_get_last_gyro_offset(current_gyro_offset);
+	printk(
+		"T-Cal: flag=%s apply=%s points=%u\n",
+		sensor_tcal_get_enabled() ? "on" : "off",
+		sensor_tcal_get_apply_mode_name(),
+		retained->tempCalState.count
+	);
+	printk(
+		"Gyroscope bias tcal (real-time): %.5f %.5f %.5f at %.2f C\n",
+		(double)current_gyro_offset[0],
+		(double)current_gyro_offset[1],
+		(double)current_gyro_offset[2],
+		(double)sensor_get_current_imu_temperature()
+	);
+#endif
+	print_sens_calibration_info();
+	printk("\nFusion: %s\n", sensor_get_sensor_fusion_name());
+}
+
+static void print_sensor_detail(void)
+{
+	printk("=== Sensor detail ===\n");
+	printk(
+		"IMU: %s | Mag: %s (%s)\n",
+		(retained->imu_addr & 0x7F) != 0x7F ? sensor_get_sensor_imu_name() : "Not searching",
+		(retained->mag_addr & 0x7F) != 0x7F ? sensor_get_sensor_mag_name() : "Not searching",
+		sensor_get_mag_enabled() ? "enabled" : "disabled"
+	);
+
+	float mag_hz = sensor_get_mag_odr();
+	float mag_feed_hz = sensor_get_mag_feed_hz();
+	float loop_ms = sensor_get_loop_period_ms();
+	printk("\nRates:\n");
+	printk("  Gyro ODR:    %.2f Hz\n", (double)sensor_get_gyro_odr());
+	printk("  Accel ODR:   %.2f Hz\n", (double)sensor_get_accel_odr());
+	if (mag_hz > 0.0f) {
+		printk("  Mag ODR:     %.2f Hz\n", (double)mag_hz);
+	} else {
+		printk("  Mag ODR:     n/a\n");
+	}
+	if (mag_feed_hz > 0.0f) {
+		printk("  Mag feed:    ~%.1f Hz\n", (double)mag_feed_hz);
+	} else if (mag_hz > 0.0f && sensor_get_mag_enabled()) {
+		printk("  Mag feed:    measuring...\n");
+	}
+	printk("  Fusion rate: %.2f Hz\n", (double)sensor_get_fusion_rate());
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1 || CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+	printk(
+		"  Oversample:  gyro %dx, accel %dx\n",
+		CONFIG_SENSOR_GYRO_OVERSAMPLING,
+		CONFIG_SENSOR_ACCEL_OVERSAMPLING
+	);
+#endif
+	if (loop_ms > 0.0f) {
+		printk("  Work time:   ~%.1f ms/loop\n", (double)loop_ms);
+	} else {
+		printk("  Work time:   n/a\n");
+	}
+	printk(
+		"  Test mode:   %s (target=%u, effective=%u TPS)\n",
+		test_mode_get() ? "enabled" : "disabled",
+		test_mode_get_target_tps(),
+		test_mode_effective_tps()
+	);
 
 #if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
 	printk("\nAccelerometer matrix:\n");
@@ -252,55 +855,17 @@ static void print_sensor(void)
 		);
 	}
 
-	// Print calibration quality analysis
-	printk("\nAccel calibration quality:\n");
-	// Extract offset (BAinv[0])
+	printk("\nAccel calibration:\n");
 	printk(
 		"  Offset: [%.5f, %.5f, %.5f]\n",
 		(double)retained->accBAinv[0][0],
 		(double)retained->accBAinv[0][1],
 		(double)retained->accBAinv[0][2]
 	);
-
-	// Extract diagonal elements (BAinv[1][0], BAinv[2][1], BAinv[3][2])
 	float diag_x = retained->accBAinv[1][0];
 	float diag_y = retained->accBAinv[2][1];
 	float diag_z = retained->accBAinv[3][2];
-	printk("  Diagonal: [%.5f, %.5f, %.5f]\n", (double)diag_x, (double)diag_y, (double)diag_z);
-
-	// Calculate average diagonal value (should be close to 1.0)
-	float diag_avg = (diag_x + diag_y + diag_z) / 3.0f;
-	printk("  Diagonal avg: %.5f (ideal: 1.0)\n", (double)diag_avg);
-
-	// Calculate diagonal deviation
-	float diag_dev = sqrtf(
-		((diag_x - diag_avg) * (diag_x - diag_avg) + (diag_y - diag_avg) * (diag_y - diag_avg)
-		 + (diag_z - diag_avg) * (diag_z - diag_avg))
-		/ 3.0f
-	);
-	printk("  Diagonal std: %.5f (lower is better)\n", (double)diag_dev);
-
-	// Calculate max off-diagonal element magnitude
-	float max_off_diag = 0.0f;
-	float off_diag_vals[6]
-		= {fabsf(retained->accBAinv[1][1]),
-		   fabsf(retained->accBAinv[1][2]),
-		   fabsf(retained->accBAinv[2][0]),
-		   fabsf(retained->accBAinv[2][2]),
-		   fabsf(retained->accBAinv[3][0]),
-		   fabsf(retained->accBAinv[3][1])};
-	for (int i = 0; i < 6; i++) {
-		if (off_diag_vals[i] > max_off_diag) {
-			max_off_diag = off_diag_vals[i];
-		}
-	}
-	printk("  Max off-diagonal: %.5f (ideal: ~0.0)\n", (double)max_off_diag);
-
-	// Overall quality assessment
-	bool good_diag = (diag_dev < 0.1f * diag_avg) && (fabsf(diag_avg - 1.0f) < 0.15f);
-	bool good_off_diag = (max_off_diag < 0.15f);
-	printk("  Quality: %s\n", (good_diag && good_off_diag) ? "GOOD" : (good_diag || good_off_diag) ? "FAIR" : "POOR");
-
+	printk("  Scale: [%.5f, %.5f, %.5f]\n", (double)diag_x, (double)diag_y, (double)diag_z);
 #else
 	printk(
 		"\nAccelerometer bias: %.5f %.5f %.5f\n",
@@ -309,26 +874,6 @@ static void print_sensor(void)
 		(double)retained->accelBias[2]
 	);
 #endif
-	printk(
-		"Gyroscope bias: %.5f %.5f %.5f\n",
-		(double)retained->gyroBias[0],
-		(double)retained->gyroBias[1],
-		(double)retained->gyroBias[2]
-	);
-#if CONFIG_SENSOR_USE_TCAL
-	// Display the real-time calculated gyro offset
-	float current_gyro_offset[3];
-	sensor_calibration_get_last_gyro_offset(current_gyro_offset);
-	printk(
-		"Gyroscope bias tcal (real-time): %.5f %.5f %.5f at %.2f C\n",
-		(double)current_gyro_offset[0],
-		(double)current_gyro_offset[1],
-		(double)current_gyro_offset[2],
-		(double)sensor_get_current_imu_temperature()
-	);
-#endif
-	//	printk("Magnetometer bridge offset: %.5f %.5f %.5f\n", (double)retained->magBias[0],
-	//(double)retained->magBias[1], (double)retained->magBias[2]);
 	printk("Magnetometer matrix:\n");
 	for (int i = 0; i < 3; i++) {
 		printk(
@@ -339,11 +884,27 @@ static void print_sensor(void)
 			(double)retained->magBAinv[3][i]
 		);
 	}
-
-	printk("\nFusion: %s\n", sensor_get_sensor_fusion_name());
+	{
+		bool mag_has_cal = (retained->magBAinv[0][0] != 0.0f
+		                 || retained->magBAinv[0][1] != 0.0f
+		                 || retained->magBAinv[0][2] != 0.0f);
+		if (sensor_calibration_get_online_mag_enabled()) {
+			float dir_bias = 0;
+			int online_samples = sensor_calibration_online_mag_status(&dir_bias);
+			float mag_cv = sensor_calibration_get_mag_quality();
+			printk(
+				"Mag cal: %s | norm_cv=%.3f | Online: enabled, %d samples, dir_bias=%.2f\n",
+				mag_has_cal ? "active" : "none",
+				(double)mag_cv,
+				online_samples,
+				(double)dir_bias
+			);
+		} else {
+			printk("Mag cal: %s | Online: disabled\n", mag_has_cal ? "active" : "none");
+		}
+	}
 
 #if CONFIG_SENSOR_RANGE_STATS
-	// Display runtime range statistics summary
 	const sensor_range_stats_t *stats = sensor_get_range_stats();
 	if (stats->initialized) {
 		float gyro_peak = 0;
@@ -351,8 +912,12 @@ static void print_sensor(void)
 		for (int i = 0; i < 3; i++) {
 			float g_peak = fmaxf(fabsf(stats->gyro_min[i]), fabsf(stats->gyro_max[i]));
 			float a_peak = fmaxf(fabsf(stats->accel_min[i]), fabsf(stats->accel_max[i]));
-			if (g_peak > gyro_peak) gyro_peak = g_peak;
-			if (a_peak > accel_peak) accel_peak = a_peak;
+			if (g_peak > gyro_peak) {
+				gyro_peak = g_peak;
+			}
+			if (a_peak > accel_peak) {
+				accel_peak = a_peak;
+			}
 		}
 		printk("\nRuntime range peaks (this session):\n");
 		printk("  Gyro: %.2f deg/s\n", (double)gyro_peak);
@@ -362,49 +927,20 @@ static void print_sensor(void)
 #endif // CONFIG_SENSOR_RANGE_STATS
 }
 
-static void print_sens_calibration_info(void)
-{
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	// Display Gyro sensitivity
-	if (retained) {
-		float scale_x = retained->gyroSensScale[0];
-		float scale_y = retained->gyroSensScale[1];
-		float scale_z = retained->gyroSensScale[2];
-
-		// Calculate the approximate input degrees difference based on the stored scale factor
-		// degrees = (1.0 - (1.0 / scale)) * 360.0 * number of revolutions
-		float deg_x = (1.0f - (1.0f / scale_x)) * (360.0f * CONFIG_SENSOR_SENS_REV);
-		float deg_y = (1.0f - (1.0f / scale_y)) * (360.0f * CONFIG_SENSOR_SENS_REV);
-		float deg_z = (1.0f - (1.0f / scale_z)) * (360.0f * CONFIG_SENSOR_SENS_REV);
-
-		printk(
-			"Gyroscope sensitivity (degrees diff over %u rev): %.3f %.3f %.3f\n",
-			(int)CONFIG_SENSOR_SENS_REV,
-			(double)deg_x,
-			(double)deg_y,
-			(double)deg_z
-		);
-	} else {
-		printk("Gyroscope sensitivity: Retained data unavailable.\n");
-	}
-#endif
-}
-
 static void print_connection(void)
 {
 	bool paired = retained->paired_addr[0];
 	printk(paired ? "Tracker ID: %u\n" : "\nTracker ID: None\n", retained->paired_addr[1]);
 	printk("Device address: %012llX\n", *(uint64_t *)NRF_FICR->DEVICEADDR & 0xFFFFFFFFFFFF);
-	printk("Receiver address: %012llX\n", (*(uint64_t *)&retained->paired_addr[0] >> 16) & 0xFFFFFFFFFFFF);
-	print_sens_calibration_info();
 	printk(
 		paired ? "Receiver address: %012llX\n" : "Receiver address: None\n",
 		(*(uint64_t *)&retained->paired_addr[0] >> 16) & 0xFFFFFFFFFFFF
 	);
 
-	// Display RF channel info
-	if (retained->rf_channel != 0xFF && retained->rf_channel <= 100) {
-		printk("RF Channel: %u (custom)\n", retained->rf_channel);
+	// Display RF channel info (stored value is encoded)
+	uint8_t rf_ch = esb_rf_channel_decode(retained->rf_channel);
+	if (rf_ch != ESB_RF_CHANNEL_DEFAULT) {
+		printk("RF Channel: %u (custom)\n", rf_ch);
 	} else {
 		printk("RF Channel: %u (default)\n", CONFIG_RADIO_RF_CHANNEL);
 	}
@@ -456,7 +992,7 @@ static void print_info(void)
 {
 	print_board();
 	printk("\n");
-	print_sensor();
+	print_sensor_summary();
 	printk("\n");
 	print_connection();
 	printk("\n");
@@ -579,11 +1115,54 @@ static void print_meow(void)
 	printk("%s%s%s\n", meows[meow], meow_punctuations[punctuation], meow_suffixes[suffix]);
 }
 
+static void print_button_help(void)
+{
+	printk("Button Functions (current build):\n");
+#if CONSOLE_BUTTON_EXISTS
+	printk("  Short press (1x):          Reboot (blocked in test mode)\n");
+#if CONFIG_USER_EXTRA_ACTIONS
+	printk("  Quick press (2x):          Calibrate sensor ZRO\n");
+	printk("  Quick press (3x):          Reset active pairing\n");
+#if DFU_EXISTS
+#if defined(CONFIG_BOARD_STYRIA_MINI_UF2)
+	printk("  Quick press (6x/7x):       Enter DFU bootloader\n");
+#else
+	printk("  Quick press (4x/5x):       Enter DFU bootloader\n");
+#endif
+#if ADAFRUIT_BOOTLOADER
+	printk("  Quick press (8x/9x):       Enter OTA DFU (BLE) if flashed SD (softdevice) firmware\n");
+#else
+	printk("  Quick press (8x/9x):       Enter DFU bootloader\n");
+#endif
+#endif
+#if USER_SHUTDOWN_ENABLED
+	printk("  Hold (~1s):                Power off; keep holding ~5s to cancel\n");
+#else
+	printk("  Hold (~1s):                Reboot; keep holding ~5s to cancel\n");
+#endif
+#else
+#if USER_SHUTDOWN_ENABLED
+	printk("  Hold (~1s):                Power off; keep holding ~5s to reset pairing\n");
+#else
+	printk("  Hold (~1s):                Reboot; keep holding ~5s to reset pairing\n");
+#endif
+#endif
+#if USB_EXISTS && DFU_EXISTS
+	printk("  Hold while USB connects:   Enter DFU bootloader\n");
+#endif
+	printk("  During OTA:                Button actions are blocked\n");
+#else
+	printk("  No sw0 button is defined for this board\n");
+#endif
+	printk("\n");
+}
+
 static void print_help(void)
 {
 	printk("\n=== Available Commands ===\n\n");
 	printk("Device Information:\n");
 	printk("  info                       Get device information\n");
+	printk("  sensor                     Get sensor rates and calibration detail\n");
 	printk("  uptime                     Get device uptime\n");
 	printk("  battery                    Get battery information\n");
 	printk("\n");
@@ -595,15 +1174,17 @@ static void print_help(void)
 #endif
 	printk("  mag                        Show magnetometer status\n");
 	printk("  mag on|off                 Enable/disable magnetometer\n");
+	printk("  mag auto on|off     Enable/disable online magnetometer calibration\n");
 	printk("  mag clear                  Clear magnetometer calibration\n");
 	printk("  mag cal                    Start magnetometer calibration\n");
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 	printk("  sens <x>,<y>,<z>           Set gyro sensitivity (deg diff over %u rev)\n", (int)CONFIG_SENSOR_SENS_REV);
+	printk("  sens auto <x|y|z> [rev]    Auto-calibrate gyro sensitivity by spinning (default %u rev)\n", SENS_CAL_DEFAULT_REVOLUTIONS);
 	printk("  sens reset                 Reset gyro sensitivity calibration\n");
 #endif
 #if CONFIG_SENSOR_USE_TCAL
 	// Update the help string to show the new command set
-	printk("  tcal <status|dump|test temp|remove index|auto on|auto off> Temperature calibration\n");
+	printk("  tcal <on|off|status|dump|test temp|remove index|auto on|auto off> Temperature calibration\n");
 #endif
 	printk("\n");
 	printk("Connection:\n");
@@ -611,25 +1192,36 @@ static void print_help(void)
 	printk("  pair                       Enter pairing mode\n");
 	printk("  clear                      Clear pairing data\n");
 	printk("  tdma <on|off>              Enable/disable TDMA scheduling\n");
+	printk("  radio <on|off>             Stop/restart ESB radio (diagnostic A/B for IMU noise)\n");
 	printk("\n");
-	printk("RF Channel:\n");
 	printk("  channel <0-100>            Set RF channel (saved to NVS)\n");
 	printk("    Example: channel 25       Set RF channel to 25\n");
 	printk("  clearchannel               Clear RF channel (use default)\n");
 	printk("\n");
 	printk("System:\n");
+	printk("  shutdown                   Power off the device\n");
 	printk("  reboot                     Soft reset the device\n");
 #if DFU_EXISTS
 	printk("  dfu                        Enter DFU bootloader\n");
+#if ADAFRUIT_BOOTLOADER
+	printk("  dfu ota                    Enter OTA DFU (BLE)\n");
+#endif
 #endif
 	printk("\n");
 	printk("Other:\n");
 	printk("  ping                       Flash LED (same as remote PING command)\n");
 	printk("  meow                       Meow!\n");
+	printk("  nvs                        Show NVS usage statistics\n");
+#if CONFIG_THREAD_ANALYZER
+	printk("  stack                      Print thread and ISR stack high-water usage\n");
+#endif
 	printk("  help                       Show this help message\n");
-	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 10s)\n");
+	printk("  debug [duration]           Start sensor debug mode at FIFO rate (1-60s, default 1s)\n");
 	printk("  range                      Show sensor range statistics (min/max values)\n");
 	printk("  range reset                Reset sensor range statistics\n");
+#if CONFIG_VQF_BENCH
+	printk("  vqfbench [iterations]      Benchmark VQF update paths (default 1000)\n");
+#endif
 	printk("\n");
 	printk("Debug Commands:\n");
 	printk("  reset zro                  Reset ZRO calibration\n");
@@ -646,6 +1238,7 @@ static void print_help(void)
 	printk("  reset bat                  Reset battery tracker\n");
 	printk("  reset all                  Clear all settings\n");
 	printk("\n");
+	print_button_help();
 }
 
 // --- Command Implementations ---
@@ -715,6 +1308,79 @@ void cmd_sens_reset(void)
 #endif
 }
 
+void cmd_sens_auto_request(uint8_t axis, uint16_t revolutions)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (axis >= 3) {
+		printk("Error: Invalid sensitivity calibration axis %u.\n", axis);
+		return;
+	}
+
+	if (revolutions == 0) {
+		revolutions = SENS_CAL_DEFAULT_REVOLUTIONS;
+	}
+
+	if (revolutions > SENS_CAL_MAX_REVOLUTIONS) {
+		printk("Error: Invalid revolutions %u. Use 1 to %u.\n", revolutions, SENS_CAL_MAX_REVOLUTIONS);
+		return;
+	}
+
+	char axis_char = "XYZ"[axis];
+	if (sensor_request_calibration_sens(axis, revolutions) != 0) {
+		printk("Error: Calibration busy or parameters invalid.\n");
+		return;
+	}
+
+	printk("Gyro sensitivity auto-calibration started on %c axis (%u rev).\n", axis_char, revolutions);
+	printk("  1. Hold the tracker still until the LED flashes.\n");
+	printk("  2. While flashing, spin it %u full turns about the %c axis, then stop.\n", revolutions, axis_char);
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
+void cmd_sens_auto(const char *axis_str, const char *rev_str)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	// Axis is a single character; the command parser has already lowercased it.
+	if (axis_str == NULL || axis_str[0] == '\0' || axis_str[1] != '\0') {
+		printk("Error: Specify a single axis. Use: 'sens auto <x|y|z> [revolutions]'.\n");
+		return;
+	}
+
+	uint8_t axis;
+	switch (axis_str[0]) {
+	case 'x':
+		axis = 0;
+		break;
+	case 'y':
+		axis = 1;
+		break;
+	case 'z':
+		axis = 2;
+		break;
+	default:
+		printk("Error: Invalid axis '%s'. Use x, y, or z.\n", axis_str);
+		return;
+	}
+
+	uint16_t revolutions = SENS_CAL_DEFAULT_REVOLUTIONS;
+	if (rev_str != NULL) {
+		char *endptr;
+		long value = strtol(rev_str, &endptr, 10);
+		if (*endptr != '\0' || value < 1 || value > SENS_CAL_MAX_REVOLUTIONS) {
+			printk("Error: Invalid revolutions '%s'. Use 1 to %u.\n", rev_str, SENS_CAL_MAX_REVOLUTIONS);
+			return;
+		}
+		revolutions = (uint16_t)value;
+	}
+
+	cmd_sens_auto_request(axis, revolutions);
+#else
+	printk("Error: Sensitivity calibration not enabled.\n");
+#endif
+}
+
 void cmd_reset_zro(void)
 {
 	sensor_calibration_clear(NULL, NULL, true);
@@ -763,510 +1429,803 @@ void cmd_ping_start(void)
 	set_led(SYS_LED_PATTERN_ONESHOT_PING, SYS_LED_PRIORITY_HIGHEST);
 }
 
-static void console_thread(void)
+void cmd_shutdown(void)
 {
-#if USB_EXISTS && DFU_EXISTS
-	if (button_read()) // button held on usb connect, enter DFU
-	{
-#if ADAFRUIT_BOOTLOADER
-		NRF_POWER->GPREGRET = 0x57;
-		sys_request_system_reboot(false);
-#endif
-#if NRF5_BOOTLOADER
-		gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-#endif
+	printk("Shutting down device.\n");
+	sys_command_shutdown();
+}
+
+static inline void strtolower(char *str)
+{
+	for (int i = 0; str[i] != '\0'; i++) {
+		str[i] = (char)tolower((unsigned char)str[i]);
 	}
-#endif
+}
 
-#if USB_EXISTS
-	console_getline_init();
+typedef void (*console_cmd_fn)(size_t argc, char **argv);
 
-	// Wait for any pending log data to be processed
-	while (log_data_pending()) {
-		k_usleep(1);
-	}
+struct console_cmd {
+	const char *name;
+	console_cmd_fn fn;
+};
 
-	// Wait for USB CDC to be ready by checking DTR (Data Terminal Ready) signal
-	// This ensures the terminal is actually connected and ready to receive data
-	const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-	if (device_is_ready(uart_dev)) {
-		uint32_t dtr = 0;
-		// Wait up to 5 seconds for DTR to be asserted (terminal connected)
-		for (int i = 0; i < 50; i++) {
-			if (uart_line_ctrl_get(uart_dev, UART_LINE_CTRL_DTR, &dtr) == 0 && dtr) {
-				break;
-			}
-			k_msleep(100);
-		}
-		// Give a bit more time for the terminal to be fully ready
-		k_msleep(100);
-	}
-
-	printk("*** " CONFIG_USB_DEVICE_MANUFACTURER " " CONFIG_USB_DEVICE_PRODUCT " ***\n");
-#endif
-	printk(FW_STRING);
-	printk("Repo: %s | Branch: %s | Author: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH, FW_GIT_AUTHOR);
-
-	// Print help on startup
+static void console_cmd_help(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
 	print_help();
+}
 
-	uint8_t command_info[] = "info";
-	uint8_t command_uptime[] = "uptime";
-	uint8_t command_reboot[] = "reboot";
-	uint8_t command_battery[] = "battery";
-	uint8_t command_scan[] = "scan";
-	uint8_t command_calibrate[] = "calibrate";
-	uint8_t command_help[] = "help";
-	uint8_t command_debug[] = "debug";
-	uint8_t command_range[] = "range";
+static void console_cmd_info(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	print_info();
+}
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	uint8_t command_6_side[] = "6-side";
-#endif
+static void console_cmd_sensor(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	print_sensor_detail();
+}
 
-	uint8_t command_mag[] = "mag";
+static void console_cmd_uptime(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	uint64_t uptime = k_uptime_ticks();
+	print_uptime(uptime, "Uptime");
+	print_uptime(uptime - retained->uptime_latest + retained->uptime_sum, "Accumulated");
+}
 
-	uint8_t command_set[] = "set";
-	uint8_t command_pair[] = "pair";
-	uint8_t command_clear[] = "clear";
-	uint8_t command_channel[] = "channel";
-	uint8_t command_clearchannel[] = "clearchannel";
+static void console_cmd_shutdown(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	cmd_shutdown();
+}
 
-#if DFU_EXISTS
-	uint8_t command_dfu[] = "dfu";
-#endif
+static void console_cmd_reboot(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	sys_request_system_reboot(false);
+}
 
-	uint8_t command_ping[] = "ping";
-	uint8_t command_meow[] = "meow";
+static void console_cmd_battery(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	print_battery_tracker();
+}
+
+static void console_cmd_scan(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	sensor_request_scan(true);
+}
+
+static void console_cmd_calibrate(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	sensor_request_calibration();
+}
 
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	uint8_t command_sens[] = "sens";
+static void console_cmd_sens(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+	char *arg2 = argc > 2 ? argv[2] : NULL;
+	char *arg3 = argc > 3 ? argv[3] : NULL;
+
+	// check if there are any arguments at all.
+	if (arg == NULL) {
+		printk("Error: Missing arguments. Use 'sens <x>,<y>,<z>', 'sens auto <x|y|z> [rev]', or 'sens reset'.\n");
+	}
+	// check if this is the auto-calibration subcommand
+	else if (strcmp(arg, "auto") == 0) {
+		if (argc > 4) {
+			printk("Error: Too many arguments. Use: 'sens auto <x|y|z> [revolutions]'.\n");
+		} else {
+			cmd_sens_auto(arg2, arg3);
+		}
+	}
+	// check if the argument is "reset"
+	else if (strcmp(arg, "reset") == 0) {
+		cmd_sens_reset();
+	} else {
+		char *token;
+		char *endptr;
+		int token_count = 0;
+		float values[3];
+
+		token = strtok(arg, ",");
+		while (token != NULL && token_count < 3) {
+			values[token_count] = strtof(token, &endptr);
+			if (token == endptr || *endptr != '\0') {
+				break; // Invalid float, stop parsing
+			}
+			token_count++;
+			token = strtok(NULL, ",");
+		}
+
+		if (token_count == 3 && token == NULL) {
+			cmd_sens_set(values[0], values[1], values[2]);
+		} else {
+			printk("Error: Invalid format. Use: 'sens <x>,<y>,<z>', 'sens auto <x|y|z> [rev]', or 'sens reset'.\n");
+			printk("Example: sens 10.5,-2.1,15.0\n");
+		}
+	}
+}
 #endif
+
 #if CONFIG_SENSOR_USE_TCAL
-	uint8_t command_tcal[] = "tcal";
-#endif
-	// debug
-	uint8_t command_reset[] = "reset";
-	uint8_t command_reset_arg_zro[] = "zro";
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	uint8_t command_reset_arg_acc[] = "acc";
-#endif
-	uint8_t command_reset_arg_mag[] = "mag";
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-	uint8_t command_reset_arg_sens[] = "sens";
-#endif
-#if CONFIG_SENSOR_USE_TCAL
-	uint8_t command_reset_arg_tcal[] = "tcal";
-#endif
-	uint8_t command_reset_arg_bat[] = "bat";
-	uint8_t command_reset_arg_fusion[] = "fusion";
-	uint8_t command_reset_arg_all[] = "all";
+static void console_cmd_tcal(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+	char *arg2 = argc > 2 ? argv[2] : NULL;
 
-	while (1) {
-#if USB_EXISTS
-		uint8_t *line = console_getline();
-#else
-		uint8_t *line = rtt_console_getline();
-#endif
-		uint8_t *arg = NULL;
-		for (uint8_t *p = line; *p; ++p) {
-			*p = tolower(*p);
-			if (*p == ' ' && !arg) {
-				*p = 0;
-				p++;
-				*p = tolower(*p);
-				if (*p) {
-					arg = p;
-				}
-			}
-		}
+	// check if there are any arguments
+	if (arg == NULL) {
+		printk("Error: Missing argument. Use: tcal <on|off|status|clear|dump|test temp|remove index|check|auto on|auto off|boot [on|off]>\n");
+	} else {
+		char *subcmd = arg;
 
-		if (memcmp(line, command_help, sizeof(command_help)) == 0) {
-			print_help();
-		} else if (memcmp(line, command_info, sizeof(command_info)) == 0) {
-			print_info();
-		} else if (memcmp(line, command_uptime, sizeof(command_uptime)) == 0) {
-			uint64_t uptime = k_uptime_ticks();
-			print_uptime(uptime, "Uptime");
-			print_uptime(uptime - retained->uptime_latest + retained->uptime_sum, "Accumulated");
-		} else if (memcmp(line, command_reboot, sizeof(command_reboot)) == 0) {
-			sys_request_system_reboot(false);
-		} else if (memcmp(line, command_battery, sizeof(command_battery)) == 0) {
-			print_battery_tracker();
-		} else if (memcmp(line, command_scan, sizeof(command_scan)) == 0) {
-			sensor_request_scan(true);
-		} else if (memcmp(line, command_calibrate, sizeof(command_calibrate)) == 0) {
-			sensor_request_calibration();
-		}
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-		else if (memcmp(line, command_sens, sizeof(command_sens)) == 0) {
-			// check if there are any arguments at all.
-			if (arg == NULL) {
-				printk("Error: Missing arguments. Use 'sens <x>,<y>,<z>' or 'sens reset'.\n");
-			}
-			// check if the argument is "reset"
-			else if (strcmp((char *)arg, "reset") == 0) {
-				cmd_sens_reset();
+		if (subcmd == NULL) {
+			// Handling case where arg might contain only spaces
+			printk("Error: Missing argument. Use: tcal <on|off|status|clear|dump|test temp|remove index|check|auto on|auto off|boot [on|off]>\n");
+		} else if (strcmp(subcmd, "on") == 0) {
+			sensor_tcal_set_enabled(true);
+			printk("T-Cal compensation enabled\n");
+		} else if (strcmp(subcmd, "off") == 0) {
+			sensor_tcal_set_enabled(false);
+			printk("T-Cal compensation disabled (using static gyro bias)\n");
+		} else if (strcmp(subcmd, "status") == 0) {
+			sensor_tcal_status();
+			printk(
+				"T-Cal compensation: %s | apply=%s\n",
+				sensor_tcal_get_enabled() ? "enabled" : "disabled",
+				sensor_tcal_get_apply_mode_name()
+			);
+			printk("Auto-calibration: %s\n", sensor_tcal_get_auto_calibration() ? "enabled" : "disabled");
+		} else if (strcmp(subcmd, "clear") == 0) {
+			cmd_reset_tcal();
+		} else if (strcmp(subcmd, "auto") == 0) {
+			char *auto_arg = arg2;
+			if (auto_arg == NULL) {
+				printk("Error: Missing argument. Use: tcal auto <on|off>\n");
+			} else if (strcmp(auto_arg, "on") == 0) {
+				sensor_tcal_set_auto_calibration(true);
+				printk("T-Cal auto-calibration enabled. Device will auto-calibrate when resting.\n");
+				printk("Note: Sleep timeout will be prevented during auto-calibration mode.\n");
+			} else if (strcmp(auto_arg, "off") == 0) {
+				sensor_tcal_set_auto_calibration(false);
+				printk("T-Cal auto-calibration disabled.\n");
 			} else {
-				char *token;
-				char *endptr;
-				int token_count = 0;
-				float values[3];
-
-				token = strtok((char *)arg, ",");
-				while (token != NULL && token_count < 3) {
-					values[token_count] = strtof(token, &endptr);
-					if (token == endptr || *endptr != '\0') {
-						break; // Invalid float, stop parsing
-					}
-					token_count++;
-					token = strtok(NULL, ",");
-				}
-
-				if (token_count == 3) {
-					cmd_sens_set(values[0], values[1], values[2]);
-				} else {
-					printk("Error: Invalid format. Use: 'sens <x>,<y>,<z>' or 'sens reset'.\n");
-					printk("Example: sens 10.5,-2.1,15.0\n");
-				}
+				printk("Error: Invalid argument '%s'. Use: tcal auto <on|off>\n", auto_arg);
 			}
-		}
-#endif
-#if CONFIG_SENSOR_USE_TCAL
-		else if (memcmp(line, command_tcal, sizeof(command_tcal)) == 0) {
-			// check if there are any arguments
-			if (arg == NULL) {
-				printk("Error: Missing argument. Use: tcal <status|clear|dump|test temp|remove index|check|auto on|auto off|boot [on|off]>\n");
-			} else {
-				// Tokenize the argument string by space to get the subcommand
-				char *subcmd = strtok((char *)arg, " ");
-
-				if (subcmd == NULL) {
-					// Handling case where arg might contain only spaces
-					printk("Error: Missing argument. Use: tcal <status|clear|dump|test temp|remove index|check|auto on|auto off|boot [on|off]>\n");
-				} else if (strcmp(subcmd, "status") == 0) {
-					sensor_tcal_status();
-					printk("Auto-calibration: %s\n", sensor_tcal_get_auto_calibration() ? "enabled" : "disabled");
-				} else if (strcmp(subcmd, "clear") == 0) {
-					cmd_reset_tcal();
-				} else if (strcmp(subcmd, "auto") == 0) {
-					char *auto_arg = strtok(NULL, " ");
-					if (auto_arg == NULL) {
-						printk("Error: Missing argument. Use: tcal auto <on|off>\n");
-					} else if (strcmp(auto_arg, "on") == 0) {
-						sensor_tcal_set_auto_calibration(true);
-						printk("T-Cal auto-calibration enabled. Device will auto-calibrate when resting.\n");
-						printk("Note: Sleep timeout will be prevented during auto-calibration mode.\n");
-					} else if (strcmp(auto_arg, "off") == 0) {
-						sensor_tcal_set_auto_calibration(false);
-						printk("T-Cal auto-calibration disabled.\n");
-					} else {
-						printk("Error: Invalid argument '%s'. Use: tcal auto <on|off>\n", auto_arg);
-					}
-				} else if (strcmp(subcmd, "dump") == 0) {
-					if (retained->tempCalState.count == 0) {
-						printk("No temperature calibration points have been collected.\n");
-						continue;
-					}
-
-					printk("Dumping %u collected temperature calibration points:\n", retained->tempCalState.count);
-					printk("--------------------------------------------------\n");
-					printk("Index | Temp (C) | Bias X   | Bias Y   | Bias Z   |\n");
-					printk("--------------------------------------------------\n");
-
-					uint16_t points_printed = 0;
-					// Iterate through the entire buffer to find the valid points
-					for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
-						// A point is valid if its temperature field is not 0.0
-						if (retained->tempCalPoints[i].temp != 0.0f) {
-							printk(
-								" %-4d | %-8.2f | %-8.5f | %-8.5f | %-8.5f\n",
-								i,
-								(double)retained->tempCalPoints[i].temp,
-								(double)retained->tempCalPoints[i].bias[0],
-								(double)retained->tempCalPoints[i].bias[1],
-								(double)retained->tempCalPoints[i].bias[2]
-							);
-							points_printed++;
-						}
-
-						// Small delay to prevent overwhelming the console output buffer
-						if (points_printed % 10 == 0 && points_printed > 0) {
-							k_msleep(20);
-						}
-					}
-					printk("--------------------------------------------------\n");
-					printk("End of dump. Total points printed: %u\n", points_printed);
-				} else if (strcmp(subcmd, "remove") == 0) {
-					// Get the next token (the index number)
-					char *idx_str = strtok(NULL, " ");
-
-					if (idx_str == NULL) {
-						printk("Error: Missing index. Use: tcal remove <index>\n");
-					} else {
-						char *endptr = NULL;
-						long index = strtol(idx_str, &endptr, 10);
-
-						// Check if conversion was successful
-						if (endptr == NULL || endptr == idx_str) {
-							printk("Error: Invalid index '%s'. Please provide a number.\n", idx_str);
-						} else {
-							// Skip trailing whitespace
-							while (*endptr != '\0' && isspace((unsigned char)*endptr)) {
-								endptr++;
-							}
-
-							// Check for trailing non-whitespace characters
-							if (*endptr != '\0') {
-								printk("Error: Invalid characters after index '%s'.\n", idx_str);
-							} else {
-								sensor_tcal_remove_point((int)index);
-							}
-						}
-					}
-				} else if (strcmp(subcmd, "test") == 0) {
-					char *temp_str = strtok(NULL, " ");
-					if (temp_str == NULL) {
-						// Use current temperature if no argument provided
-						float current_temp = sensor_get_current_imu_temperature();
-						if (isnan(current_temp)) {
-							printk("Error: Cannot read current temperature. Please specify temperature: tcal test <temp>\n");
-						} else {
-							sensor_tcal_test_methods(current_temp);
-						}
-					} else {
-						char *endptr = NULL;
-						float test_temp = strtof(temp_str, &endptr);
-
-						if (endptr == temp_str || *endptr != '\0') {
-							printk("Error: Invalid temperature '%s'. Use: tcal test <temp>\n", temp_str);
-							printk("Example: tcal test 25.5\n");
-						} else {
-							sensor_tcal_test_methods(test_temp);
-						}
-					}
-				} else if (strcmp(subcmd, "check") == 0) {
-					float current_temp = sensor_get_current_imu_temperature();
-					if (isnan(current_temp)) {
-						printk("Error: Cannot read current temperature.\n");
-					} else {
-						float closest_temp, distance;
-						bool needs_cal = sensor_tcal_is_temp_outside_range(current_temp, &closest_temp, &distance);
-						printk("Current temperature: %.2fC\n", (double)current_temp);
-						if (!isnan(closest_temp)) {
-							printk("Closest calibration point: %.2fC (distance: %.2fC)\n",
-								(double)closest_temp, (double)distance);
-							float sampling_interval = 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
-							printk("Configured sampling interval: %.2fC\n", (double)sampling_interval);
-							if (needs_cal) {
-								printk("Status: NEEDS calibration (distance > interval, auto-cal may trigger)\n");
-							} else {
-								printk("Status: Calibration sufficient (within sampling interval)\n");
-							}
-						} else {
-							printk("Status: No calibration data available (auto-cal will trigger)\n");
-						}
-					}
-				} else if (strcmp(subcmd, "boot") == 0) {
-					char *boot_arg = strtok(NULL, " ");
-					if (boot_arg == NULL) {
-						// Show current boot calibration status
-						printk("Boot Calibration Status:\n");
-						printk("  Enabled: %s\n", retained->bootCalState.enabled ? "yes" : "no");
-						printk("  Completed: %s\n", retained->bootCalState.completed ? "yes" : "no");
-						printk("  Attempts: %u\n", retained->bootCalState.attempt_count);
-						printk("  D_offset valid: %s\n", retained->bootCalState.doffset_valid ? "yes" : "no");
-						if (retained->bootCalState.doffset_valid) {
-							printk("  D_offset: [%.5f, %.5f, %.5f] dps\n",
-								(double)retained->bootCalState.doffset[0],
-								(double)retained->bootCalState.doffset[1],
-								(double)retained->bootCalState.doffset[2]);
-						}
-						printk("\nUsage: tcal boot <on|off>\n");
-					} else if (strcmp(boot_arg, "on") == 0) {
-						sensor_boot_cal_set_enabled(true);
-						printk("Boot calibration enabled. Will calibrate on next boot.\n");
-					} else if (strcmp(boot_arg, "off") == 0) {
-						sensor_boot_cal_set_enabled(false);
-						printk("Boot calibration disabled.\n");
-					} else {
-						printk("Error: Invalid argument '%s'. Use: tcal boot <on|off>\n", boot_arg);
-					}
-				} else {
-					printk("Error: Invalid argument '%s'. Use: <status|clear|dump|test temp|remove index|check|auto on|auto off|boot on|boot off>\n", subcmd);
-				}
+		} else if (strcmp(subcmd, "dump") == 0) {
+			if (retained->tempCalState.count == 0) {
+				printk("No temperature calibration points have been collected.\n");
+				return;
 			}
-		}
-#endif
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-		else if (memcmp(line, command_6_side, sizeof(command_6_side)) == 0) {
-			sensor_request_calibration_6_side();
-		}
-#endif
-		else if (memcmp(line, command_mag, sizeof(command_mag)) == 0) {
-			if (arg == NULL) {
-				// No argument: show status
-				printk("Magnetometer: %s\n", sensor_get_mag_enabled() ? "enabled" : "disabled");
-				printk("Hardware: %s\n", sensor_get_sensor_mag_name());
-			} else {
-				char *subcmd = strtok((char *)arg, " ");
-				if (strcmp(subcmd, "on") == 0) {
-					printk("Enabling magnetometer\n");
-					sensor_set_mag_enabled(true);
-				} else if (strcmp(subcmd, "off") == 0) {
-					printk("Disabling magnetometer\n");
-					sensor_set_mag_enabled(false);
-				} else if (strcmp(subcmd, "clear") == 0) {
-					sensor_calibration_clear_mag(NULL, true);
-					printk("Magnetometer calibration cleared\n");
-				} else if (strcmp(subcmd, "cal") == 0 || strcmp(subcmd, "calibrate") == 0) {
-					sensor_calibration_clear_mag(NULL, true);
-					sensor_request_calibration_mag();
-					printk("Magnetometer calibration started\n");
-				} else {
-					printk("Usage: mag [on|off|clear|cal]\n");
-				}
-			}
-		}
-		else if (memcmp(line, command_set, sizeof(command_set)) == 0) {
-			uint64_t addr = strtoull(arg, NULL, 16);
-			uint8_t buf[17];
-			snprintk(buf, 17, "%016llx", addr);
-			if (addr != 0 && memcmp(buf, arg, 17) == 0) {
-				esb_set_pair(addr);
-			} else {
-				printk("Invalid address\n");
-			}
-		} else if (memcmp(line, command_pair, sizeof(command_pair)) == 0) {
-			esb_reset_pair();
-		} else if (memcmp(line, command_clear, sizeof(command_clear)) == 0) {
-			esb_clear_pair();
-		} else if (memcmp(line, command_channel, sizeof(command_channel)) == 0) {
-			if (!arg) {
-				printk("Usage: channel <0-100>\n");
-				printk("Example: channel 25 - Set RF channel to 25\n");
-			} else {
-				char *endptr;
-				long channel = strtol(arg, &endptr, 10);
 
-				if (*endptr != '\0' || channel < 0 || channel > 100) {
-					printk("Invalid channel. Must be a number between 0 and 100.\n");
-				} else {
-					printk("Setting RF channel to %d\n", (int)channel);
-					// Save to retained memory
-					retained->rf_channel = (uint8_t)channel;
-					retained_update();
-					// Save to NVS
-					sys_write(
-						RF_CHANNEL_ID,
-						&retained->rf_channel,
-						&retained->rf_channel,
-						sizeof(retained->rf_channel)
+			printk("Dumping %u collected temperature calibration points:\n", retained->tempCalState.count);
+			printk("--------------------------------------------------\n");
+			printk("Index | Temp (C) | Bias X   | Bias Y   | Bias Z   |\n");
+			printk("--------------------------------------------------\n");
+
+			uint16_t points_printed = 0;
+			// Iterate through the entire buffer to find the valid points
+			for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+				// A point is valid if its temperature field is not 0.0
+				if (retained->tempCalPoints[i].temp != 0.0f) {
+					printk(
+						" %-4d | %-8.2f | %-8.5f | %-8.5f | %-8.5f\n",
+						i,
+						(double)retained->tempCalPoints[i].temp,
+						(double)retained->tempCalPoints[i].bias[0],
+						(double)retained->tempCalPoints[i].bias[1],
+						(double)retained->tempCalPoints[i].bias[2]
 					);
-					printk("RF channel saved to NVS: %u\n", retained->rf_channel);
-					// Reinitialize ESB with new channel
-					esb_deinitialize();
-					k_msleep(10);
-					esb_initialize(true); // Channel will be applied inside esb_initialize
-					printk("ESB reinitialized with channel %u\n", retained->rf_channel);
+					points_printed++;
+				}
+
+				// Small delay to prevent overwhelming the console output buffer
+				if (points_printed % 10 == 0 && points_printed > 0) {
+					k_msleep(20);
 				}
 			}
-		} else if (memcmp(line, command_clearchannel, sizeof(command_clearchannel)) == 0) {
-			printk("Clearing RF channel setting (restore default)\n");
-			// Clear saved channel (set to 0xFF = use default)
-			retained->rf_channel = 0xFF;
-			retained_update();
-			sys_write(RF_CHANNEL_ID, &retained->rf_channel, &retained->rf_channel, sizeof(retained->rf_channel));
-			printk("RF channel cleared, will use default on next boot\n");
-			// Reinitialize ESB with default channel
-			esb_deinitialize();
-			k_msleep(10);
-			esb_initialize(true); // Will use default channel since rf_channel is 0xFF
-			printk("ESB reinitialized with default channel\n");
-		}
-#if DFU_EXISTS
-		else if (memcmp(line, command_dfu, sizeof(command_dfu)) == 0) {
-#if ADAFRUIT_BOOTLOADER
-			NRF_POWER->GPREGRET = 0x57;
-			k_msleep(100); // Wait for register to be written
-			sys_request_system_reboot(false);
-#endif
-#if NRF5_BOOTLOADER
-			gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
-#endif
-		}
-#endif
-		else if (memcmp(line, command_ping, sizeof(command_ping)) == 0) {
-			cmd_ping_start();
-		}
-		else if (memcmp(line, command_meow, sizeof(command_meow)) == 0) {
-			print_meow();
-		} else if (memcmp(line, command_debug, sizeof(command_debug)) == 0) {
-			uint32_t duration = 1; // Default 1 second
-			if (arg) {
-				char *endptr;
-				char *arg_char = (char *)arg;
-				long dur = strtol(arg_char, &endptr, 10);
-				if (endptr != arg_char && *endptr == '\0' && dur >= 1 && dur <= 60) {
-					duration = (uint32_t)dur;
+			printk("--------------------------------------------------\n");
+			printk("End of dump. Total points printed: %u\n", points_printed);
+		} else if (strcmp(subcmd, "remove") == 0) {
+			char *idx_str = arg2;
+
+			if (idx_str == NULL) {
+				printk("Error: Missing index. Use: tcal remove <index>\n");
+			} else {
+				char *endptr = NULL;
+				long index = strtol(idx_str, &endptr, 10);
+
+				// Check if conversion was successful
+				if (endptr == NULL || endptr == idx_str) {
+					printk("Error: Invalid index '%s'. Please provide a number.\n", idx_str);
 				} else {
-					printk("Invalid duration (1-60s). Using default 1 seconds.\n");
+					// Skip trailing whitespace
+					while (*endptr != '\0' && isspace((unsigned char)*endptr)) {
+						endptr++;
+					}
+
+					// Check for trailing non-whitespace characters
+					if (*endptr != '\0') {
+						printk("Error: Invalid characters after index '%s'.\n", idx_str);
+					} else {
+						sensor_tcal_remove_point((int)index);
+					}
 				}
 			}
-			sensor_debug_start(duration);
-		} else if (memcmp(line, command_range, sizeof(command_range)) == 0) {
-#if CONFIG_SENSOR_RANGE_STATS
-			if (arg && strcmp((char *)arg, "reset") == 0) {
-				sensor_reset_range_stats();
-				printk("Sensor range statistics have been reset.\n");
+		} else if (strcmp(subcmd, "test") == 0) {
+			char *temp_str = arg2;
+			if (temp_str == NULL) {
+				// Use current temperature if no argument provided
+				float current_temp = sensor_get_current_imu_temperature();
+				if (isnan(current_temp)) {
+					printk("Error: Cannot read current temperature. Please specify temperature: tcal test <temp>\n");
+				} else {
+					sensor_tcal_test_methods(current_temp);
+				}
 			} else {
-				sensor_print_range_stats();
+				char *endptr = NULL;
+				float test_temp = strtof(temp_str, &endptr);
+
+				if (endptr == temp_str || *endptr != '\0') {
+					printk("Error: Invalid temperature '%s'. Use: tcal test <temp>\n", temp_str);
+					printk("Example: tcal test 25.5\n");
+				} else {
+					sensor_tcal_test_methods(test_temp);
+				}
 			}
-#else
-			printk("Sensor range statistics not enabled in configuration.\n");
-#endif // CONFIG_SENSOR_RANGE_STATS
-		}	else if (memcmp(line, command_reset, sizeof(command_reset)) == 0) {
-			if (arg && memcmp(arg, command_reset_arg_zro, sizeof(command_reset_arg_zro)) == 0) {
-				cmd_reset_zro();
-			}
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-			else if (arg && memcmp(arg, command_reset_arg_acc, sizeof(command_reset_arg_acc)) == 0) {
-				cmd_reset_acc();
-			}
-#endif
-			else if (arg && memcmp(arg, command_reset_arg_mag, sizeof(command_reset_arg_mag)) == 0) {
-				sensor_calibration_clear_mag(NULL, true);
-			}
-#if CONFIG_SENSOR_USE_SENS_CALIBRATION
-			else if (arg && memcmp(arg, command_reset_arg_sens, sizeof(command_reset_arg_sens)) == 0) {
-				cmd_sens_reset();
-			}
-#endif
-#if CONFIG_SENSOR_USE_TCAL
-			else if (arg && memcmp(arg, command_reset_arg_tcal, sizeof(command_reset_arg_tcal)) == 0) {
-				cmd_reset_tcal();
-			}
-#endif
-			else if (arg && memcmp(arg, command_reset_arg_bat, sizeof(command_reset_arg_bat)) == 0) {
-				cmd_reset_bat();
-			} else if (arg && memcmp(arg, command_reset_arg_fusion, sizeof(command_reset_arg_fusion)) == 0) {
-				cmd_fusion_reset();
-			} else if (arg && memcmp(arg, command_reset_arg_all, sizeof(command_reset_arg_all)) == 0) {
-				sys_clear();
+		} else if (strcmp(subcmd, "check") == 0) {
+			float current_temp = sensor_get_current_imu_temperature();
+			if (isnan(current_temp)) {
+				printk("Error: Cannot read current temperature.\n");
 			} else {
-				printk("Invalid argument\n");
+				float closest_temp, distance;
+				bool needs_cal = sensor_tcal_is_temp_outside_range(current_temp, &closest_temp, &distance);
+				printk("Current temperature: %.2fC\n", (double)current_temp);
+				if (!isnan(closest_temp)) {
+					printk("Closest calibration point: %.2fC (distance: %.2fC)\n",
+						(double)closest_temp, (double)distance);
+					float sampling_interval = 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
+					printk("Configured sampling interval: %.2fC\n", (double)sampling_interval);
+					if (needs_cal) {
+						printk("Status: NEEDS calibration (distance > interval, auto-cal may trigger)\n");
+					} else {
+						printk("Status: Calibration sufficient (within sampling interval)\n");
+					}
+				} else {
+					printk("Status: No calibration data available (auto-cal will trigger)\n");
+				}
 			}
-		} else if (memcmp(line, "tdma", 4) == 0) {
-			if (arg && strcmp((char *)arg, "on") == 0) {
-				tdma_set_enabled(true);
-				printk("TDMA enabled\n");
-			} else if (arg && strcmp((char *)arg, "off") == 0) {
-				tdma_set_enabled(false);
-				printk("TDMA disabled\n");
+		} else if (strcmp(subcmd, "boot") == 0) {
+			char *boot_arg = arg2;
+			if (boot_arg == NULL) {
+				// Show current boot calibration status
+				printk("Boot Calibration Status:\n");
+				printk("  Enabled: %s\n", retained->bootCalState.enabled ? "yes" : "no");
+				printk("  Completed: %s\n", retained->bootCalState.completed ? "yes" : "no");
+				printk("  Attempts: %u\n", retained->bootCalState.attempt_count);
+				printk("  D_offset valid: %s\n", retained->bootCalState.doffset_valid ? "yes" : "no");
+				if (retained->bootCalState.doffset_valid) {
+					printk("  D_offset: [%.5f, %.5f, %.5f] dps\n",
+						(double)retained->bootCalState.doffset[0],
+						(double)retained->bootCalState.doffset[1],
+						(double)retained->bootCalState.doffset[2]);
+				}
+				printk("\nUsage: tcal boot <on|off>\n");
+			} else if (strcmp(boot_arg, "on") == 0) {
+				sensor_boot_cal_set_enabled(true);
+				printk("Boot calibration enabled. Will calibrate on next boot.\n");
+			} else if (strcmp(boot_arg, "off") == 0) {
+				sensor_boot_cal_set_enabled(false);
+				printk("Boot calibration disabled.\n");
 			} else {
-				printk("TDMA: %s\n", tdma_is_enabled() ? "enabled" : "disabled");
+				printk("Error: Invalid argument '%s'. Use: tcal boot <on|off>\n", boot_arg);
 			}
 		} else {
+			printk("Error: Invalid argument '%s'. Use: <status|clear|dump|test temp|remove index|check|auto on|auto off|boot on|boot off>\n", subcmd);
+		}
+	}
+}
+#endif
+
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+static void console_cmd_6_side(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	sensor_request_calibration_6_side();
+}
+#endif
+
+static void console_cmd_mag(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+	char *arg2 = argc > 2 ? argv[2] : NULL;
+	char *arg3 = argc > 3 ? argv[3] : NULL;
+
+	if (arg == NULL) {
+		// No argument: show status
+		printk("Magnetometer: %s\n", sensor_get_mag_enabled() ? "enabled" : "disabled");
+		printk("Hardware: %s\n", sensor_get_sensor_mag_name());
+		printk("Magnetometer matrix:\n");
+		for (int i = 0; i < 3; i++) {
+			printk("%.5f %.5f %.5f %.5f\n",
+				(double)retained->magBAinv[0][i],
+				(double)retained->magBAinv[1][i],
+				(double)retained->magBAinv[2][i],
+				(double)retained->magBAinv[3][i]);
+		}
+		bool mag_has_cal = (retained->magBAinv[0][0] != 0.0f
+		                 || retained->magBAinv[0][1] != 0.0f
+		                 || retained->magBAinv[0][2] != 0.0f);
+		if (sensor_calibration_get_online_mag_enabled()) {
+			float dir_bias = 0;
+			int online_samples = sensor_calibration_online_mag_status(&dir_bias);
+			float mag_cv = sensor_calibration_get_mag_quality();
+			printk("Calibration: %s (norm_cv=%.3f)\n",
+			       mag_has_cal ? "active" : "none", (double)mag_cv);
+			printk("Online: enabled, %d samples, dir_bias=%.2f\n",
+			       online_samples, (double)dir_bias);
+		} else {
+			printk("Calibration: %s\n", mag_has_cal ? "active" : "none");
+			printk("Online: disabled\n");
+		}
+	} else {
+		char *subcmd = arg;
+		if (subcmd == NULL) {
+			printk("Usage: mag [on|off|clear|cal|auto <on|off>]\n");
+		} else if (strcmp(subcmd, "on") == 0) {
+			printk("Enabling magnetometer\n");
+			sensor_set_mag_enabled(true);
+		} else if (strcmp(subcmd, "off") == 0) {
+			printk("Disabling magnetometer\n");
+			sensor_set_mag_enabled(false);
+		} else if (strcmp(subcmd, "auto") == 0 || strcmp(subcmd, "online") == 0) {
+			char *state = arg2;
+			char *extra = arg3;
+
+			if (state == NULL || extra != NULL) {
+				printk("Usage: mag %s <on|off>\n", subcmd);
+			} else if (strcmp(state, "on") == 0) {
+				sensor_calibration_set_online_mag_enabled(true);
+				printk("Online magnetometer calibration enabled\n");
+			} else if (strcmp(state, "off") == 0) {
+				sensor_calibration_set_online_mag_enabled(false);
+				printk("Online magnetometer calibration disabled\n");
+			} else {
+				printk("Usage: mag %s <on|off>\n", subcmd);
+			}
+		} else if (strcmp(subcmd, "clear") == 0) {
+			sensor_calibration_clear_mag(NULL, true);
+			printk("Magnetometer calibration cleared\n");
+		} else if (strcmp(subcmd, "cal") == 0 || strcmp(subcmd, "calibrate") == 0) {
+			sensor_calibration_clear_mag(NULL, true);
+			sensor_request_calibration_mag();
+			printk("Magnetometer calibration started\n");
+		} else {
+			printk("Usage: mag [on|off|clear|cal|auto <on|off>]\n");
+		}
+	}
+}
+
+static void console_cmd_set(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (argc != 2) {
+		printk("Invalid number of arguments\n");
+		return;
+	}
+	uint64_t addr = parse_u64(arg, 16);
+	char buf[17];
+	snprintk(buf, 17, "%016llx", addr);
+	if (addr != 0 && strcmp(buf, arg) == 0) {
+		esb_set_pair(addr);
+	} else {
+		printk("Invalid address\n");
+	}
+}
+
+static void console_cmd_pair(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	esb_reset_pair();
+}
+
+static void console_cmd_clear(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	esb_clear_pair();
+}
+
+static void console_cmd_channel(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (!arg) {
+		printk("Usage: channel <0-100>\n");
+		printk("Example: channel 25 - Set RF channel to 25\n");
+	} else {
+		char *endptr;
+		long channel = strtol(arg, &endptr, 10);
+
+		if (*endptr != '\0' || channel < 0 || channel > 100) {
+			printk("Invalid channel. Must be a number between 0 and 100.\n");
+		} else {
+			printk("Setting RF channel to %d\n", (int)channel);
+			// Save to retained memory (encoded)
+			retained->rf_channel = esb_rf_channel_encode((uint8_t)channel);
+			retained_update();
+			// Save to NVS
+			sys_write(
+				RF_CHANNEL_ID,
+				&retained->rf_channel,
+				&retained->rf_channel,
+				sizeof(retained->rf_channel)
+			);
+			printk("RF channel saved to NVS: %d\n", (int)channel);
+			if (esb_reinitialize()) {
+				printk("Error: ESB reinitialize failed\n");
+			} else {
+				printk("ESB reinitialized with channel %d\n", (int)channel);
+			}
+		}
+	}
+}
+
+static void console_cmd_clearchannel(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	printk("Clearing RF channel setting (restore default)\n");
+	// Clear saved channel (set to default marker)
+	retained->rf_channel = ESB_RF_CHANNEL_DEFAULT;
+	retained_update();
+	sys_write(RF_CHANNEL_ID, &retained->rf_channel, &retained->rf_channel, sizeof(retained->rf_channel));
+	printk("RF channel cleared, will use default on next boot\n");
+	if (esb_reinitialize()) {
+		printk("Error: ESB reinitialize failed\n");
+	} else {
+		printk("ESB reinitialized with default channel\n");
+	}
+}
+
+static void console_cmd_radio(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (!arg) {
+		printk("Usage: radio <on|off>\n");
+		printk("Example: radio off - stop ESB radio for IMU noise A/B test\n");
+		return;
+	}
+
+	if (strcmp(arg, "off") == 0) {
+		esb_deinitialize();
+		printk("ESB radio disabled; sensor loop keeps running (diagnostic only)\n");
+	} else if (strcmp(arg, "on") == 0) {
+		if (esb_reinitialize()) {
+			printk("Error: ESB reinitialize failed\n");
+		} else {
+			printk("ESB radio reinitialized\n");
+		}
+	} else {
+		printk("Invalid radio argument: %s (use on/off)\n", arg);
+	}
+}
+
+#if DFU_EXISTS
+static void console_cmd_dfu(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	char *arg = argc > 1 ? argv[1] : NULL;
+	bool ota = false;
+
+#if ADAFRUIT_BOOTLOADER
+	// Subcommands:
+	//   dfu      -> UF2 DFU (USB MSC/CDC)
+	//   dfu ota  -> OTA DFU (BLE)
+	char *mode = arg;
+
+	if (mode && strcmp(mode, "ota") == 0) {
+		ota = true;
+		printk("Entering OTA DFU (BLE)...\n");
+	} else if (mode == NULL) {
+		printk("Entering UF2 DFU...\n");
+	} else {
+		printk("Error: Unknown DFU mode '%s'. Use: dfu [ota]\n", mode);
+		return;
+	}
+
+#else
+	if (arg != NULL) {
+		printk("Error: This bootloader does not support a DFU mode argument\n");
+		return;
+	}
+#endif
+
+	printk("Entering DFU bootloader...\n");
+	sys_enter_dfu(ota);
+}
+#endif
+
+static void console_cmd_ping(size_t argc, char **argv)
+{
+	if (argc > 1 && strcmp(argv[1], "stats") == 0) {
+		connection_print_ping_stats();
+		return;
+	}
+	cmd_ping_start();
+}
+
+static void console_cmd_nvs(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	sys_nvs_stats();
+}
+
+#if CONFIG_THREAD_ANALYZER
+static void console_cmd_stack(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	printk("Thread/ISR stack high-water usage:\n");
+	thread_analyzer_print(0);
+}
+#endif
+
+static void console_cmd_meow(size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	print_meow();
+}
+
+static void console_cmd_debug(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	uint32_t duration = 1; // Default 1 second
+	if (arg) {
+		char *endptr;
+		long dur = strtol(arg, &endptr, 10);
+		if (endptr != arg && *endptr == '\0' && dur >= 1 && dur <= 60) {
+			duration = (uint32_t)dur;
+		} else {
+			printk("Invalid duration (1-60s). Using default 1 seconds.\n");
+		}
+	}
+	sensor_debug_start(duration);
+}
+
+static void console_cmd_range(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+#if CONFIG_SENSOR_RANGE_STATS
+	if (arg && strcmp(arg, "reset") == 0) {
+		sensor_reset_range_stats();
+		printk("Sensor range statistics have been reset.\n");
+	} else {
+		sensor_print_range_stats();
+	}
+#else
+	ARG_UNUSED(arg);
+	printk("Sensor range statistics not enabled in configuration.\n");
+#endif // CONFIG_SENSOR_RANGE_STATS
+}
+
+#if CONFIG_VQF_BENCH
+static void console_cmd_vqfbench(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	uint32_t iterations = 1000;
+	if (arg) {
+		char *endptr;
+		long parsed = strtol(arg, &endptr, 10);
+		if (endptr != arg && *endptr == '\0' && parsed > 0 && parsed <= 20000) {
+			iterations = (uint32_t)parsed;
+		} else {
+			printk("Invalid iteration count. Using default 1000.\n");
+		}
+	}
+	vqf_run_benchmark(iterations);
+}
+#endif // CONFIG_VQF_BENCH
+
+static void console_cmd_reset(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (arg && strcmp(arg, "zro") == 0) {
+		cmd_reset_zro();
+	}
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+	else if (arg && strcmp(arg, "acc") == 0) {
+		cmd_reset_acc();
+	}
+#endif
+	else if (arg && strcmp(arg, "mag") == 0) {
+		sensor_calibration_clear_mag(NULL, true);
+	}
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	else if (arg && strcmp(arg, "sens") == 0) {
+		cmd_sens_reset();
+	}
+#endif
+#if CONFIG_SENSOR_USE_TCAL
+	else if (arg && strcmp(arg, "tcal") == 0) {
+		cmd_reset_tcal();
+	}
+#endif
+	else if (arg && strcmp(arg, "bat") == 0) {
+		cmd_reset_bat();
+	} else if (arg && strcmp(arg, "fusion") == 0) {
+		cmd_fusion_reset();
+	} else if (arg && strcmp(arg, "all") == 0) {
+		sys_clear();
+	} else {
+		printk("Invalid argument\n");
+	}
+}
+
+static void console_cmd_tdma(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (arg && strcmp(arg, "on") == 0) {
+		tdma_set_enabled(true);
+		printk("TDMA enabled\n");
+	} else if (arg && strcmp(arg, "off") == 0) {
+		tdma_set_enabled(false);
+		printk("TDMA disabled\n");
+	} else if (arg && strcmp(arg, "capture") == 0) {
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		char *state = argc > 2 ? argv[2] : NULL;
+		if (state && strcmp(state, "on") == 0) {
+			radio_capture_set_enabled(true);
+			printk("RADIO capture enabled\n");
+		} else if (state && strcmp(state, "off") == 0) {
+			radio_capture_set_enabled(false);
+			printk("RADIO capture disabled\n");
+		} else {
+			printk("RADIO capture: %s\n", radio_capture_is_enabled() ? "enabled" : "disabled");
+			radio_capture_print_stats();
+		}
+#else
+		printk("tdma capture requires CONFIG_TDMA_DIAGNOSTICS=y\n");
+#endif
+	} else if (arg && strcmp(arg, "stats") == 0) {
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		tdma_print_stats();
+#else
+		printk("tdma stats requires CONFIG_TDMA_DIAGNOSTICS=y\n");
+#endif
+	} else {
+		printk("TDMA: %s\n", tdma_is_enabled() ? "enabled" : "disabled");
+	}
+}
+
+static void console_cmd_test(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (arg && strcmp(arg, "on") == 0) {
+		test_mode_set(true);
+		printk("Test mode enabled\n");
+	} else if (arg && strcmp(arg, "off") == 0) {
+		test_mode_set(false);
+		printk("Test mode disabled\n");
+	} else {
+		printk("Test mode: %s\n", test_mode_get() ? "enabled" : "disabled");
+	}
+}
+
+static const struct console_cmd console_cmds[] = {
+	{"help", console_cmd_help},
+	{"info", console_cmd_info},
+	{"sensor", console_cmd_sensor},
+	{"uptime", console_cmd_uptime},
+	{"shutdown", console_cmd_shutdown},
+	{"reboot", console_cmd_reboot},
+	{"battery", console_cmd_battery},
+	{"scan", console_cmd_scan},
+	{"calibrate", console_cmd_calibrate},
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	{"sens", console_cmd_sens},
+#endif
+#if CONFIG_SENSOR_USE_TCAL
+	{"tcal", console_cmd_tcal},
+#endif
+#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+	{"6-side", console_cmd_6_side},
+#endif
+	{"mag", console_cmd_mag},
+	{"set", console_cmd_set},
+	{"pair", console_cmd_pair},
+	{"clear", console_cmd_clear},
+	{"channel", console_cmd_channel},
+	{"clearchannel", console_cmd_clearchannel},
+	{"radio", console_cmd_radio},
+#if DFU_EXISTS
+	{"dfu", console_cmd_dfu},
+#endif
+	{"ping", console_cmd_ping},
+	{"nvs", console_cmd_nvs},
+	{"meow", console_cmd_meow},
+	{"debug", console_cmd_debug},
+#if CONFIG_THREAD_ANALYZER
+	{"stack", console_cmd_stack},
+#endif
+	{"range", console_cmd_range},
+#if CONFIG_VQF_BENCH
+	{"vqfbench", console_cmd_vqfbench},
+#endif
+	{"reset", console_cmd_reset},
+	{"tdma", console_cmd_tdma},
+	{"test", console_cmd_test},
+};
+
+static void console_thread(void)
+{
+#if UART_CONSOLE_EXISTS
+	if (console_serial_start() != 0) {
+		return;
+	}
+#elif !USB_EXISTS
+	printk(FW_STRING);
+	printk("Repo: %s | Branch: %s\n", FW_GIT_REPO_URL, FW_GIT_BRANCH);
+	printk("Type 'help' to show available commands.\n");
+#endif
+
+	while (1) {
+#if USB_EXISTS || UART_CONSOLE_EXISTS
+		struct console_line_message message;
+		if (k_msgq_get(&console_line_msgq, &message, K_FOREVER) != 0 || !console_line_is_current(message.epoch)) {
+			continue;
+		}
+		char *line = message.line;
+#else
+		char *line = rtt_console_getline();
+#endif
+		char *argv[8] = {NULL};
+		size_t argc = parse_args(line, argv, ARRAY_SIZE(argv));
+		if (argc == 0) {
+			continue;
+		}
+		for (size_t i = 0; i < argc; i++) {
+			strtolower(argv[i]);
+		}
+
+		bool found = false;
+		for (size_t i = 0; i < ARRAY_SIZE(console_cmds); i++) {
+			if (strcmp(argv[0], console_cmds[i].name) == 0) {
+				console_cmds[i].fn(argc, argv);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
 			printk("Unknown command\n");
 		}
 	}

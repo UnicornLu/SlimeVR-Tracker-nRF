@@ -2,6 +2,9 @@
 
 #include <zephyr/logging/log.h>
 
+#include <errno.h>
+#include <string.h>
+
 //#define DEBUG true
 //#define DEBUG_RATE true
 
@@ -20,7 +23,6 @@ enum sensor_interface_spec sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_COUNT]
 uint32_t sensor_interface_dev_spi_dummy_reads[SENSOR_INTERFACE_DEV_COUNT] = {0};
 
 uint8_t ext_addr = 0x00;
-uint8_t min_ext_burst = 0;
 static const sensor_ext_ssi_t *ext_ssi = NULL;
 
 // TODO: only one active spi transaction at a time
@@ -34,6 +36,57 @@ struct spi_buf_set rx = {.buffers = rx_bufs, .count = 2};
 
 // TODO: also keep reference to sensor device drivers (such as for ext mag)
 
+static int ssi_ext_read_segmented(uint8_t start_addr, uint8_t dummy_bytes, uint8_t *buf, uint32_t num_bytes)
+{
+	if (ext_ssi == NULL)
+		return -1;
+
+	uint8_t data_cap = ext_ssi->ext_burst;
+	if (data_cap == 0)
+	{
+		LOG_ERR("Unsupported external read: burst=0");
+		return -1;
+	}
+	/* A per-chunk dummy prefix is consumed by the IMU driver before the data,
+	 * so it reduces the data bytes that fit in one transaction. */
+	if (dummy_bytes >= data_cap)
+	{
+		LOG_ERR("Dummy prefix %u exceeds external read budget %u", dummy_bytes, data_cap);
+		return -1;
+	}
+
+	uint8_t data_per_chunk = data_cap - dummy_bytes;
+	size_t offset = 0;
+	while (offset < num_bytes)
+	{
+		size_t chunk = num_bytes - offset;
+		if (chunk > data_per_chunk)
+			chunk = data_per_chunk;
+
+		/* The interface layer advances the sub-register by the number of data
+		 * bytes already read, matching how a single auto-incrementing burst
+		 * would walk the register map. dummy_bytes are dropped inside the
+		 * driver read; here we must skip them before copying data out. */
+		uint8_t reg = start_addr + (uint8_t)offset;
+		if (dummy_bytes)
+		{
+			uint8_t tmp[32]; /* holds dummy prefix + one chunk of register data */
+			int err = ext_ssi->ext_write_read(ext_addr, &reg, 1, tmp, dummy_bytes + chunk);
+			if (err)
+				return err;
+			memcpy(buf + offset, tmp + dummy_bytes, chunk);
+		}
+		else
+		{
+			int err = ext_ssi->ext_write_read(ext_addr, &reg, 1, buf + offset, chunk);
+			if (err)
+				return err;
+		}
+		offset += chunk;
+	}
+	return 0;
+}
+
 void sensor_interface_register_sensor_imu_spi(struct spi_dt_spec *dev)
 {
 	sensor_interface_dev_spi[SENSOR_INTERFACE_DEV_IMU] = dev;
@@ -44,6 +97,11 @@ void sensor_interface_register_sensor_imu_i2c(struct i2c_dt_spec *dev)
 {
 	sensor_interface_dev_i2c[SENSOR_INTERFACE_DEV_IMU] = dev;
 	sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_IMU] = SENSOR_INTERFACE_SPEC_I2C;
+}
+
+bool sensor_interface_imu_is_i2c(void)
+{
+	return sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_IMU] == SENSOR_INTERFACE_SPEC_I2C;
 }
 
 void sensor_interface_register_sensor_mag_spi(struct spi_dt_spec *dev)
@@ -65,16 +123,16 @@ int sensor_interface_register_sensor_mag_ext(uint8_t addr, uint8_t min_burst, ui
 	case SENSOR_INTERFACE_SPEC_SPI:
 		if (ext_ssi != NULL)
 		{
-			if (burst > ext_ssi->ext_burst)
+			/* Only a single read whose register-data length cannot be segmented
+			 * below the I2CM transaction width is unsupported. Anything wider is
+			 * segmented transparently by the interface layer. */
+			if (min_burst > ext_ssi->ext_burst)
 			{
-				if (min_burst > ext_ssi->ext_burst)
-				{
-					LOG_ERR("Unsupported burst length");
-					return -1;
-				}
-				LOG_WRN("Using minimum burst length");
+				LOG_ERR("Unsupported minimum burst %u > external read width %u", min_burst, ext_ssi->ext_burst);
+				return -1;
 			}
-			min_ext_burst = min_burst; // fallback if num_read exceeds ext_burst
+			if (burst > ext_ssi->ext_burst)
+				LOG_INF("Magnetometer burst %u exceeds I2CM width %u; using segmented external reads", burst, ext_ssi->ext_burst);
 			ext_addr = addr;
 			sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] = SENSOR_INTERFACE_SPEC_EXT;
 			return 0;
@@ -114,6 +172,13 @@ const sensor_ext_ssi_t *sensor_interface_ext_get(void)
 	return ext_ssi;
 }
 
+enum sensor_interface_spec sensor_interface_get_spec(enum sensor_interface_dev dev)
+{
+	if (dev < 0 || dev >= SENSOR_INTERFACE_DEV_COUNT)
+		return SENSOR_INTERFACE_SPEC_SPI; // safe default
+	return sensor_interface_dev_spec[dev];
+}
+
 // TODO: spi config by device
 
 int ssi_write(enum sensor_interface_dev dev, const uint8_t *buf, uint32_t num_bytes)
@@ -124,7 +189,6 @@ int ssi_write(enum sensor_interface_dev dev, const uint8_t *buf, uint32_t num_by
 		tx_bufs[0].buf = (void *)buf;
 		tx_bufs[0].len = num_bytes;
 		tx.count = 1;
-		k_busy_wait(1);
 #if DEBUG
 		LOG_DBG("ssi_write: dev=%d, num_bytes=%zu", dev, num_bytes);
 		LOG_HEXDUMP_DBG(buf, num_bytes, "ssi_write: buf");
@@ -164,7 +228,6 @@ int ssi_read(enum sensor_interface_dev dev, uint8_t *buf, uint32_t num_bytes)
 		rx_bufs[1].buf = buf;
 		rx_bufs[1].len = num_bytes;
 		rx.count = 2;
-		k_busy_wait(1);
 #if DEBUG
 		LOG_DBG("ssi_read: dev=%d, num_bytes=%zu", dev, num_bytes);
 		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], NULL, &rx);
@@ -203,7 +266,6 @@ int ssi_write_read(enum sensor_interface_dev dev, const void *write_buf, size_t 
 		rx_bufs[1].buf = read_buf;
 		rx_bufs[1].len = num_read;
 		rx.count = 2;
-		k_busy_wait(1);
 #if DEBUG
 		LOG_DBG("ssi_write_read: dev=%d, num_write=%zu, num_read=%zu", dev, num_write, num_read);
 		LOG_HEXDUMP_DBG(write_buf, num_write, "ssi_write_read: write_buf");
@@ -225,12 +287,17 @@ int ssi_write_read(enum sensor_interface_dev dev, const void *write_buf, size_t 
 	case SENSOR_INTERFACE_SPEC_I2C:
 		return i2c_write_read_dt(sensor_interface_dev_i2c[dev], write_buf, num_write, read_buf, num_read);
 	case SENSOR_INTERFACE_SPEC_EXT:
-		if (ext_ssi != NULL)
+		if (ext_ssi == NULL)
+			return -1;
+		if (num_write != 1)
 		{
-			if (num_read > ext_ssi->ext_burst)
-				num_read = min_ext_burst;
-			return ext_ssi->ext_write_read(ext_addr, write_buf, num_write, read_buf, num_read);
+			LOG_ERR("Unsupported external write_read: write=%zu", num_write);
+			return -1;
 		}
+		if (num_read <= ext_ssi->ext_burst)
+			return ext_ssi->ext_write_read(ext_addr, write_buf, num_write, read_buf, num_read);
+		/* Longer than one I2CM transaction: segment by register-data length. */
+		return ssi_ext_read_segmented(((const uint8_t *)write_buf)[0], 0, read_buf, num_read);
 	default:
 		return -1;
 	}
@@ -243,6 +310,43 @@ int ssi_burst_read(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t *b
 	return ssi_write_read(dev, &start_addr, 1, buf, num_bytes);
 }
 
+int ssi_burst_read_dummy(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t dummy_bytes, uint8_t *buf, uint32_t num_bytes)
+{
+	if (dummy_bytes == 0)
+		return ssi_burst_read(dev, start_addr, buf, num_bytes);
+
+	/* On the external (I2CM) interface the interface layer owns segmentation:
+	 * it advances the sub-register per data chunk and strips the per-chunk
+	 * dummy prefix, so >burst register reads are merged transparently. */
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_EXT)
+		return ssi_ext_read_segmented(start_addr, dummy_bytes, buf, num_bytes);
+
+	uint8_t tmp[16];
+	uint32_t offset = 0;
+	while (offset < num_bytes)
+	{
+		// Each segment has its own dummy prefix, so only bytes after the prefix are copied out.
+		uint32_t transfer_len = dummy_bytes + (num_bytes - offset);
+		if (transfer_len > sizeof(tmp))
+			transfer_len = sizeof(tmp);
+		if (transfer_len <= dummy_bytes)
+		{
+			LOG_ERR("Unsupported dummy-byte burst read");
+			return -1;
+		}
+
+		int err = ssi_burst_read(dev, start_addr + offset, tmp, transfer_len);
+		if (err)
+			return err;
+
+		uint32_t chunk = transfer_len - dummy_bytes;
+		memcpy(buf + offset, tmp + dummy_bytes, chunk);
+		offset += chunk;
+	}
+
+	return 0;
+}
+
 int ssi_burst_write(enum sensor_interface_dev dev, uint8_t start_addr, const uint8_t *buf, uint32_t num_bytes)
 {
 	switch (sensor_interface_dev_spec[dev])
@@ -253,7 +357,6 @@ int ssi_burst_write(enum sensor_interface_dev dev, uint8_t start_addr, const uin
 		tx_bufs[1].buf = (void *)buf;
 		tx_bufs[1].len = num_bytes;
 		tx.count = 2;
-		k_busy_wait(1);
 #if DEBUG
 		LOG_DBG("ssi_burst_write: dev=%d, start_addr=0x%02X, num_bytes=%d", dev, start_addr, num_bytes);
 		LOG_HEXDUMP_DBG(&start_addr, 1, "ssi_burst_write: start_addr");
@@ -313,21 +416,24 @@ int ssi_reg_read_interval(enum sensor_interface_dev dev, uint8_t start_addr, uin
 #if DEBUG || DEBUG_RATE
 	uint32_t start = k_cycle_get_32();
 #endif
+	#if CONFIG_SOC_NRF52832
+	uint32_t maxcnt = 255; // easyeda-maxcnt-bits = <8>
+	#elif CONFIG_SOC_NRF52810
+	uint32_t maxcnt = 1023; // easyeda-maxcnt-bits = <10>
+	#else
+	uint32_t maxcnt = 2048; // all other SOC have >11 bits
+	#endif
+	if (interval == 0 || interval > maxcnt)
+		return -EINVAL;
+
 	// TODO: better way to handle with spi?
 	// TODO: not working
 	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI)
 		start_addr |= 0x80; // set read bit
 	int err = ssi_write(dev, &start_addr, 1); // Start read buffer
-//	if (err)
-//		return err;
-#if CONFIG_SOC_NRF52832
-	uint32_t maxcnt = 255; // easyeda-maxcnt-bits = <8>
-#elif CONFIG_SOC_NRF52810
-	uint32_t maxcnt = 1023; // easyeda-maxcnt-bits = <10>
-#else
-	uint32_t maxcnt = 2048; // all other SOC have >11 bits
-#endif
-	interval *= maxcnt / interval; // maximum interval below maxcnt
+	if (err)
+		return err;
+	interval *= maxcnt / interval;
 	while (num_bytes > 0)
 	{
 #if DEBUG || DEBUG_RATE
@@ -335,9 +441,9 @@ int ssi_reg_read_interval(enum sensor_interface_dev dev, uint8_t start_addr, uin
 #endif
 		if (interval > num_bytes)
 			interval = num_bytes;
-		err |= ssi_read(dev, buf, interval);
-//		if (err)
-//			return err;
+		err = ssi_read(dev, buf, interval);
+		if (err)
+			return err;
 		buf += interval;
 		num_bytes -= interval;
 	}
@@ -361,7 +467,9 @@ int ssi_burst_read_interval(enum sensor_interface_dev dev, uint8_t start_addr, u
 #else
 	uint32_t maxcnt = sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI ? 16383 : 1023; // all other SOC have >=14 bits, I2C timeout (>25ms) on higher interval
 #endif
-	interval *= maxcnt / interval; // maximum interval below maxcnt
+	if (interval == 0 || interval > maxcnt)
+		return -EINVAL;
+	interval *= maxcnt / interval;
 	while (num_bytes > 0)
 	{
 #if DEBUG || DEBUG_RATE
@@ -369,9 +477,9 @@ int ssi_burst_read_interval(enum sensor_interface_dev dev, uint8_t start_addr, u
 #endif
 		if (interval > num_bytes)
 			interval = num_bytes;
-		err |= ssi_burst_read(dev, start_addr, buf, interval);
-//		if (err)
-//			return err;
+		err = ssi_burst_read(dev, start_addr, buf, interval);
+		if (err)
+			return err;
 		buf += interval;
 		num_bytes -= interval;
 	}

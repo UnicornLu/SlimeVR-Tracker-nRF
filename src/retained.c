@@ -29,6 +29,7 @@ struct retained_data *retained = (struct retained_data *)DT_REG_ADDR(MEMORY_REGI
 #define RETAINED_CHECKED_SIZE (RETAINED_CRC_OFFSET + sizeof(retained->crc))
 
 static uint64_t init_time;
+static K_MUTEX_DEFINE(retained_lock);
 
 static int retained_init(void)
 {
@@ -90,6 +91,8 @@ bool retained_validate(void)
 		retained->bootCalState.doffset[0] = 0.0f;
 		retained->bootCalState.doffset[1] = 0.0f;
 		retained->bootCalState.doffset[2] = 0.0f;
+		/* Default on; apply path falls back to ZRO until enough points. */
+		retained->tcal_enabled = true;
 #endif
 		/* Initialize watchdog_state with valid magic but zero counters */
 		retained->watchdog_state.magic = WATCHDOG_STATE_MAGIC;
@@ -97,6 +100,8 @@ bool retained_validate(void)
 		retained->watchdog_state.total_wdt_resets = 0;
 		retained->watchdog_state.last_failed_channel = 0;
 		retained->watchdog_state.last_reset_uptime = 0;
+		/* Stored channel encoding: 0xFF = default (see esb.h helpers). */
+		retained->rf_channel = 0xFF;
 	}
 
 	/* Reset to accrue runtime from this session. */
@@ -108,6 +113,8 @@ bool retained_validate(void)
 
 void retained_update(void)
 {
+	k_mutex_lock(&retained_lock, K_FOREVER);
+
 	uint64_t now = k_uptime_ticks();
 
 	retained->uptime_sum += (now - retained->uptime_latest);
@@ -117,4 +124,6 @@ void retained_update(void)
 				  RETAINED_CRC_OFFSET);
 
 	retained->crc = sys_cpu_to_le32(crc);
+
+	k_mutex_unlock(&retained_lock);
 }

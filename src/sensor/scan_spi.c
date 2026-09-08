@@ -51,12 +51,13 @@ int sensor_scan_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg, int dev_addr_
 		for (int k = 0; k < reg_count; k++)
 		{
 			uint8_t reg = dev_reg[reg_index + k];
-			if (*spi_dev_reg == 0xFF || *spi_dev_reg == reg)
+			/* Retained imu_reg keeps bit7 as SPI interface flag (also SPI read bit). */
+			if (*spi_dev_reg == 0xFF || (*spi_dev_reg & 0x7F) == reg)
 			{
 				uint8_t id;
-				uint8_t reg_read = reg | 0x80; // set read bit for SPI
-				tx_buf.buf = &reg_read;
-				LOG_INF("Scanning register: 0x%02X (read: 0x%02X)", reg, reg_read);
+				tx_buf.buf = &reg;
+				reg |= 0x80; // set read bit / SPI interface flag for retained
+				LOG_DBG("Scanning register: 0x%02X", reg);
 				// TODO: BMM150 workaround?
 				int err = spi_transceive_dt(bus, &tx, &rx);
 				LOG_INF("SPI err: %d, Read value: 0x%02X, 0x%02X, 0x%02X", err, buf[0], buf[1], buf[2]);
@@ -71,6 +72,12 @@ int sensor_scan_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg, int dev_addr_
 				LOG_INF("Extracted ID: 0x%02X (from buf[1]=0x%02X, buf[2]=0x%02X, buf[0]=0x%02X)", id, buf[1], buf[2], buf[0]);
 				for (int l = 0; l < id_cnt; l++)
 				{
+					// 0xFF is a "no real WHO_AM_I" sentinel (e.g. QMC5883L, an
+					// I2C-only part). On SPI a reserved-register read floats to
+					// 0xFF, so this would false-match and shadow real SPI mags
+					// later in the table (e.g. LIS2MDL at 0x4F). Skip it on SPI.
+					if (dev_id[id_ind + l] == 0xFF)
+						continue;
 					if (id == dev_id[id_ind + l])
 					{
 						*spi_dev_reg = reg_read;

@@ -70,7 +70,7 @@ struct retained_data {
 
 
 	uint8_t fusion_id; // fusion_data_stored
-	uint8_t fusion_data[512];
+	uint8_t fusion_data[784];
 
 	uint16_t imu_addr;
 	uint16_t mag_addr;
@@ -79,10 +79,23 @@ struct retained_data {
 	uint8_t mag_reg;
 
 	uint8_t rf_channel; // RF channel (0-100), 0xFF means use default
+	uint8_t wom_idle_wake_streak;
+	bool wom_sleep_pending;
 
 	bool mag_enabled;
+	uint8_t mag_online_calibration_mode;
+
+	// Online magnetometer calibration runtime state.
+	// Persists across WoM resumes so online mag cal does not re-enter
+	// early bootstrap after every wake, but is cleared on full reboot/shutdown.
+	struct {
+		float last_buf_avg_norm;
+		uint8_t update_count;
+		uint8_t reserved[3];
+	} onlineMagState;
 
 #if CONFIG_SENSOR_USE_TCAL
+	bool tcal_enabled; // Temperature calibration compensation enabled
 	float gyroTemp;
 
 	#define TCAL_BUFFER_SIZE                                                                                               \

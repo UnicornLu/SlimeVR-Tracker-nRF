@@ -8,6 +8,11 @@
 #define LIS3MDL_CTRL_REG2 0x21
 #define LIS3MDL_CTRL_REG3 0x22
 #define LIS3MDL_CTRL_REG4 0x23
+#define LIS3MDL_CTRL_REG5 0x24
+#define LIS3MDL_CTRL_REG5_BDU 0x40
+
+#define LIS3MDL_STATUS_REG 0x27
+#define LIS3MDL_STATUS_ZYXDA 0x08
 
 #define LIS3MDL_OUT_X_L 0x28
 
@@ -43,7 +48,7 @@ void lis3_shutdown(void);
 int lis3_update_odr(float time, float *actual_time);
 
 void lis3_mag_oneshot(void);
-void lis3_mag_read(float m[3]);
+bool lis3_mag_read(float m[3]);
 float lis3_temp_read(float bias[3]);
 
 void lis3_mag_process(uint8_t *raw_m, float m[3]);
