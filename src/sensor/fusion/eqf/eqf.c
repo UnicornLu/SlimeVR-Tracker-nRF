@@ -110,6 +110,7 @@ static int ortho_counter;
 static float rest_gyr_lp[3];    /* LP filtered gyro (rad/s)          */
 static float rest_acc_lp[3];    /* LP filtered accel (g)             */
 static float rest_gyr_dev;      /* last gyro squared deviation       */
+static float rest_acc_dev;      /* last accel squared deviation      */
 static float rest_t;            /* accumulated rest time (s)         */
 static bool  rest_detected;
 static bool  rest_gyr_lp_init;  /* gyro LP initialized              */
@@ -127,6 +128,7 @@ static float mag_candidate_dip;    /* alternative field candidate dip    */
 static float mag_candidate_t;      /* time spent in candidate field      */
 static float mag_undisturbed_t;    /* stable time in current field       */
 static float mag_reject_t;         /* accumulated rejection time         */
+static bool mag_rebase_pending;
 
 /* ── 3×3 matrix helpers (row-major float[9]) ───────────────────────── */
 
@@ -1065,6 +1067,7 @@ void eqf_init(float g_time, float a_time, float m_time)
 	memset(rest_gyr_lp, 0, sizeof(rest_gyr_lp));
 	memset(rest_acc_lp, 0, sizeof(rest_acc_lp));
 	rest_gyr_dev = 0.0f;
+	rest_acc_dev = 0.0f;
 	rest_t = 0.0f;
 	rest_detected = false;
 	rest_gyr_lp_init = false;
@@ -1082,6 +1085,7 @@ void eqf_init(float g_time, float a_time, float m_time)
 
 	/* reset magnetic state */
 	mag_ref_valid = false;
+	mag_rebase_pending = false;
 	eqf_reset_mag_runtime_state(false);
 }
 
@@ -1103,6 +1107,7 @@ void eqf_load(const void *data)
 	memset(rest_gyr_lp, 0, sizeof(rest_gyr_lp));
 	memset(rest_acc_lp, 0, sizeof(rest_acc_lp));
 	rest_gyr_dev = 0.0f;
+	rest_acc_dev = 0.0f;
 	rest_t = 0.0f;
 	rest_detected = false;
 	rest_gyr_lp_init = false;
@@ -1228,7 +1233,7 @@ void eqf_update_accel(float *a, float time)
 	float da0 = a[0] - rest_acc_lp[0];
 	float da1 = a[1] - rest_acc_lp[1];
 	float da2 = a[2] - rest_acc_lp[2];
-	float acc_dev_sq = da0 * da0 + da1 * da1 + da2 * da2;
+	rest_acc_dev = da0 * da0 + da1 * da1 + da2 * da2;
 
 	float gyr_th_rad = EQF_REST_TH_GYR * DEG_TO_RAD;
 	float max_bias_rad = EQF_REST_MAX_BIAS * DEG_TO_RAD;
@@ -1236,7 +1241,7 @@ void eqf_update_accel(float *a, float time)
 	/* reject rest if: gyro deviation too high, accel deviation too high,
 	 * accel norm not near 1g, or LP'd gyro exceeds max plausible bias */
 	if (rest_gyr_dev >= gyr_th_rad * gyr_th_rad
-	    || acc_dev_sq >= EQF_REST_TH_ACC * EQF_REST_TH_ACC
+	    || rest_acc_dev >= EQF_REST_TH_ACC * EQF_REST_TH_ACC
 	    || fabsf(anorm - 1.0f) > EQF_REST_ACC_NORM_TH
 	    || fabsf(rest_gyr_lp[0]) > max_bias_rad
 	    || fabsf(rest_gyr_lp[1]) > max_bias_rad
@@ -1260,6 +1265,36 @@ void eqf_update_mag(float *m, float time)
 	float mn = v3_norm(m);
 	if (mn < 1e-10f)
 		return;
+
+	/* A calibration handoff cannot reuse the old field's trust or apply a
+	 * first-sample heading correction. Reacquire without touching A/a_vec/P. */
+	if (mag_rebase_pending) {
+		float current_norm, current_dip;
+		eqf_get_mag_norm_dip(m, &current_norm, &current_dip);
+		float reference_norm = mag_ref_valid ? st.mag_ref_norm : mag_candidate_norm;
+		float reference_dip = mag_ref_valid ? eqf_get_mag_ref_dip() : mag_candidate_dip;
+		if (reference_norm > 0.0f && fabsf(current_norm - reference_norm) < EQF_MAG_NORM_TH * reference_norm
+			&& fabsf(current_dip - reference_dip) < EQF_MAG_DIP_TH * DEG_TO_RAD) {
+			if (mag_ref_valid || v3_norm(rest_gyr_lp) >= EQF_MAG_NEW_MIN_GYR * DEG_TO_RAD) {
+				mag_candidate_t += dt;
+			}
+		} else {
+			mag_candidate_norm = current_norm;
+			mag_candidate_dip = current_dip;
+			mag_candidate_t = 0.0f;
+		}
+		float required = mag_ref_valid ? EQF_MAG_MIN_UNDISTURBED_T : EQF_MAG_NEW_FIRST_TIME;
+		if (mag_candidate_t < required) {
+			return;
+		}
+		if (!mag_ref_valid) {
+			eqf_set_mag_ref(mag_candidate_norm, mag_candidate_dip);
+			mag_ref_valid = true;
+		}
+		mag_rebase_pending = false;
+		eqf_reset_mag_runtime_state(true);
+		return;
+	}
 
 	if (mode == EQF_INIT) {
 		mag_sum[0] += m[0]; mag_sum[1] += m[1]; mag_sum[2] += m[2];
@@ -1401,21 +1436,63 @@ int eqf_get_gyro_sanity(void)
 	return 0;
 }
 
+bool eqf_get_rest_detected(void)
+{
+	return rest_detected;
+}
+
+void eqf_get_relative_rest_deviations(float out[2])
+{
+	float gyr_th_rad = EQF_REST_TH_GYR * DEG_TO_RAD;
+	out[0] = sqrtf(rest_gyr_dev) / gyr_th_rad;
+	out[1] = sqrtf(rest_acc_dev) / EQF_REST_TH_ACC;
+}
+
+bool eqf_get_mag_dist_detected(void)
+{
+	return mag_dist_detected;
+}
+
+static void eqf_rebase_mag(float norm, float dip)
+{
+	eqf_set_mag_ref(norm, dip);
+	mag_ref_valid = norm > 0.0f;
+	eqf_reset_mag_runtime_state(false);
+	mag_dist_detected = true;
+	mag_rebase_pending = true;
+	memset(mag_sum, 0, sizeof(mag_sum));
+	mag_norm_sum = 0.0f;
+	mag_init_count = 0;
+	have_mag = false;
+}
+
+void eqf_get_mag_ref(float *norm, float *dip)
+{
+	*norm = st.mag_ref_norm;
+	*dip = eqf_get_mag_ref_dip();
+}
+
 
 /* ── Fusion vtable ─────────────────────────────────────────────────── */
 
 const sensor_fusion_t sensor_fusion_eqf = {
-	.init             = eqf_init,
-	.load             = eqf_load,
-	.save             = eqf_save,
-	.update_gyro      = eqf_update_gyro,
-	.update_accel     = eqf_update_accel,
-	.update_mag       = eqf_update_mag,
-	.update           = eqf_update,
-	.get_gyro_bias    = eqf_get_gyro_bias,
-	.set_gyro_bias    = eqf_set_gyro_bias,
+	.init = eqf_init,
+	.load = eqf_load,
+	.save = eqf_save,
+	.update_gyro = eqf_update_gyro,
+	.update_accel = eqf_update_accel,
+	.update_mag = eqf_update_mag,
+	.update = eqf_update,
+	.get_gyro_bias = eqf_get_gyro_bias,
+	.set_gyro_bias = eqf_set_gyro_bias,
 	.update_gyro_sanity = eqf_update_gyro_sanity,
-	.get_gyro_sanity  = eqf_get_gyro_sanity,
-	.get_lin_a        = eqf_get_lin_a,
-	.get_quat         = eqf_get_quat,
+	.get_gyro_sanity = eqf_get_gyro_sanity,
+	.get_lin_a = eqf_get_lin_a,
+	.get_quat = eqf_get_quat,
+	.get_rest_detected = eqf_get_rest_detected,
+	.get_relative_rest_deviations = eqf_get_relative_rest_deviations,
+	.get_mag_dist_detected = eqf_get_mag_dist_detected,
+	.get_quat6 = NULL, /* EqF attitude is magnetically coupled. */
+	.rebase_mag = eqf_rebase_mag,
+	.get_mag_ref = eqf_get_mag_ref,
 };

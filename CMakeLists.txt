@@ -5,7 +5,7 @@
 #
 cmake_minimum_required(VERSION 3.20.0)
 
-# Configure VERSION from repository branch and tag
+# Configure VERSION from repository tags, or a deterministic development fallback.
 find_package(Git)
 
 if(GIT_EXECUTABLE)
@@ -18,6 +18,9 @@ if(GIT_EXECUTABLE)
     COMMAND ${GIT_EXECUTABLE} describe --dirty --tags --long --match [0-9]*.[0-9]*.[0-9]*
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE GIT_VERSION
+    RESULT_VARIABLE GIT_VERSION_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
     )
   # Prefer a https URL for display (falls back to ssh/origin.url)
   execute_process(
@@ -40,11 +43,6 @@ endif()
 if(GIT_BRANCH STREQUAL "")
   set(GIT_BRANCH unknown)
   message(WARNING "Unknown Git Branch")
-endif()
-
-if(GIT_VERSION STREQUAL "")
-  set(GIT_VERSION 0.0.0-0)
-  message(WARNING "Unknown Tag/Version")
 endif()
 
 # Choose URL: origin.https.url > origin.url
@@ -73,20 +71,26 @@ if(GIT_AUTHOR STREQUAL "")
 endif()
 
 string(STRIP ${GIT_BRANCH} GIT_BRANCH)
-string(STRIP ${GIT_VERSION} GIT_VERSION)
 string(STRIP ${GIT_REPO_URL} GIT_REPO_URL)
 string(STRIP ${GIT_AUTHOR} GIT_AUTHOR)
 
-string(REPLACE "-" ";" GIT_VERSION ${GIT_VERSION})
-list(GET GIT_VERSION 0 GIT_RELEASE)
-list(GET GIT_VERSION 1 GIT_TWEAK)
-string(REPLACE "v" "" GIT_RELEASE ${GIT_RELEASE})
-string(REPLACE "." ";" GIT_RELEASE ${GIT_RELEASE})
-list(GET GIT_RELEASE 0 GIT_MAJOR)
-list(GET GIT_RELEASE 1 GIT_MINOR)
-list(GET GIT_RELEASE 2 GIT_PATCH)
-
-configure_file(${CMAKE_SOURCE_DIR}/VERSION_SRC ${CMAKE_SOURCE_DIR}/VERSION @ONLY)
+if(GIT_VERSION_RESULT STREQUAL "0" AND
+   GIT_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)-([0-9]+)-g[0-9a-f]+(-dirty)?$")
+  set(GIT_MAJOR ${CMAKE_MATCH_1})
+  set(GIT_MINOR ${CMAKE_MATCH_2})
+  set(GIT_PATCH ${CMAKE_MATCH_3})
+  set(GIT_TWEAK ${CMAKE_MATCH_4})
+  configure_file(${CMAKE_SOURCE_DIR}/VERSION_SRC ${CMAKE_SOURCE_DIR}/VERSION @ONLY)
+else()
+  # VERSION is generated; never reuse stale release numbers from another branch.
+  # Zephyr supplies commit provenance separately through APP_BUILD_VERSION.
+  set(GIT_MAJOR 0)
+  set(GIT_MINOR 0)
+  set(GIT_PATCH 0)
+  set(GIT_TWEAK 0)
+  configure_file(${CMAKE_SOURCE_DIR}/VERSION_SRC ${CMAKE_SOURCE_DIR}/VERSION @ONLY)
+  message(STATUS "No Git release version available; using development version 0.0.0")
+endif()
 
 # Pass metadata to C compilation units
 add_compile_definitions(
@@ -142,8 +146,87 @@ FILE(GLOB_RECURSE app_sources src/*.c)
 if(NOT CONFIG_CONNECTION_OVER_HID)
   list(FILTER app_sources EXCLUDE REGEX ".*/hid\\.c$")
 endif()
+if(NOT CONFIG_TDMA_DIAGNOSTICS)
+  list(FILTER app_sources EXCLUDE REGEX ".*/radio_capture\\.c$")
+endif()
+list(FILTER app_sources EXCLUDE REGEX ".*/sensor/imu/.*\\.c$")
+list(FILTER app_sources EXCLUDE REGEX ".*/sensor/mag/.*\\.c$")
 target_sources(app PRIVATE ${app_sources})
 
+# IMU drivers
+if(CONFIG_SENSOR_DRV_BMI270)
+  target_sources(app PRIVATE src/sensor/imu/BMI270.c)
+endif()
+if(CONFIG_SENSOR_DRV_ICM42688)
+  target_sources(app PRIVATE src/sensor/imu/ICM42688.c)
+endif()
+if(CONFIG_SENSOR_DRV_ICM42686)
+  target_sources(app PRIVATE src/sensor/imu/ICM42686.c)
+endif()
+if(CONFIG_SENSOR_DRV_ICM45686)
+  target_sources(app PRIVATE src/sensor/imu/ICM45686.c)
+endif()
+if(CONFIG_SENSOR_DRV_LSM6DSM)
+  target_sources(app PRIVATE src/sensor/imu/LSM6DSM.c)
+endif()
+if(CONFIG_SENSOR_DRV_LSM6DSO)
+  target_sources(app PRIVATE src/sensor/imu/LSM6DSO.c)
+endif()
+# LSM6DSM/DSO vtables call shared helpers defined in LSM6DSV.c (lsm_shutdown,
+# lsm_accel_read, …). Compile that TU whenever any LSM6 family DRV is on, even
+# if SENSOR_DRV_LSM6DSV=n — keep the Kconfig off so scan/vtable stay trimmed and
+# SENSOR_IMU_DRV_COUNT is not inflated.
+if(CONFIG_SENSOR_DRV_LSM6DSV OR CONFIG_SENSOR_DRV_LSM6DSM OR CONFIG_SENSOR_DRV_LSM6DSO)
+  target_sources(app PRIVATE src/sensor/imu/LSM6DSV.c)
+endif()
+
+# Magnetometer drivers
+if(CONFIG_SENSOR_DRV_AK09940)
+  target_sources(app PRIVATE src/sensor/mag/AK09940.c)
+endif()
+if(CONFIG_SENSOR_DRV_BMM150)
+  target_sources(app PRIVATE src/sensor/mag/BMM150.c)
+endif()
+if(CONFIG_SENSOR_DRV_BMM350)
+  target_sources(app PRIVATE src/sensor/mag/BMM350.c)
+endif()
+if(CONFIG_SENSOR_DRV_ICT153XX)
+  target_sources(app PRIVATE src/sensor/mag/ICT153xx.c)
+endif()
+if(CONFIG_SENSOR_DRV_IST8306)
+  target_sources(app PRIVATE src/sensor/mag/IST8306.c)
+endif()
+if(CONFIG_SENSOR_DRV_IST8308)
+  target_sources(app PRIVATE src/sensor/mag/IST8308.c)
+endif()
+if(CONFIG_SENSOR_DRV_LIS2MDL)
+  target_sources(app PRIVATE src/sensor/mag/LIS2MDL.c)
+endif()
+if(CONFIG_SENSOR_DRV_LIS3MDL)
+  target_sources(app PRIVATE src/sensor/mag/LIS3MDL.c)
+endif()
+if(CONFIG_SENSOR_DRV_MMC5603NJ)
+  target_sources(app PRIVATE src/sensor/mag/MMC5603NJ.c)
+endif()
+if(CONFIG_SENSOR_DRV_MMC5983MA)
+  target_sources(app PRIVATE src/sensor/mag/MMC5983MA.c)
+endif()
+if(CONFIG_SENSOR_DRV_QMC5883L)
+  target_sources(app PRIVATE src/sensor/mag/QMC5883L.c)
+endif()
+if(CONFIG_SENSOR_DRV_QMC6309)
+  target_sources(app PRIVATE src/sensor/mag/QMC6309.c)
+endif()
+
+set(_slimenrf_imu_drv_count 0)
+foreach(_d BMI270 ICM42688 ICM42686 ICM45686 LSM6DSM LSM6DSO LSM6DSV)
+  if(CONFIG_SENSOR_DRV_${_d})
+    math(EXPR _slimenrf_imu_drv_count "${_slimenrf_imu_drv_count}+1")
+  endif()
+endforeach()
+if(_slimenrf_imu_drv_count EQUAL 0)
+  message(FATAL_ERROR "No IMU SENSOR_DRV_* enabled. Enable at least one, or turn off SENSOR_IMU_DRIVERS_MINIMAL.")
+endif()
 # NORDIC SDK APP END
 
 FILE(GLOB_RECURSE files vqf-c/src/*.c)
