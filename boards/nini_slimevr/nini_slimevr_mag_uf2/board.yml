@@ -7,3 +7,5 @@ board:
   vendor: nini_slimevr
   socs:
     - name: nrf52833
+      variants:
+      - name: 'LSM'
