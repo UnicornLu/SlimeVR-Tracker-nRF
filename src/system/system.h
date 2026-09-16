@@ -25,6 +25,11 @@
 #define RF_CHANNEL_ID 31
 #define MAG_ENABLED_ID 37
 #define TCAL_ENABLED_ID 38
+#define MAG_ONLINE_CALIBRATION_ID 39
+
+#define MAG_ONLINE_CALIBRATION_DEFAULT 0
+#define MAG_ONLINE_CALIBRATION_ENABLED 1
+#define MAG_ONLINE_CALIBRATION_DISABLED 2
 
 #if CONFIG_SENSOR_USE_TCAL
 #define MAIN_GYRO_TEMP_ID 32
@@ -36,24 +41,45 @@
 
 void configure_sense_pins(void);
 
+/* Complete RESETREAS snapshot captured once at PRE_KERNEL_1, before W1C. */
+uint32_t sys_get_reset_reason(void);
+
 uint8_t reboot_counter_read(void);
 void reboot_counter_write(uint8_t reboot_counter);
 
-void sys_write(uint16_t id, void *ptr, const void *data, size_t len);
+/* Eager retained + NVS write, thread context only.
+ * Returns 0 on persistence success, -EIO if NVS cannot initialize, or the
+ * negative NVS write error. On failure retained RAM is still updated/sealed.
+ */
+int sys_write(uint16_t id, void *ptr, const void *data, size_t len);
+void sys_write_warm(uint16_t id, void *retained_ptr, const void *data, size_t len);
+void sys_warm_transaction_begin(void);
+void sys_warm_transaction_mark(uint16_t id, void *retained_ptr, size_t len);
+void sys_warm_transaction_end(bool retained_changed);
+void sys_flush_warm(void);
+bool sys_warm_is_dirty(void);
 void sys_read(uint16_t id, void *data, size_t len);
+/* Confirmation-gated reset; cancels deferred IMU writes before clearing storage.
+ * Storage errors are logged; live runtime settings still require a reboot. */
 void sys_clear(void);
 void sys_nvs_stats(void);
 
 int set_sensor_clock(bool enable, float rate, float* actual_rate);
 
 bool button_read(void);
+bool button_read_filtered(void);
 
 bool dock_read(void);
 bool chg_read(void);
 bool stby_read(void);
 
+/* 0: power request accepted; positive: deliberate long-hold cancellation;
+ * negative: admission rejected (not a pairing request). */
 int sys_user_shutdown(void);
-void sys_command_shutdown(void);
+/* 0: asynchronous OFF request accepted; negative: admission rejected. */
+int sys_command_shutdown(void);
+void sys_enter_dfu(bool ota);
+void sys_skip_dfu(void);
 void sys_reset_mode(uint8_t mode);
 
 #endif

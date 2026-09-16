@@ -23,9 +23,10 @@
 #include "util.h"
 
 #include <math.h>
-#include <stddef.h>
+#include <zephyr/sys/printk.h>
 #if defined(CONFIG_VQF_BENCH)
 #include <zephyr/kernel.h>
+#include "thread_priority.h"
 #endif
 
 #if defined(CONFIG_VQF_BENCH) && defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
@@ -39,32 +40,11 @@
 #include "retained.h" // for BUILD_ASSERT on fusion_data size
 
 #ifndef DEG_TO_RAD
-#define DEG_TO_RAD 0.01745329251994329577f  /* (float)(M_PI / 180.0) */
+#define DEG_TO_RAD 0.01745329251994329577f /* (float)(M_PI / 180.0) */
 #endif
 
 #ifndef RAD_TO_DEG
-#define RAD_TO_DEG 57.29577951308232087680f  /* (float)(180.0 / M_PI) */
-#endif
-
-#define VQF_PI 3.14159265358979323846f
-
-#ifndef VQF_NO_MAG_HEADING_HOLD_ENTER_S
-#define VQF_NO_MAG_HEADING_HOLD_ENTER_S 0.6f
-#endif
-#ifndef VQF_NO_MAG_HEADING_HOLD_ENTER_DEV
-#define VQF_NO_MAG_HEADING_HOLD_ENTER_DEV 0.8f
-#endif
-#ifndef VQF_NO_MAG_HEADING_HOLD_EXIT_DEV
-#define VQF_NO_MAG_HEADING_HOLD_EXIT_DEV 1.5f
-#endif
-#ifndef VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD
-#define VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD 0.0018f
-#endif
-#ifndef VQF_NO_MAG_HEADING_HOLD_RESET_S
-#define VQF_NO_MAG_HEADING_HOLD_RESET_S 2.0f
-#endif
-#ifndef VQF_NO_MAG_HEADING_HOLD_MAX_CORR_DPS
-#define VQF_NO_MAG_HEADING_HOLD_MAX_CORR_DPS 1.00f
+#define RAD_TO_DEG 57.29577951308232087680f /* (float)(180.0 / M_PI) */
 #endif
 
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
@@ -96,18 +76,17 @@
  * is linearly interpolated from GENTLE (intensity=0) to AGGRESSIVE
  * (intensity=1).  When rest is detected, TAU_ACC_REST overrides.
  */
-#define ADAPTIVE_TAU_ACC_REST       3.0f   /* tauAcc when at rest (seconds) */
-#define ADAPTIVE_TAU_ACC_GENTLE     2.0f   /* tauAcc during gentle motion (seconds) */
-#define ADAPTIVE_TAU_ACC_AGGRESSIVE 4.3f   /* tauAcc under aggressive motion (seconds) */
-#define ADAPTIVE_TAU_ACC_LEVELS     5     /* quantization levels */
-#define ADAPTIVE_ACC_DEV_TH         2.0f   /* accel deviation threshold (m/s²) */
-#define ADAPTIVE_ATTACK_ALPHA       0.4f   /* attack coefficient: fast increase (per sample) */
-#define ADAPTIVE_RELEASE_ALPHA      0.2f   /* release coefficient: slow decrease (per sample) */
-#define TAU_SMOOTH_ALPHA_DOWN       0.21f  /* tauAcc decrease smoothing (per sample) */
-#define TAU_SMOOTH_ALPHA_UP         0.21f  /* tauAcc increase smoothing (per sample) */
-#endif /* CONFIG_VQF_ADAPTIVE_TAU_ACC */
+#define ADAPTIVE_TAU_ACC_REST 3.0f       /* tauAcc when at rest (seconds) */
+#define ADAPTIVE_TAU_ACC_GENTLE 2.0f     /* tauAcc during gentle motion (seconds) */
+#define ADAPTIVE_TAU_ACC_AGGRESSIVE 4.3f /* tauAcc under aggressive motion (seconds) */
+#define ADAPTIVE_TAU_ACC_LEVELS 5        /* quantization levels */
+#define ADAPTIVE_ACC_DEV_TH 2.0f         /* accel deviation threshold (m/s²) */
+#define ADAPTIVE_ATTACK_ALPHA 0.4f       /* attack coefficient: fast increase (per sample) */
+#define ADAPTIVE_RELEASE_ALPHA 0.2f      /* release coefficient: slow decrease (per sample) */
+#define TAU_SMOOTH_ALPHA_DOWN 0.21f      /* tauAcc decrease smoothing (per sample) */
+#define TAU_SMOOTH_ALPHA_UP 0.21f        /* tauAcc increase smoothing (per sample) */
+#endif                                   /* CONFIG_VQF_ADAPTIVE_TAU_ACC */
 
-static uint8_t imu_id;
 
 static vqf_params_t params;
 static vqf_state_t state;
@@ -115,6 +94,11 @@ static vqf_coeffs_t coeffs;
 #define VQF_MEM_SIZE (sizeof(vqf_state_t) + sizeof(vqf_coeffs_t))
 
 static float last_a[3] = {0};
+/* Sample periods from the last vqf_init(); used to re-init cleanly when a
+ * corrupt (non-finite) retained state is rejected at load. */
+static float vqf_init_gyr_time;
+static float vqf_init_acc_time;
+static float vqf_init_mag_time;
 #if defined(CONFIG_VQF_BENCH)
 static volatile float vqf_bench_sink;
 static vqf_params_t vqf_bench_params;
@@ -160,19 +144,10 @@ static float smoothed_tau;           /* smoothed tauAcc for gradual transitions 
 static uint32_t rest_enter_count;
 static uint32_t rest_exit_count;
 static float rest_total_s;
-static float rest_last_enter_time;   /* uptime when last rest started */
+static float rest_last_enter_time; /* uptime when last rest started */
 static float rest_last_duration_s;
 static float uptime_s;
 static bool prev_rest_detected;
-
-static bool vqf_mag_enabled = true;
-static bool no_mag_heading_hold_active;
-static bool no_mag_heading_hold_target_valid;
-static float no_mag_heading_hold_rest_s;
-static float no_mag_heading_hold_unsteady_s;
-static float no_mag_heading_hold_target;
-static uint8_t no_mag_heading_hold_axis = 2;
-static vqf_real_t no_mag_heading_hold_frame[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
 /* Circular rest event log */
 #define REST_EVENT_LOG_SIZE 5
@@ -180,258 +155,40 @@ static struct {
 	float time_s;
 	bool entered;
 } rest_event_log[REST_EVENT_LOG_SIZE];
-static uint8_t rest_event_idx;  /* next write position */
+static uint8_t rest_event_idx;   /* next write position */
 static uint8_t rest_event_total; /* total events (up to log size) */
-
-
-static void vqf_reset_no_mag_heading_hold(void);
 
 void vqf_update_sensor_ids(int imu)
 {
-	imu_id = imu;
-}
-
-void vqf_set_mag_enabled(bool enabled)
-{
-	vqf_mag_enabled = enabled;
-	vqf_reset_no_mag_heading_hold();
-}
-
-void vqf_set_heading_hold_frame(const float correction_q[4])
-{
-	if (correction_q == NULL) {
-		no_mag_heading_hold_frame[0] = 1.0f;
-		no_mag_heading_hold_frame[1] = 0.0f;
-		no_mag_heading_hold_frame[2] = 0.0f;
-		no_mag_heading_hold_frame[3] = 0.0f;
-	} else {
-		for (int i = 0; i < 4; i++)
-			no_mag_heading_hold_frame[i] = correction_q[i];
-	}
-	vqf_reset_no_mag_heading_hold();
-}
-
-static float vqf_wrap_angle(float angle)
-{
-	while (angle > VQF_PI)
-		angle -= 2.0f * VQF_PI;
-	while (angle < -VQF_PI)
-		angle += 2.0f * VQF_PI;
-	return angle;
-}
-
-static void vqf_quat_multiply(const vqf_real_t a[4], const vqf_real_t b[4], vqf_real_t out[4])
-{
-	vqf_real_t w = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
-	vqf_real_t x = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
-	vqf_real_t y = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
-	vqf_real_t z = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
-	out[0] = w;
-	out[1] = x;
-	out[2] = y;
-	out[3] = z;
-}
-
-static void vqf_apply_heading_hold_frame(const vqf_real_t q[4], vqf_real_t out[4])
-{
-	vqf_quat_multiply(q, no_mag_heading_hold_frame, out);
-}
-
-static void vqf_quat_rotated_axis(const vqf_real_t q[4], uint8_t axis, float out[3])
-{
-	float w = q[0];
-	float x = q[1];
-	float y = q[2];
-	float z = q[3];
-
-	switch (axis) {
-	case 0:
-		out[0] = 1.0f - 2.0f * (y * y + z * z);
-		out[1] = 2.0f * (x * y + w * z);
-		out[2] = 2.0f * (x * z - w * y);
-		break;
-	case 1:
-		out[0] = 2.0f * (x * y - w * z);
-		out[1] = 1.0f - 2.0f * (x * x + z * z);
-		out[2] = 2.0f * (y * z + w * x);
-		break;
-	default:
-		out[0] = 2.0f * (x * z + w * y);
-		out[1] = 2.0f * (y * z - w * x);
-		out[2] = 1.0f - 2.0f * (x * x + y * y);
-		break;
-	}
-}
-
-static float vqf_heading_from_axis(const vqf_real_t q[4], uint8_t axis)
-{
-	float axis_world[3];
-	vqf_quat_rotated_axis(q, axis, axis_world);
-	return atan2f(axis_world[1], axis_world[0]);
-}
-
-static uint8_t vqf_select_heading_axis(const vqf_real_t q[4])
-{
-	uint8_t best_axis = 2;
-	float best_horizontal_sq = -1.0f;
-
-	for (uint8_t axis = 0; axis < 3; axis++) {
-		float axis_world[3];
-		vqf_quat_rotated_axis(q, axis, axis_world);
-		float horizontal_sq = axis_world[0] * axis_world[0] + axis_world[1] * axis_world[1];
-		if (horizontal_sq > best_horizontal_sq) {
-			best_horizontal_sq = horizontal_sq;
-			best_axis = axis;
-		}
-	}
-
-	return best_axis;
-}
-
-static float vqf_max_rest_deviation(void)
-{
-	vqf_real_t deviations[2];
-	getRelativeRestDeviations(&params, &state, deviations);
-	return fmaxf(deviations[0], deviations[1]);
-}
-
-static float vqf_rest_gyr_lp_norm(void)
-{
-	return sqrtf(
-		state.restLastGyrLp[0] * state.restLastGyrLp[0] +
-		state.restLastGyrLp[1] * state.restLastGyrLp[1] +
-		state.restLastGyrLp[2] * state.restLastGyrLp[2]);
-}
-
-static float vqf_accel_dt_from_timestamp(uint64_t timestamp_us)
-{
-	if (state.lastAccTsUs != 0 && timestamp_us > state.lastAccTsUs) {
-		uint64_t diff = timestamp_us - state.lastAccTsUs;
-		if (diff > 0 && diff <= 10000000ULL)
-			return (float)diff / 1e6f;
-	}
-	return coeffs.accTs;
-}
-
-static void vqf_reset_no_mag_heading_hold(void)
-{
-	no_mag_heading_hold_active = false;
-	no_mag_heading_hold_target_valid = false;
-	no_mag_heading_hold_rest_s = 0.0f;
-	no_mag_heading_hold_unsteady_s = 0.0f;
-	no_mag_heading_hold_target = 0.0f;
-	no_mag_heading_hold_axis = 2;
-}
-
-static void vqf_capture_no_mag_heading_hold_target(void)
-{
-	vqf_real_t quat[4];
-	vqf_real_t heading_quat[4];
-	getQuat9D(&state, quat);
-	vqf_apply_heading_hold_frame(quat, heading_quat);
-	no_mag_heading_hold_axis = vqf_select_heading_axis(heading_quat);
-	no_mag_heading_hold_target = vqf_heading_from_axis(heading_quat, no_mag_heading_hold_axis);
-	no_mag_heading_hold_target_valid = true;
-}
-
-static void vqf_update_no_mag_heading_hold(float dt)
-{
-	if (vqf_mag_enabled) {
-		vqf_reset_no_mag_heading_hold();
-		return;
-	}
-
-	float rest_dev = vqf_max_rest_deviation();
-	float rest_gyr_lp_norm = vqf_rest_gyr_lp_norm();
-	float enter_gyr_lp_norm = params.biasClip * DEG_TO_RAD * 0.5f;
-	float exit_gyr_lp_norm = params.biasClip * DEG_TO_RAD * 0.8f;
-
-	if (state.restDetected) {
-		vqf_reset_no_mag_heading_hold();
-		return;
-	}
-
-	bool near_static = rest_dev <= VQF_NO_MAG_HEADING_HOLD_ENTER_DEV
-		&& rest_gyr_lp_norm <= enter_gyr_lp_norm;
-	bool unsteady = rest_dev > VQF_NO_MAG_HEADING_HOLD_EXIT_DEV
-		|| rest_gyr_lp_norm > exit_gyr_lp_norm;
-	if (near_static) {
-		no_mag_heading_hold_rest_s += dt;
-		no_mag_heading_hold_unsteady_s = 0.0f;
-	} else if (!no_mag_heading_hold_active) {
-		no_mag_heading_hold_rest_s = 0.0f;
-		if (unsteady && no_mag_heading_hold_target_valid) {
-			no_mag_heading_hold_unsteady_s += dt;
-			if (no_mag_heading_hold_unsteady_s >= VQF_NO_MAG_HEADING_HOLD_RESET_S)
-				vqf_reset_no_mag_heading_hold();
-		} else {
-			no_mag_heading_hold_unsteady_s = 0.0f;
-		}
-	} else if (unsteady) {
-		no_mag_heading_hold_unsteady_s += dt;
-		if (no_mag_heading_hold_unsteady_s >= VQF_NO_MAG_HEADING_HOLD_RESET_S) {
-			vqf_reset_no_mag_heading_hold();
-			return;
-		}
-	} else {
-		no_mag_heading_hold_unsteady_s = 0.0f;
-	}
-
-	if (!no_mag_heading_hold_active) {
-		if (no_mag_heading_hold_rest_s < VQF_NO_MAG_HEADING_HOLD_ENTER_S)
-			return;
-
-		if (!no_mag_heading_hold_target_valid)
-			vqf_capture_no_mag_heading_hold_target();
-		no_mag_heading_hold_active = true;
-	}
-
-	if (unsteady)
-		return;
-
-	vqf_real_t quat9d[4];
-	vqf_real_t heading_quat[4];
-	getQuat9D(&state, quat9d);
-	vqf_apply_heading_hold_frame(quat9d, heading_quat);
-	float error = vqf_wrap_angle(
-		no_mag_heading_hold_target - vqf_heading_from_axis(heading_quat, no_mag_heading_hold_axis));
-	float abs_error = fabsf(error);
-
-	if (abs_error > VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD) {
-		float correction = error - copysignf(VQF_NO_MAG_HEADING_HOLD_DEADBAND_RAD, error);
-		float max_correction = VQF_NO_MAG_HEADING_HOLD_MAX_CORR_DPS * DEG_TO_RAD * dt;
-		if (fabsf(correction) > max_correction)
-			correction = copysignf(max_correction, correction);
-		state.delta = vqf_wrap_angle(state.delta + correction);
-	}
+	ARG_UNUSED(imu);
 }
 
 static void set_params()
 {
 	init_params(&params);
-	params.tauAcc = 4.3f;
-	params.biasClip = 2.0f;
-	params.biasForgettingTime = 427.0f;
-	params.biasSigmaInit = 1.10f;
-	params.biasSigmaMotion = 0.048f;
-	params.biasSigmaRest = 0.0153f;
+	params.tauAcc = 3.8f;
+	params.biasClip = 5.0f;
+	params.biasForgettingTime = 100.0f;
+	params.biasSigmaInit = 1.0f;
+	params.biasSigmaMotion = 0.28f;
+	params.biasSigmaRest = 0.05f;
 	params.biasVerticalForgettingFactor = 0.0001f;
 	params.motionBiasEstEnabled = true;
 	params.restBiasEstEnabled = true;
-	params.restFilterTau = 0.66f;
-	params.restMinT = 0.63f;
-	params.restThGyr = 0.68f;
-	params.restThAcc = 0.21f;
+	params.restFilterTau = 1.34f;
+	params.restMinT = 2.8f;
+	params.restThGyr = 0.8f;
+	params.restThAcc = 0.08f;
 	params.magDistRejectionEnabled = true;
-	params.tauMag = 6.0f;
+	params.tauMag = 9.0f;
 	params.magCurrentTau = 0.50f;
-	params.magNormTh = 0.08f;
-	params.magDipTh = 6.0f;
-	params.magRefTau = 15.0f;
-	params.magNewTime = 12.0f;
-	params.magNewFirstTime = 5.5f;
-	params.magNewMinGyr = 16.0f;
-	params.magMinUndisturbedTime = 0.6f;
+	params.magNormTh = 0.10f;
+	params.magDipTh = 4.0f;
+	params.magRefTau = 10.0f;
+	params.magNewTime = 3.0f;
+	params.magNewFirstTime = 3.0f;
+	params.magNewMinGyr = 20.0f;
+	params.magMinUndisturbedTime = 0.5f;
 	params.magMaxRejectionTime = 3200.0f;
 	params.magRejectionFactor = 1150.0f;
 }
@@ -439,6 +196,9 @@ static void set_params()
 void vqf_init(float g_time, float a_time, float m_time)
 {
 	set_params();
+	vqf_init_gyr_time = g_time;
+	vqf_init_acc_time = a_time;
+	vqf_init_mag_time = m_time;
 	initVqf(&params, &state, &coeffs, g_time, a_time, m_time);
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 	motion_intensity = 0.0f;
@@ -454,16 +214,80 @@ void vqf_init(float g_time, float a_time, float m_time)
 	prev_rest_detected = false;
 	rest_event_idx = 0;
 	rest_event_total = 0;
-	vqf_reset_no_mag_heading_hold();
+}
+
+/* Finite test by exponent bits (all ones = NaN/±inf). The ARM isfinite()
+ * builtin compiles to vcmp+bhi, which lets NaN through (an unordered
+ * compare never sets the branch condition) — test the bit pattern. */
+static ALWAYS_INLINE bool vqf_float_finite(float x)
+{
+	uint32_t bits;
+	memcpy(&bits, &x, sizeof(bits));
+	return (bits & 0x7F800000u) != 0x7F800000u;
+}
+
+static ALWAYS_INLINE bool vqf_vec3_finite(const float v[3])
+{
+	return vqf_float_finite(v[0]) && vqf_float_finite(v[1]) && vqf_float_finite(v[2]);
+}
+
+static bool vqf_loaded_state_valid(void)
+{
+	/* Reject NaN/inf retained state: it propagates permanently (clip()
+	 * and the Kalman update carry NaN). LP filter *states* are excluded:
+	 * they legitimately hold NaN markers during initialization. */
+	for (size_t i = 0; i < 3; i++) {
+		if (!vqf_float_finite(state.bias[i]) || !vqf_float_finite(state.restLastGyrLp[i])
+		    || !vqf_float_finite(state.restLastAccLp[i]) || !vqf_float_finite(state.lastAccLp[i])) {
+			return false;
+		}
+	}
+	for (size_t i = 0; i < 4; i++) {
+		if (!vqf_float_finite(state.gyrQuat[i]) || !vqf_float_finite(state.accQuat[i])) {
+			return false;
+		}
+	}
+	for (size_t i = 0; i < 9; i++) {
+		if (!vqf_float_finite(state.biasP[i])) {
+			return false;
+		}
+	}
+	return vqf_float_finite(coeffs.gyrTs) && coeffs.gyrTs > 0.0f
+	       && vqf_float_finite(coeffs.accTs) && coeffs.accTs > 0.0f
+	       && vqf_float_finite(coeffs.magTs);
+}
+
+/* Prefer the period recorded by vqf_init(); fall back to the loaded coeffs,
+ * then a fixed 100 Hz default so a corrupt block can't give zero-time filters. */
+static float vqf_safe_init_time(float saved_time, float loaded_time)
+{
+	if (vqf_float_finite(saved_time) && saved_time > 0.0f) {
+		return saved_time;
+	}
+	if (vqf_float_finite(loaded_time) && loaded_time > 0.0f) {
+		return loaded_time;
+	}
+	return 0.01f;
 }
 
 void vqf_load(const void *data)
 {
-	BUILD_ASSERT(VQF_MEM_SIZE <= sizeof(((struct retained_data *)0)->fusion_data),
-		     "VQF state+coeffs exceeds fusion_data buffer in retained memory");
+	BUILD_ASSERT(
+		VQF_MEM_SIZE <= sizeof(((struct retained_data *)0)->fusion_data),
+		"VQF state+coeffs exceeds fusion_data buffer in retained memory"
+	);
 	set_params();
 	memcpy(&state, data, sizeof(state));
 	memcpy(&coeffs, (uint8_t *)data + sizeof(state), sizeof(coeffs));
+	if (!vqf_loaded_state_valid()) {
+		printk("VQF: rejecting non-finite retained state, reinitializing\n");
+		vqf_init(
+			vqf_safe_init_time(vqf_init_gyr_time, coeffs.gyrTs),
+			vqf_safe_init_time(vqf_init_acc_time, coeffs.accTs),
+			vqf_safe_init_time(vqf_init_mag_time, coeffs.magTs)
+		);
+		return;
+	}
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 	motion_intensity = 0.0f;
 	current_tau_level = -1.0f;
@@ -478,13 +302,14 @@ void vqf_load(const void *data)
 	prev_rest_detected = false;
 	rest_event_idx = 0;
 	rest_event_total = 0;
-	vqf_reset_no_mag_heading_hold();
 }
 
 void vqf_save(void *data)
 {
-	BUILD_ASSERT(VQF_MEM_SIZE <= sizeof(((struct retained_data *)0)->fusion_data),
-		     "VQF state+coeffs exceeds fusion_data buffer in retained memory");
+	BUILD_ASSERT(
+		VQF_MEM_SIZE <= sizeof(((struct retained_data *)0)->fusion_data),
+		"VQF state+coeffs exceeds fusion_data buffer in retained memory"
+	);
 	memcpy(data, &state, sizeof(state));
 	memcpy((uint8_t *)data + sizeof(state), &coeffs, sizeof(coeffs));
 }
@@ -492,19 +317,16 @@ void vqf_save(void *data)
 void vqf_update_gyro(float *g, float time)
 {
 	ARG_UNUSED(time);
+	if (!vqf_vec3_finite(g)) {
+		return;
+	}
 	float g_rad[3] = {0};
 	// g is in deg/s, convert to rad/s
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 3; i++) {
 		g_rad[i] = g[i] * DEG_TO_RAD;
+	}
+	/* Fixed coeffs->gyrTs path (caller-dt / lastGyrTsUs synth disabled for A/B). */
 	updateGyr(&params, &state, &coeffs, g_rad);
-}
-
-void vqf_update_gyro_ts(float *g, uint64_t timestamp_us)
-{
-	float g_rad[3] = {0};
-	for (int i = 0; i < 3; i++)
-		g_rad[i] = g[i] * DEG_TO_RAD;
-	updateGyrTs(&params, &state, &coeffs, g_rad, timestamp_us);
 }
 
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
@@ -519,9 +341,7 @@ void vqf_update_gyro_ts(float *g, uint64_t timestamp_us)
 static void vqf_pre_accel_update(const float a_m_s2[3])
 {
 	/* --- Adaptive tauAcc based on motion intensity --- */
-	float a_norm = sqrtf(a_m_s2[0] * a_m_s2[0] +
-			     a_m_s2[1] * a_m_s2[1] +
-			     a_m_s2[2] * a_m_s2[2]);
+	float a_norm = sqrtf(a_m_s2[0] * a_m_s2[0] + a_m_s2[1] * a_m_s2[1] + a_m_s2[2] * a_m_s2[2]);
 	float a_dev = fabsf(a_norm - CONST_EARTH_GRAVITY);
 	float alpha_inst = fminf(a_dev / ADAPTIVE_ACC_DEV_TH, 1.0f);
 
@@ -544,9 +364,8 @@ static void vqf_pre_accel_update(const float a_m_s2[3])
 	if (state.restDetected) {
 		target_tau = ADAPTIVE_TAU_ACC_REST;
 	} else {
-		target_tau = ADAPTIVE_TAU_ACC_GENTLE +
-			     (ADAPTIVE_TAU_ACC_AGGRESSIVE - ADAPTIVE_TAU_ACC_GENTLE) *
-				     motion_intensity;
+		target_tau
+			= ADAPTIVE_TAU_ACC_GENTLE + (ADAPTIVE_TAU_ACC_AGGRESSIVE - ADAPTIVE_TAU_ACC_GENTLE) * motion_intensity;
 	}
 
 	/*
@@ -555,23 +374,19 @@ static void vqf_pre_accel_update(const float a_m_s2[3])
 	 * sudden acc correction gain change.  Increase (motion→rest) is fast
 	 * so the filter settles quickly at rest.
 	 */
-	float tau_alpha = (target_tau < smoothed_tau) ? TAU_SMOOTH_ALPHA_DOWN
-						      : TAU_SMOOTH_ALPHA_UP;
+	float tau_alpha = (target_tau < smoothed_tau) ? TAU_SMOOTH_ALPHA_DOWN : TAU_SMOOTH_ALPHA_UP;
 	smoothed_tau += tau_alpha * (target_tau - smoothed_tau);
 
 	/*
 	 * Quantize target_tau directly to avoid unnecessary setTauAcc() calls.
 	 * The step size is derived from the full possible range of tauAcc values.
 	 */
-	float tau_min = fminf(fminf(ADAPTIVE_TAU_ACC_REST, ADAPTIVE_TAU_ACC_GENTLE),
-			      ADAPTIVE_TAU_ACC_AGGRESSIVE);
-	float tau_max = fmaxf(fmaxf(ADAPTIVE_TAU_ACC_REST, ADAPTIVE_TAU_ACC_GENTLE),
-			      ADAPTIVE_TAU_ACC_AGGRESSIVE);
+	float tau_min = fminf(fminf(ADAPTIVE_TAU_ACC_REST, ADAPTIVE_TAU_ACC_GENTLE), ADAPTIVE_TAU_ACC_AGGRESSIVE);
+	float tau_max = fmaxf(fmaxf(ADAPTIVE_TAU_ACC_REST, ADAPTIVE_TAU_ACC_GENTLE), ADAPTIVE_TAU_ACC_AGGRESSIVE);
 	float tau_step = (tau_max - tau_min) / ADAPTIVE_TAU_ACC_LEVELS;
 	float quantized_tau;
 	if (tau_step > 0.001f) {
-		quantized_tau = tau_min +
-				roundf((smoothed_tau - tau_min) / tau_step) * tau_step;
+		quantized_tau = tau_min + roundf((smoothed_tau - tau_min) / tau_step) * tau_step;
 		quantized_tau = fmaxf(tau_min, fminf(quantized_tau, tau_max));
 	} else {
 		quantized_tau = smoothed_tau;
@@ -588,8 +403,9 @@ static void vqf_pre_accel_update(const float a_m_s2[3])
  * @brief Track rest detection transitions and accumulate diagnostics.
  * Called after each accelerometer update (which runs rest detection).
  */
-static void vqf_track_rest_diag(float dt)
+static void vqf_track_rest_diag(void)
 {
+	float dt = coeffs.accTs;
 	uptime_s += dt;
 
 	bool cur = state.restDetected;
@@ -600,8 +416,9 @@ static void vqf_track_rest_diag(float dt)
 		rest_event_log[rest_event_idx].time_s = uptime_s;
 		rest_event_log[rest_event_idx].entered = true;
 		rest_event_idx = (rest_event_idx + 1) % REST_EVENT_LOG_SIZE;
-		if (rest_event_total < REST_EVENT_LOG_SIZE)
+		if (rest_event_total < REST_EVENT_LOG_SIZE) {
 			rest_event_total++;
+		}
 	} else if (!cur && prev_rest_detected) {
 		/* leaving rest */
 		rest_exit_count++;
@@ -609,8 +426,9 @@ static void vqf_track_rest_diag(float dt)
 		rest_event_log[rest_event_idx].time_s = uptime_s;
 		rest_event_log[rest_event_idx].entered = false;
 		rest_event_idx = (rest_event_idx + 1) % REST_EVENT_LOG_SIZE;
-		if (rest_event_total < REST_EVENT_LOG_SIZE)
+		if (rest_event_total < REST_EVENT_LOG_SIZE) {
 			rest_event_total++;
+		}
 	}
 	if (cur) {
 		rest_total_s += dt;
@@ -621,38 +439,30 @@ static void vqf_track_rest_diag(float dt)
 void vqf_update_accel(float *a, float time)
 {
 	ARG_UNUSED(time);
+	if (!vqf_vec3_finite(a)) {
+		return;
+	}
 	float a_m_s2[3] = {0};
 	// a is in g, convert to m/s^2
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 3; i++) {
 		a_m_s2[i] = a[i] * CONST_EARTH_GRAVITY;
-	if (a_m_s2[0] != 0 || a_m_s2[1] != 0 || a_m_s2[2] != 0)
+	}
+	if (a_m_s2[0] != 0 || a_m_s2[1] != 0 || a_m_s2[2] != 0) {
 		memcpy(last_a, a_m_s2, sizeof(a_m_s2));
+	}
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 	vqf_pre_accel_update(a_m_s2);
 #endif
+	/* Fixed coeffs->accTs path (caller-dt / lastAccTsUs synth disabled for A/B). */
 	updateAcc(&params, &state, &coeffs, a_m_s2);
-	vqf_update_no_mag_heading_hold(coeffs.accTs);
-	vqf_track_rest_diag(coeffs.accTs);
-}
-
-void vqf_update_accel_ts(float *a, uint64_t timestamp_us)
-{
-	float dt = vqf_accel_dt_from_timestamp(timestamp_us);
-	float a_m_s2[3] = {0};
-	for (int i = 0; i < 3; i++)
-		a_m_s2[i] = a[i] * CONST_EARTH_GRAVITY;
-	if (a_m_s2[0] != 0 || a_m_s2[1] != 0 || a_m_s2[2] != 0)
-		memcpy(last_a, a_m_s2, sizeof(a_m_s2));
-#if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
-	vqf_pre_accel_update(a_m_s2);
-#endif
-	updateAccTs(&params, &state, &coeffs, a_m_s2, timestamp_us);
-	vqf_update_no_mag_heading_hold(dt);
-	vqf_track_rest_diag(dt);
+	vqf_track_rest_diag();
 }
 
 void vqf_update_mag(float *m, float time)
 {
+	if (!vqf_vec3_finite(m)) {
+		return;
+	}
 	// Use the caller-supplied time step when valid so that VQF time accumulators
 	// (magCandidateT, magRejectT, etc.) and gain k run at the correct real-time
 	// rate even when the sensor loop runs faster or slower than the mag ODR.
@@ -662,25 +472,22 @@ void vqf_update_mag(float *m, float time)
 	// updateMag_internal directly).
 	if (time > 0.0f && time < 10.0f) {
 		uint64_t synth_ts = state.lastMagTsUs + (uint64_t)(time * 1e6f);
-		if (synth_ts == 0)
+		if (synth_ts == 0) {
 			synth_ts = 1; // avoid the "uninitialized" sentinel value
+		}
 		updateMagTs(&params, &state, &coeffs, m, synth_ts);
 	} else {
 		updateMag(&params, &state, &coeffs, m);
 	}
 }
 
-void vqf_update_mag_ts(float *m, uint64_t timestamp_us)
-{
-	updateMagTs(&params, &state, &coeffs, m, timestamp_us);
-}
-
 void vqf_update(float *g, float *a, float *m, float time)
 {
 	// TODO: time unused?
 	// TODO: gyro is a different rate to the others, should they be separated
-	if (g[0] != 0 || g[1] != 0 || g[2] != 0) // ignore zeroed gyro
+	if (g[0] != 0 || g[1] != 0 || g[2] != 0) { // ignore zeroed gyro
 		vqf_update_gyro(g, time);
+	}
 	vqf_update_accel(a, time);
 	vqf_update_mag(m, time);
 }
@@ -689,23 +496,24 @@ void vqf_get_gyro_bias(float *g_off)
 {
 	getBiasEstimate(&state, &coeffs, g_off);
 	// VQF internal unit is rad/s, fusion interface expects deg/s
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 3; i++) {
 		g_off[i] *= RAD_TO_DEG;
+	}
 }
 
 void vqf_set_gyro_bias(float *g_off)
 {
 	float g_off_rad[3];
 	// fusion interface receives values in deg/s, VQF requires rad/s
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 3; i++) {
 		g_off_rad[i] = g_off[i] * DEG_TO_RAD;
+	}
 	setBiasEstimate(&state, g_off_rad, -1);
 }
 
 void vqf_update_gyro_sanity(float *g, float *m)
 {
 	// TODO: does vqf tell us a "recovery state"
-	return;
 }
 
 int vqf_get_gyro_sanity(void)
@@ -724,10 +532,11 @@ void vqf_get_lin_a(float *lin_a)
 	vec_gravity[1] = 2.0f * (q[2] * q[3] + q[0] * q[1]);
 	vec_gravity[2] = 2.0f * (q[0] * q[0] - 0.5f + q[3] * q[3]);
 
-//	float *a = state.lastAccLp; // not usable, rotated by inertial frame
+	//	float *a = state.lastAccLp; // not usable, rotated by inertial frame
 	float *a = last_a;
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 3; i++) {
 		lin_a[i] = a[i] - vec_gravity[i] * CONST_EARTH_GRAVITY; // gravity vector to m/s^2 before subtracting
+	}
 }
 
 void vqf_get_quat(float *q)
@@ -745,14 +554,28 @@ bool vqf_get_mag_dist_detected(void)
 	return getMagDistDetected(&state);
 }
 
-void vqf_reset_mag_ref(void)
-{
-	setMagRef(&state, 0, 0);
-}
-
-void vqf_set_mag_ref(float norm, float dip)
+static void vqf_rebase_mag(float norm, float dip)
 {
 	setMagRef(&state, norm, dip);
+	state.magDistDetected = true;
+	state.magUndisturbedT = 0.0f;
+	state.magRejectT = 0.0f;
+	state.magCandidateNorm = -1.0f;
+	state.magCandidateDip = 0.0f;
+	state.magCandidateT = 0.0f;
+	state.magNormDip[0] = state.magNormDip[1] = 0.0f;
+	for (unsigned i = 0; i < 4; i++) {
+		state.magNormDipLpState[i] = NAN;
+	}
+	state.kMagInit = 0.0f;
+	state.lastMagDisAngle = 0.0f;
+	state.lastMagCorrAngularRate = 0.0f;
+	state.lastMagTsUs = 0;
+}
+
+static void vqf_get_quat6(float *q)
+{
+	getQuat6D(&state, q);
 }
 
 float vqf_get_mag_ref_norm(void)
@@ -783,7 +606,9 @@ void vqf_get_relative_rest_deviations(float *out)
 
 void vqf_get_debug_info(vqf_debug_info_t *info)
 {
-	if (!info) return;
+	if (!info) {
+		return;
+	}
 
 	info->rest_detected = getRestDetected(&state);
 	getRelativeRestDeviations(&params, &state, info->rest_deviations);
@@ -853,10 +678,11 @@ void vqf_get_debug_info(vqf_debug_info_t *info)
 	info->rest_event_count = rest_event_total;
 	for (uint8_t i = 0; i < REST_EVENT_LOG_SIZE; i++) {
 		uint8_t src;
-		if (rest_event_total >= REST_EVENT_LOG_SIZE)
+		if (rest_event_total >= REST_EVENT_LOG_SIZE) {
 			src = (rest_event_idx + i) % REST_EVENT_LOG_SIZE;
-		else
+		} else {
 			src = i;
+		}
 		info->rest_events[i].time_s = rest_event_log[src].time_s;
 		info->rest_events[i].entered = rest_event_log[src].entered;
 	}
@@ -909,8 +735,7 @@ static ALWAYS_INLINE uint32_t vqf_bench_timer_hz(void)
 #endif
 }
 
-static void vqf_bench_print_stats(const char *name, uint32_t iterations, uint32_t total_cycles,
-				  uint32_t timer_hz)
+static void vqf_bench_print_stats(const char *name, uint32_t iterations, uint32_t total_cycles, uint32_t timer_hz)
 {
 	uint32_t avg_cycles_int = 0;
 	uint32_t avg_cycles_frac = 0;
@@ -951,7 +776,6 @@ static void vqf_bench_print_stats(const char *name, uint32_t iterations, uint32_
 }
 
 #define VQF_BENCH_BATCH_SIZE 16U
-#define VQF_BENCH_THREAD_PRIO 8
 
 typedef enum {
 	VQF_BENCH_UPDATE_GYR,
@@ -960,12 +784,18 @@ typedef enum {
 	VQF_BENCH_GET_QUAT9D,
 } vqf_bench_op_t;
 
-static uint32_t vqf_bench_measure(vqf_bench_op_t op, uint32_t iterations,
-				  const vqf_real_t gyr_samples[][3],
-				  const vqf_real_t acc_samples[][3],
-				  const vqf_real_t mag_samples[][3], size_t sample_count,
-				  vqf_params_t *bench_params, vqf_state_t *bench_state,
-				  vqf_coeffs_t *bench_coeffs, float quat[4])
+static uint32_t vqf_bench_measure(
+	vqf_bench_op_t op,
+	uint32_t iterations,
+	const vqf_real_t gyr_samples[][3],
+	const vqf_real_t acc_samples[][3],
+	const vqf_real_t mag_samples[][3],
+	size_t sample_count,
+	vqf_params_t *bench_params,
+	vqf_state_t *bench_state,
+	vqf_coeffs_t *bench_coeffs,
+	float quat[4]
+)
 {
 	uint32_t total_cycles = 0;
 	uint32_t remaining = iterations;
@@ -1016,8 +846,8 @@ void vqf_run_benchmark(uint32_t iterations)
 		iterations = 1000;
 	}
 
-	if (bench_thread_prio < VQF_BENCH_THREAD_PRIO) {
-		k_thread_priority_set(bench_thread, VQF_BENCH_THREAD_PRIO);
+	if (bench_thread_prio < VQF_BENCH_THREAD_PRIORITY) {
+		k_thread_priority_set(bench_thread, VQF_BENCH_THREAD_PRIORITY);
 		bench_prio_changed = true;
 	}
 
@@ -1040,54 +870,88 @@ void vqf_run_benchmark(uint32_t iterations)
 	vqf_bench_timer_prepare();
 	timer_hz = vqf_bench_timer_hz();
 
-	printk("VQF benchmark (%u iterations, CMSIS-DSP=%s, timer=%s)\n", iterations,
-	#ifdef CONFIG_CMSIS_DSP
-			"on"
-	#else
-			"off"
-	#endif
-			,
-	#if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
-			"DWT CYCCNT"
-	#else
-			"system timer"
-	#endif
-		);
+	printk(
+		"VQF benchmark (%u iterations, CMSIS-DSP=%s, timer=%s)\n",
+		iterations,
+#ifdef CONFIG_CMSIS_DSP
+		"on"
+#else
+		"off"
+#endif
+		,
+#if defined(CONFIG_CPU_CORTEX_M_HAS_DWT)
+		"DWT CYCCNT"
+#else
+		"system timer"
+#endif
+	);
 
 	vqf_bench_params = vqf_bench_warm_params;
 	vqf_bench_state = vqf_bench_warm_state;
 	vqf_bench_coeffs = vqf_bench_warm_coeffs;
-	elapsed_cycles = vqf_bench_measure(VQF_BENCH_UPDATE_GYR, iterations, vqf_bench_gyr_samples,
-				       vqf_bench_acc_samples, vqf_bench_mag_samples,
-				       vqf_bench_sample_count, &vqf_bench_params,
-				       &vqf_bench_state, &vqf_bench_coeffs, vqf_bench_quat);
+	elapsed_cycles = vqf_bench_measure(
+		VQF_BENCH_UPDATE_GYR,
+		iterations,
+		vqf_bench_gyr_samples,
+		vqf_bench_acc_samples,
+		vqf_bench_mag_samples,
+		vqf_bench_sample_count,
+		&vqf_bench_params,
+		&vqf_bench_state,
+		&vqf_bench_coeffs,
+		vqf_bench_quat
+	);
 	vqf_bench_print_stats("updateGyr", iterations, elapsed_cycles, timer_hz);
 
 	vqf_bench_params = vqf_bench_warm_params;
 	vqf_bench_state = vqf_bench_warm_state;
 	vqf_bench_coeffs = vqf_bench_warm_coeffs;
-	elapsed_cycles = vqf_bench_measure(VQF_BENCH_UPDATE_ACC, iterations, vqf_bench_gyr_samples,
-				       vqf_bench_acc_samples, vqf_bench_mag_samples,
-				       vqf_bench_sample_count, &vqf_bench_params,
-				       &vqf_bench_state, &vqf_bench_coeffs, vqf_bench_quat);
+	elapsed_cycles = vqf_bench_measure(
+		VQF_BENCH_UPDATE_ACC,
+		iterations,
+		vqf_bench_gyr_samples,
+		vqf_bench_acc_samples,
+		vqf_bench_mag_samples,
+		vqf_bench_sample_count,
+		&vqf_bench_params,
+		&vqf_bench_state,
+		&vqf_bench_coeffs,
+		vqf_bench_quat
+	);
 	vqf_bench_print_stats("updateAcc", iterations, elapsed_cycles, timer_hz);
 
 	vqf_bench_params = vqf_bench_warm_params;
 	vqf_bench_state = vqf_bench_warm_state;
 	vqf_bench_coeffs = vqf_bench_warm_coeffs;
-	elapsed_cycles = vqf_bench_measure(VQF_BENCH_UPDATE_MAG, iterations, vqf_bench_gyr_samples,
-				       vqf_bench_acc_samples, vqf_bench_mag_samples,
-				       vqf_bench_sample_count, &vqf_bench_params,
-				       &vqf_bench_state, &vqf_bench_coeffs, vqf_bench_quat);
+	elapsed_cycles = vqf_bench_measure(
+		VQF_BENCH_UPDATE_MAG,
+		iterations,
+		vqf_bench_gyr_samples,
+		vqf_bench_acc_samples,
+		vqf_bench_mag_samples,
+		vqf_bench_sample_count,
+		&vqf_bench_params,
+		&vqf_bench_state,
+		&vqf_bench_coeffs,
+		vqf_bench_quat
+	);
 	vqf_bench_print_stats("updateMag", iterations, elapsed_cycles, timer_hz);
 
 	vqf_bench_params = vqf_bench_warm_params;
 	vqf_bench_state = vqf_bench_warm_state;
 	vqf_bench_coeffs = vqf_bench_warm_coeffs;
-	elapsed_cycles = vqf_bench_measure(VQF_BENCH_GET_QUAT9D, iterations, vqf_bench_gyr_samples,
-				       vqf_bench_acc_samples, vqf_bench_mag_samples,
-				       vqf_bench_sample_count, &vqf_bench_params,
-				       &vqf_bench_state, &vqf_bench_coeffs, vqf_bench_quat);
+	elapsed_cycles = vqf_bench_measure(
+		VQF_BENCH_GET_QUAT9D,
+		iterations,
+		vqf_bench_gyr_samples,
+		vqf_bench_acc_samples,
+		vqf_bench_mag_samples,
+		vqf_bench_sample_count,
+		&vqf_bench_params,
+		&vqf_bench_state,
+		&vqf_bench_coeffs,
+		vqf_bench_quat
+	);
 	vqf_bench_print_stats("getQuat9D", iterations, elapsed_cycles, timer_hz);
 
 	printk("  checksum: %.6f\n", (double)vqf_bench_sink);
@@ -1099,21 +963,28 @@ void vqf_run_benchmark(uint32_t iterations)
 #endif
 
 const sensor_fusion_t sensor_fusion_vqf = {
-	vqf_init,
-	vqf_load,
-	vqf_save,
+	.init = vqf_init,
+	.load = vqf_load,
+	.save = vqf_save,
 
-	vqf_update_gyro,
-	vqf_update_accel,
-	vqf_update_mag,
-	vqf_update,
+	.update_gyro = vqf_update_gyro,
+	.update_accel = vqf_update_accel,
+	.update_mag = vqf_update_mag,
+	.update = vqf_update,
 
-	vqf_get_gyro_bias,
-	vqf_set_gyro_bias,
+	.get_gyro_bias = vqf_get_gyro_bias,
+	.set_gyro_bias = vqf_set_gyro_bias,
 
-	vqf_update_gyro_sanity,
-	vqf_get_gyro_sanity,
+	.update_gyro_sanity = vqf_update_gyro_sanity,
+	.get_gyro_sanity = vqf_get_gyro_sanity,
 
-	vqf_get_lin_a,
-	vqf_get_quat
+	.get_lin_a = vqf_get_lin_a,
+	.get_quat = vqf_get_quat,
+
+	.get_rest_detected = vqf_get_rest_detected,
+	.get_relative_rest_deviations = vqf_get_relative_rest_deviations,
+	.get_mag_dist_detected = vqf_get_mag_dist_detected,
+	.get_quat6 = vqf_get_quat6,
+	.rebase_mag = vqf_rebase_mag,
+	.get_mag_ref = vqf_get_mag_ref,
 };

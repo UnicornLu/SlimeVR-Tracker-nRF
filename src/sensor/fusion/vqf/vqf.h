@@ -28,8 +28,6 @@
 #include "sensor/sensor.h"
 
 void vqf_update_sensor_ids(int imu);
-void vqf_set_mag_enabled(bool enabled);
-void vqf_set_heading_hold_frame(const float correction_q[4]);
 
 void vqf_init(float g_time, float a_time, float m_time);
 void vqf_load(const void *data);
@@ -39,10 +37,6 @@ void vqf_update_gyro(float *g, float time);
 void vqf_update_accel(float *a, float time);
 void vqf_update_mag(float *m, float time);
 void vqf_update(float *g, float *a, float *m, float time);
-
-void vqf_update_gyro_ts(float *g, uint64_t timestamp_us);
-void vqf_update_accel_ts(float *a, uint64_t timestamp_us);
-void vqf_update_mag_ts(float *m, uint64_t timestamp_us);
 
 void vqf_get_gyro_bias(float *g_off);
 void vqf_set_gyro_bias(float *g_off);
@@ -55,8 +49,6 @@ void vqf_get_quat(float *q);
 
 bool vqf_get_rest_detected(void);
 bool vqf_get_mag_dist_detected(void);
-void vqf_reset_mag_ref(void);
-void vqf_set_mag_ref(float norm, float dip);
 float vqf_get_mag_ref_norm(void);
 void vqf_get_mag_ref(float *norm, float *dip);
 float vqf_get_delta(void);

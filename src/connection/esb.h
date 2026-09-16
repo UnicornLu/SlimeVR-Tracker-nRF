@@ -24,20 +24,43 @@
 #define SLIMENRF_ESB
 
 #include <esb.h>
-#include <nrfx_timer.h>
 
-// TODO: timer?
 #define LAST_RESET_LIMIT 10
 extern uint8_t last_reset;
-// TODO: move to esb/timer
-// extern const nrfx_timer_t m_timer;
 extern bool esb_state;
-extern bool timer_state;
 
-// TODO: esb/sensor?
 extern uint16_t led_clock;
 extern uint32_t led_clock_offset;
 
+/* ---------------------------------------------------------------------------
+ * RF channel storage encoding (retained/NVS byte).
+ *
+ * User-facing channel is 0-100. Stored byte encodes:
+ *   0xFF        -> default channel (CONFIG_RADIO_RF_CHANNEL)
+ *   0           -> invalid/uninitialized (legacy data) -> default
+ *   128         -> channel 0
+ *   1..100      -> channel value
+ *
+ * Keeps 0 unambiguous as "no setting" so upgrading old devices can never
+ * accidentally land on channel 0. */
+#define ESB_RF_CHANNEL_DEFAULT 0xFF
+#define ESB_RF_CHANNEL_ZERO_ENC 128
+
+static inline uint8_t esb_rf_channel_encode(uint8_t channel)
+{
+	return channel == 0 ? ESB_RF_CHANNEL_ZERO_ENC : channel;
+}
+
+static inline uint8_t esb_rf_channel_decode(uint8_t stored)
+{
+	if (stored == ESB_RF_CHANNEL_ZERO_ENC) {
+		return 0; /* channel 0 */
+	}
+	if (stored == ESB_RF_CHANNEL_DEFAULT || stored == 0 || stored > 100) {
+		return ESB_RF_CHANNEL_DEFAULT; /* default (incl. legacy/invalid) */
+	}
+	return stored;
+}
 void esb_write_ack(uint8_t type);
 void event_handler(struct esb_evt const *event);
 int clocks_start(void);
@@ -46,6 +69,8 @@ void clocks_request_start(uint32_t delay_us);
 void clocks_request_stop(uint32_t delay_us);
 int esb_initialize(bool);
 void esb_deinitialize(void);
+/* Quiesce TX then re-init PTX (channel/NVS already applied in esb_initialize). */
+int esb_reinitialize(void);
 
 void esb_set_addr_discovery(void);
 void esb_set_addr_paired(void);
@@ -57,7 +82,10 @@ void esb_reset_pair(void);
 void esb_clear_pair(void);
 
 void esb_process_ota_rx_queue(void);
-void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give packets some names
+int esb_write(uint8_t *data, bool no_ack, size_t data_length);
+/* Start the clock before guarded admission; -EAGAIN defers with HFXO warm.
+ * force_resync bypasses admission for unslotted startup recovery. */
+int esb_write_ping(uint8_t *data, bool force_resync);
 
 #define PING_INTERVAL_MS 997
 // Ping/Pong types for ACK payload validation
@@ -109,19 +137,31 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 #define ESB_PONG_FLAG_DATA_COLLECT_ON 0x22  // Start raw data collection
 #define ESB_PONG_FLAG_DATA_COLLECT_OFF 0x23 // Stop raw data collection
 #define ESB_PONG_FLAG_SENS_AUTO 0x24        // Auto-calibrate gyro sensitivity
+#define ESB_PONG_FLAG_MAG_AUTO_ON 0x25      // Enable online magnetometer calibration
+#define ESB_PONG_FLAG_MAG_AUTO_OFF 0x26     // Disable online magnetometer calibration
 #define ESB_PONG_FLAG_OTA_QUERY_INFO 0x30   // Request firmware info for ESB OTA
 #define ESB_PONG_FLAG_OTA_ABORT 0x31        // Abort ESB OTA update
 #define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
 #define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON 0x34  // Start batch raw data collection (data[8] = target Hz, 0 = accel ODR)
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF 0x35 // Stop batch raw data collection
+#define ESB_PONG_FLAG_DATA_COLLECT_METADATA 0x36 // Request metadata/calibration mask/chunk; token bytes 10-11
 
 // Raw data collection packet types
-#define ESB_RAW_IMU_TYPE    0x10  // Raw IMU data (float, with piggybacked mag)
-#define ESB_RAW_MAG_TYPE    0x11  // Raw magnetometer data (float, reserved)
-#define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
-#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (52 bytes, packet-loss resistant)
+// DEPRECATED on tracker: ESB_RAW_IMU/MAG unused; live TX is ESB_RAW_IMU_QUAT_TYPE.
+// Kept for wire-format docs / receiver + analyzer compatibility.
+#define ESB_RAW_IMU_TYPE    0x10  // DEPRECATED: legacy raw IMU (float)
+#define ESB_RAW_MAG_TYPE    0x11  // DEPRECATED: reserved raw mag
+// Metadata (ODR, range, sensor IDs): captured once per collection session,
+// sent at session start, and replayed on explicit requests.
+#define ESB_RAW_META_TYPE   0x12
+#define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (packet-loss resistant)
 #define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
 
-// ESB_RAW_CAL_TYPE sub-types (byte[2] of 0x14 packet)
+// ACK payload marker for raw-data ARQ retransmit requests (receiver → tracker)
+#define RAW_ARQ_MARKER 0xAA
+
+// ESB_RAW_CAL_TYPE sub-types (byte[2])
 #define RAW_CAL_SUB_ACCEL   0x01  // Accel calibration: accBAinv[4][3] (48 bytes)
 #define RAW_CAL_SUB_MAG     0x02  // Mag calibration: magBAinv[4][3] (48 bytes)
 #define RAW_CAL_SUB_GYRO    0x03  // Gyro cal: gyroBias[3] + gyroSensScale[3] (24 bytes)
@@ -139,6 +179,7 @@ void esb_write(uint8_t *data, bool no_ack, size_t data_length); // TODO: give pa
 bool esb_ready(void);
 
 // Get remote command flag to echo back in PING
+void esb_get_ping_request_data(uint8_t out[4]);
 uint8_t esb_get_ping_ack_flag(void);
 
 // Additional delay applied to the base ping interval after repeated failures.

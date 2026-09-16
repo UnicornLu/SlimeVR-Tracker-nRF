@@ -5,11 +5,13 @@
  */
 
 #include <zephyr/kernel.h>
+#include "watchdog.h"
+#include "system/system.h"
 
+#include <hal/nrf_power.h>
 /* Only compile when Task WDT is enabled */
 #if defined(CONFIG_TASK_WDT)
 
-#include "watchdog.h"
 #include "globals.h"
 #include <zephyr/task_wdt/task_wdt.h>
 #include <zephyr/drivers/watchdog.h>
@@ -17,12 +19,24 @@
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/reboot.h>
-#include <hal/nrf_power.h>
 
 LOG_MODULE_REGISTER(watchdog, LOG_LEVEL_INF);
 
-/* Adafruit bootloader DFU magic number (DFU_MAGIC_UF2_RESET) */
-#define ADAFRUIT_DFU_MAGIC ADAFRUIT_DFU_MAGIC_UF2_RESET
+/* Give the hardware WDT fallback its full window before forcing a cold reboot.
+ * If the hardware fallback was never actually started, this is what recovers
+ * the device instead of freezing forever in the timeout callback. */
+#ifdef CONFIG_TASK_WDT_HW_FALLBACK
+#define WATCHDOG_SOFT_REBOOT_MS \
+	(CONFIG_TASK_WDT_MIN_TIMEOUT + CONFIG_TASK_WDT_HW_FALLBACK_DELAY + 500)
+#else
+#define WATCHDOG_SOFT_REBOOT_MS 500
+#endif
+
+#if DT_NODE_EXISTS(DT_ALIAS(watchdog0))
+#define WATCHDOG_NODE DT_ALIAS(watchdog0)
+#else
+#define WATCHDOG_NODE DT_NODELABEL(wdt)
+#endif
 
 /* Channel handles from task_wdt_add() */
 static int channel_ids[WDT_CHANNEL_COUNT];
@@ -44,11 +58,9 @@ static const char *channel_names[] = {
 	"button",
 	"led",
 	"status",
-	"calibration"
+	"calibration",
+	"scan"
 };
-
-/* Store WDT reset status before RESETREAS is cleared by early_check */
-static bool last_reset_was_wdt = false;
 
 /* Default timeout values in milliseconds */
 static const uint32_t default_timeouts[] = {
@@ -59,7 +71,8 @@ static const uint32_t default_timeouts[] = {
 	10000,    // button - increased for boot delay
 	30000,   // led - can be suspended
 	15000,   // status - error display cycles
-	60000    // calibration - long operations
+	60000,   // calibration - long operations
+	10000    // scan - sensor bus discovery/init may need retries
 };
 
 /**
@@ -85,19 +98,25 @@ static void watchdog_timeout_callback(int channel_id, void *user_data)
 	LOG_ERR("System uptime: %u ms", k_uptime_get_32());
 
 	/* Important: When a callback is provided to task_wdt_add(), the task_wdt
-	 * does NOT automatically reboot. The hardware WDT fallback will only
-	 * trigger if we don't return from this callback. We spin here to let
-	 * the hardware WDT timeout and reset the system.
+	 * does NOT automatically reboot. The hardware WDT fallback normally
+	 * resets because this callback never returns. If the hardware fallback
+	 * was not actually started, that spin would freeze the device forever
+	 * with the watchdog appearing dead. Escape deterministically: let the
+	 * hardware WDT have its full fallback window, then force a cold reboot.
 	 */
-	LOG_ERR("Waiting for hardware WDT to reset system...");
+	LOG_ERR("Waiting up to %d ms for hardware WDT, then rebooting",
+		WATCHDOG_SOFT_REBOOT_MS);
 
-	/* Spin forever - hardware WDT will reset the system */
+	/* Busy-wait so the hardware WDT window runs out while interrupts stay
+	 * locked. k_cycle_get_32() is used because k_uptime stops advancing
+	 * while the system clock ISR is masked. */
 	uint32_t start_cycles = k_cycle_get_32();
 	uint32_t last_print_ms = 0;
 
-	while (1) {
-		/* Calculate elapsed time and print status every second */
-		uint32_t elapsed_ms = k_cyc_to_ms_floor32(k_cycle_get_32() - start_cycles);
+	while (k_cyc_to_ms_floor32(k_cycle_get_32() - start_cycles)
+	       < WATCHDOG_SOFT_REBOOT_MS) {
+		uint32_t elapsed_ms
+			= k_cyc_to_ms_floor32(k_cycle_get_32() - start_cycles);
 		if (elapsed_ms >= last_print_ms + 1000) {
 			printk("WDT: Still waiting... %u ms\n", elapsed_ms);
 			last_print_ms = elapsed_ms;
@@ -106,6 +125,9 @@ static void watchdog_timeout_callback(int channel_id, void *user_data)
 		/* Small delay to reduce CPU load */
 		k_busy_wait(1000);
 	}
+
+	LOG_ERR("Hardware WDT did not reset, forcing cold reboot");
+	sys_reboot(SYS_REBOOT_COLD);
 
 	/* Restore interrupts (unreachable, but for completeness) */
 	irq_unlock(key);
@@ -116,8 +138,8 @@ static void watchdog_timeout_callback(int channel_id, void *user_data)
  */
 static bool should_enter_dfu(void)
 {
-	/* Use saved WDT reset status (RESETREAS was cleared in early_check) */
-	if (!last_reset_was_wdt) {
+	/* Reset causes remain available after the boot snapshot clears hardware. */
+	if (!watchdog_caused_reset()) {
 		return false;
 	}
 
@@ -155,14 +177,15 @@ static void enter_dfu_mode(void)
 		retained_update();
 	}
 
-#if CONFIG_BUILD_OUTPUT_UF2
-	/* Adafruit bootloader: Set GPREGRET to enter UF2 DFU mode */
-	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC;
+#if CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT
+	NRF_POWER->GPREGRET = ADAFRUIT_DFU_MAGIC_UF2_RESET;
 	k_msleep(100);
 	sys_reboot(SYS_REBOOT_COLD);
-#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER
+#elif CONFIG_BOARD_HAS_NRF5_BOOTLOADER && !CONFIG_BOOTLOADER_MCUBOOT
 	/* nRF5 SDK bootloader - implementation depends on specific bootloader */
 	sys_reboot(SYS_REBOOT_COLD);
+#elif CONFIG_BOOTLOADER_MCUBOOT
+	sys_enter_dfu(false);
 #else
 	/* No bootloader available, perform cold reboot */
 	LOG_ERR("No bootloader available, performing cold reboot");
@@ -171,26 +194,16 @@ static void enter_dfu_mode(void)
 }
 
 /**
- * @brief Early check for WDT reset (must be called before RESETREAS is cleared)
+ * @brief Save OTA diagnostics before later startup code changes GPREGRET
  */
 static int watchdog_early_check(void)
 {
-	/* Check if last reset was caused by watchdog - save for later use */
-	last_reset_was_wdt = watchdog_caused_reset();
-
 	/* Save GPREGRET for OTA RAM engine debug (survives system reset) */
-	saved_gpregret = NRF_POWER->GPREGRET & 0xFF;
+	saved_gpregret = nrf_power_gpregret_get(NRF_POWER, 0) & 0xFF;
 	if (saved_gpregret >= 0xD0 && saved_gpregret <= 0xDE) {
 		/* Clear it so bootloader doesn't see it on next reset */
-		NRF_POWER->GPREGRET = 0;
+		nrf_power_gpregret_set(NRF_POWER, 0, 0);
 	}
-
-	/* Clear reset reason flags early to prevent other code from seeing stale values */
-#ifdef NRF_RESET
-	NRF_RESET->RESETREAS = NRF_RESET->RESETREAS;
-#else
-	NRF_POWER->RESETREAS = NRF_POWER->RESETREAS;
-#endif
 
 	return 0;
 }
@@ -211,7 +224,7 @@ int watchdog_init(void)
 	}
 
 	/* Process WDT reset state */
-	if (last_reset_was_wdt && retained) {
+	if (watchdog_caused_reset() && retained) {
 		LOG_WRN("System was reset by watchdog!");
 
 		/* Check if watchdog_state is valid (magic number matches) */
@@ -250,7 +263,7 @@ int watchdog_init(void)
 	}
 
 	/* Get the hardware WDT device */
-	const struct device *wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt));
+	const struct device *wdt_dev = DEVICE_DT_GET(WATCHDOG_NODE);
 	if (!device_is_ready(wdt_dev)) {
 		LOG_WRN("WDT device not ready, watchdog disabled");
 		/* Don't fail - allow system to boot without watchdog */
@@ -363,16 +376,6 @@ void watchdog_resume(wdt_channel_id_t channel)
 	}
 }
 
-bool watchdog_caused_reset(void)
-{
-#ifdef NRF_RESET
-	uint32_t reset_reason = NRF_RESET->RESETREAS;
-	return (reset_reason & RESET_RESETREAS_DOG_Msk) != 0;
-#else
-	uint32_t reset_reason = NRF_POWER->RESETREAS;
-	return (reset_reason & POWER_RESETREAS_DOG_Msk) != 0;
-#endif
-}
 
 uint8_t watchdog_get_reset_count(void)
 {
@@ -426,3 +429,25 @@ const char *watchdog_get_channel_name(wdt_channel_id_t channel)
 }
 
 #endif /* CONFIG_TASK_WDT */
+
+bool watchdog_caused_reset(void)
+{
+#ifdef NRF_RESET
+	uint32_t reset_reason = sys_get_reset_reason();
+	uint32_t watchdog_mask = 0;
+
+#ifdef RESET_RESETREAS_DOG_Msk
+	watchdog_mask |= RESET_RESETREAS_DOG_Msk;
+#endif
+#ifdef RESET_RESETREAS_DOG0_Msk
+	watchdog_mask |= RESET_RESETREAS_DOG0_Msk;
+#endif
+#ifdef RESET_RESETREAS_DOG1_Msk
+	watchdog_mask |= RESET_RESETREAS_DOG1_Msk;
+#endif
+	return (reset_reason & watchdog_mask) != 0;
+#else
+	uint32_t reset_reason = sys_get_reset_reason();
+	return (reset_reason & POWER_RESETREAS_DOG_Msk) != 0;
+#endif
+}
