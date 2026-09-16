@@ -157,6 +157,11 @@ int sensor_interface_spi_configure(enum sensor_interface_dev dev, uint32_t frequ
 {
 	if (sensor_interface_dev_spec[dev] != SENSOR_INTERFACE_SPEC_SPI)
 		return -1; // no spi device registered
+#if DT_NODE_HAS_COMPAT(DT_BUS(DT_NODELABEL(imu_spi)), zephyr_spi_bitbang)
+	/* Unlike nrfx SPIM, bitbang does not enforce a controller frequency cap. */
+	if (dev == SENSOR_INTERFACE_DEV_IMU)
+		frequency = MIN(frequency, DT_PROP(DT_NODELABEL(imu_spi), spi_max_frequency));
+#endif
 	sensor_interface_dev_spi[dev]->config.frequency = frequency;
 	sensor_interface_dev_spi_dummy_reads[dev] = dummy_reads; // shoutout to BMI270
 	return 0;
@@ -170,6 +175,15 @@ void sensor_interface_ext_configure(const sensor_ext_ssi_t *ext)
 const sensor_ext_ssi_t *sensor_interface_ext_get(void)
 {
 	return ext_ssi;
+}
+
+int sensor_interface_ext_set_prefetch(bool enabled)
+{
+	if (sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] != SENSOR_INTERFACE_SPEC_EXT)
+		return 0;
+	if (ext_ssi == NULL)
+		return -1;
+	return ext_ssi->ext_set_prefetch ? ext_ssi->ext_set_prefetch(enabled) : 0;
 }
 
 enum sensor_interface_spec sensor_interface_get_spec(enum sensor_interface_dev dev)

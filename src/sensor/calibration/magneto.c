@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "util.h"
 
+#include <float.h>
 #include <math.h>
 #include <string.h>
 
@@ -153,8 +154,8 @@ bool magneto_centered_direction(const mag_center_estimator_t *estimator, const f
 
 bool mag_bainv_structurally_ok(const float m_inv[4][3], float bias_limit)
 {
-	/* NaN/±inf must never pass: the fit (magneto1_4) emits them under
-	 * degenerate data, and v_epsilon()'s CMSIS path treats NaN as in-range. */
+	/* Retain structural validation for every candidate, including imported
+	 * matrices: v_epsilon()'s CMSIS path treats NaN as in-range. */
 	if (!v_finite(&m_inv[0][0], 12)) {
 		return false;
 	}
@@ -170,9 +171,40 @@ bool mag_bainv_structurally_ok(const float m_inv[4][3], float bias_limit)
 	float max_gain = MAX(MAX(fabsf(diagonal[0]), fabsf(diagonal[1])), fabsf(diagonal[2]));
 	float limit = bias_limit > 0.0f ? bias_limit : MAX(fabsf(magnitude) * 2.0f, 0.1f);
 
-	return v_epsilon(m_inv[0], zero, limit)
-		&& v_epsilon(diagonal, average, MAX(fabsf(magnitude) * 0.2f, 0.1f))
-		&& max_gain <= MAG_CAL_MAX_AXIS_GAIN;
+	if (!v_epsilon(m_inv[0], zero, limit) || !v_epsilon(diagonal, average, MAX(fabsf(magnitude) * 0.2f, 0.1f))
+		|| max_gain <= 0.0f || max_gain > MAG_CAL_MAX_AXIS_GAIN) {
+		return false;
+	}
+
+	/* Magneto produces a symmetric positive definite correction. Permit only
+	 * float-roundoff asymmetry, then test its symmetric part using LDL^T.
+	 * Normalize by the largest diagonal so the pivot floor is relative to
+	 * matrix gain, not field units; zero/negative and numerically singular
+	 * corrections must not become usable models after a clear or import. */
+	const float tolerance = 16.0f * FLT_EPSILON;
+	for (int row = 0; row < 3; row++) {
+		for (int col = row + 1; col < 3; col++) {
+			if (fabsf(m_inv[row + 1][col] - m_inv[col + 1][row]) > tolerance * max_gain) {
+				return false;
+			}
+		}
+	}
+	float a = diagonal[0] / max_gain;
+	float b = (0.5f * m_inv[1][1] + 0.5f * m_inv[2][0]) / max_gain;
+	float c = (0.5f * m_inv[1][2] + 0.5f * m_inv[3][0]) / max_gain;
+	float d = diagonal[1] / max_gain;
+	float e = (0.5f * m_inv[2][2] + 0.5f * m_inv[3][1]) / max_gain;
+	float f = diagonal[2] / max_gain;
+	if (a <= tolerance) {
+		return false;
+	}
+	float pivot2 = d - b * b / a;
+	if (pivot2 <= tolerance || !isfinite(pivot2)) {
+		return false;
+	}
+	float cross = e - b * c / a;
+	float pivot3 = f - c * c / a - cross * cross / pivot2;
+	return isfinite(pivot3) && pivot3 > tolerance;
 }
 
 /**
@@ -189,7 +221,9 @@ bool magneto_quality_check(double *ata_buf, double norm_sum_val, double sample_c
 
 	// Run trial calibration
 	float m_inv[4][3];
-	magneto_current_calibration(m_inv, ata_buf, norm_sum_val, sample_count_val);
+	if (magneto_current_calibration(m_inv, ata_buf, norm_sum_val, sample_count_val) < 0) {
+		return false;
+	}
 
 	float hm = (float)(norm_sum_val / sample_count_val);
 	if (!mag_bainv_structurally_ok(m_inv, hm * 2.0f)) {

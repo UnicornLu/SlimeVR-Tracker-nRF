@@ -130,7 +130,7 @@ int esb_ota_flash_mcuboot_region(uint32_t *addr, uint32_t *capacity)
 		return -EBUSY;
 	}
 
-	const uint8_t area_id = FIXED_PARTITION_ID(slot1_partition);
+	const uint8_t area_id = PARTITION_ID(slot1_partition);
 	const struct flash_area *area;
 	int err = flash_area_open(area_id, &area);
 	if (err) {
@@ -160,7 +160,7 @@ int esb_ota_flash_prepare_mcuboot_slot(void)
 {
 #if OTA_MCUBOOT_HAS_SECONDARY
 	const struct flash_area *area;
-	int err = flash_area_open(FIXED_PARTITION_ID(slot1_partition), &area);
+	int err = flash_area_open(PARTITION_ID(slot1_partition), &area);
 	if (err) {
 		return err;
 	}
@@ -359,7 +359,8 @@ void esb_ota_flash_copy_and_reset(uint32_t staging_base, uint32_t target_base,
 #endif
 }
 
-uint32_t esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scratch)
+int esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scratch,
+			      uint32_t *result)
 {
 	uint32_t crc = 0;
 	uint32_t remaining = size;
@@ -370,15 +371,15 @@ uint32_t esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scra
 		int err = flash_read(flash_dev, offset, scratch, chunk);
 		if (err) {
 			LOG_ERR("OTA: Flash read failed at 0x%05X (err %d)", offset, err);
-			/* Nonzero poison so callers cannot treat failure as a valid CRC. */
-			return 0xFFFFFFFFu;
+			return err;
 		}
 		crc = crc32_ieee_update(crc, scratch, chunk);
 		offset += chunk;
 		remaining -= chunk;
 	}
 
-	return crc;
+	*result = crc;
+	return 0;
 }
 
 /**

@@ -51,7 +51,6 @@ static int64_t magneto_progress_time;
 
 static int64_t mag_cal_last_status_log;
 
-double ata[100]; /* manual / 6-side Magneto accumulator */
 double norm_sum;
 double sample_count;
 
@@ -106,12 +105,11 @@ int sensor_calibrate_mag(void)
 	float m_inv[4][3];
 	LOG_INF("Calibrating magnetometer hard/soft iron offset");
 
-	// max allocated 1072 bytes
 #if DEBUG
 	printk("ata:\n");
 	for (int i = 0; i < 10; i++) {
 		for (int j = 0; j < 10; j++) {
-			printk("%7.2f, ", (double)ata[i * 10 + j]);
+			printk("%7.2f, ", (double)mag_cal_workspace.ata[i * 10 + j]);
 		}
 		printk("\n");
 		k_msleep(3);
@@ -119,8 +117,24 @@ int sensor_calibrate_mag(void)
 	printk("norm_sum: %.2f, sample_count: %.0f\n", norm_sum, sample_count);
 #endif
 	wait_for_threads();
-	magneto_current_calibration(m_inv, ata, norm_sum, sample_count); // 25ms
+	int err = magneto_current_calibration(m_inv, mag_cal_workspace.ata, norm_sum, sample_count);
+	if (!err) {
+		/* Generic Magneto uses mean raw norm as its fitted target. Normalize
+		 * only the magnetic correction matrix, leaving hard-iron bias intact. */
+		const float scale = (float)(.5 * sample_count / norm_sum);
+		for (unsigned i = 1; i < 4; i++) {
+			for (unsigned j = 0; j < 3; j++) {
+				m_inv[i][j] *= scale;
+			}
+		}
+	}
 	magneto_reset();
+	if (err) {
+		LOG_WRN("Magnetometer calibration failed: %d; previous calibration unchanged", err);
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
+		return err;
+	}
 
 	LOG_INF("Magnetometer matrix:");
 	for (int i = 0; i < 3; i++) {
@@ -175,7 +189,7 @@ void magneto_reset(void)
 	last_magneto_progress = 0;
 	magneto_progress_time = 0;
 	mag_cal_last_status_log = 0;
-	memset(ata, 0, sizeof(ata));
+	memset(mag_cal_workspace.ata, 0, sizeof(mag_cal_workspace.ata));
 	norm_sum = 0;
 	sample_count = 0;
 	for (int i = 0; i < 3; i++) {
@@ -364,7 +378,7 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 			}
 			memcpy(pre_acc, rawData, sizeof(rawData));
 
-			magneto_sample(rawData[0], rawData[1], rawData[2], ata, &norm_sum, &sample_count);
+			magneto_sample(rawData[0], rawData[1], rawData[2], mag_cal_workspace.ata, &norm_sum, &sample_count);
 
 			sample_idx++;
 
@@ -393,9 +407,12 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 	LOG_INF("Calculating calibration matrix...");
 
 	wait_for_threads();
-	magneto_current_calibration(a_inv, ata, norm_sum, sample_count);
+	int err = magneto_current_calibration(a_inv, mag_cal_workspace.ata, norm_sum, sample_count);
 
 	magneto_reset();
+	if (err) {
+		return err;
+	}
 
 	LOG_INF("Calibration calculation complete.");
 	return 0;
@@ -473,7 +490,7 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 	}
 
 	// Accept sample - add to Magneto accumulator
-	magneto_sample(m[0], m[1], m[2], ata, &norm_sum, &sample_count); // 400us
+	magneto_sample(m[0], m[1], m[2], mag_cal_workspace.ata, &norm_sum, &sample_count); // 400us
 	float coverage_mag[3];
 	magneto_coverage_sample(&manual_center_estimator, raw_mag, coverage_mag);
 	magneto_update_dir_range(coverage_mag);
@@ -498,7 +515,7 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 			return;
 		}
 
-		if (magneto_quality_check(ata, norm_sum, sample_count, NULL)) {
+		if (magneto_quality_check(mag_cal_workspace.ata, norm_sum, sample_count, NULL)) {
 			magneto_progress |= 0b01111111;
 			LOG_INF("Mag cal ready: %d samples, min_range=%.2f", (int)sample_count, (double)min_range);
 			set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR);

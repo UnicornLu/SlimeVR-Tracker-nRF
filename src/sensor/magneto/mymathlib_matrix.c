@@ -2,7 +2,6 @@
 #include "mymathlib_matrix.h"
 
 #include <math.h>
-#include <zephyr/kernel.h>
 #include <string.h>
 #include <float.h>
 
@@ -479,7 +478,7 @@ void Identity_Matrix(double *A, int n)
 ////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////
-//  int Hessenberg_Form_Elementary(double *A, double *S, int n)               //
+//  int Hessenberg_Form_Elementary(double *A, double *S, int n, int perm[])    //
 //                                                                            //
 //  Description:                                                              //
 //     This program transforms the square matrix A to a similar matrix in     //
@@ -507,30 +506,33 @@ void Identity_Matrix(double *A, int n)
 //                   The matrix S should be dimensioned at least n x n in the //
 //                   calling routine.                                         //
 //     int    n      The number of rows or columns of the matrix A.           //
+//     int perm[]    Caller-owned workspace with at least n elements.         //
 //                                                                            //
 //  Return Values:                                                            //
 //      0  Success                                                            //
-//     -1  Failure - Not enough memory                                        //
+//     -1  Failure - Invalid arguments or non-finite elimination factor        //
 //                                                                            //
 //  Example:                                                                  //
 //     #define N                                                              //
-//     double A[N][N], S[N][N];                                               //
+//     double A[N][N], S[N][N]; int perm[N];                                  //
 //                                                                            //
 //     (your code to create the matrix A)                                     //
-//     if (Hessenberg_Form_Elementary(&A[0][0], (double*)S, N ) < 0) {        //
-//        printf("Not enough memory\n"); exit(0);                             //
+//     if (Hessenberg_Form_Elementary(&A[0][0], (double*)S, N, perm) < 0) {    //
+//        printf("Hessenberg reduction failed\n"); exit(0);                    //
 //     }                                                                      //
 //                                                                            //
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
-int Hessenberg_Form_Elementary(double *A, double *S, int n)
+int Hessenberg_Form_Elementary(double *A, double *S, int n, int perm[])
 {
    int i, j, col, row;
-   int *perm;
    double *p_row, *pS_row;
    double max;
    double s;
    double *pA, *pB, *pC, *pS;
+
+   if (A == NULL || S == NULL || perm == NULL || n < 1)
+      return -1;
 
    // n x n matrices for which n <= 2 are already in Hessenberg form
 
@@ -547,12 +549,6 @@ int Hessenberg_Form_Elementary(double *A, double *S, int n)
       *S = 0.0;
       return 0;
    }
-
-   // Allocate working memory
-
-   perm = (int *)k_malloc(n * sizeof(int));
-   if (perm == NULL)
-      return -1; // not enough memory
 
    // For each column use Elementary transformations
    //   to zero the entries below the subdiagonal.
@@ -589,7 +585,10 @@ int Hessenberg_Form_Elementary(double *A, double *S, int n)
       pS = pS_row + n;
       for (i = col + 2; i < n; pA += n, pS += n, i++)
       {
-         s = *(pA + col) / *(p_row + col);
+         // A zero pivot means the entire remaining column is already zero.
+         s = max == 0.0 ? 0.0 : *(pA + col) / *(p_row + col);
+         if (!isfinite(s))
+            return -1;
          for (j = 0; j < n; j++)
             *(pA + j) -= *(p_row + j) * s;
          *(pS + col) = s;
@@ -604,7 +603,6 @@ int Hessenberg_Form_Elementary(double *A, double *S, int n)
 
    Hessenberg_Elementary_Transform(A, S, perm, n);
 
-   k_free(perm);
    return 0;
 }
 
@@ -784,7 +782,7 @@ int QR_Hessenberg_Matrix(double *H, double *S, double eigen_real[],
    }
 
    BackSubstitution(H, eigen_real, eigen_imag, n);
-   Calculate_Eigenvectors(H, S, eigen_real, eigen_imag, n);
+   Calculate_Eigenvectors(H, S, eigen_imag, n);
 
    return 0;
 }
@@ -1224,6 +1222,9 @@ void Double_QR_Step(double *H, int min_row, int max_row, int min_col,
    a /= s;
    b /= s;
    c /= s;
+   s = sqrt(a * a + b * b + c * c);
+   if (a < 0.0)
+      s = -s;
 
    for (; k <= last_test_row_col; k++, pH += n)
    {
@@ -1236,12 +1237,11 @@ void Double_QR_Step(double *H, int min_row, int max_row, int min_col,
          a = pH[k - 1] / x;
          b = pH[n + k - 1] / x;
          c /= x;
-      }
-      s = sqrt(a * a + b * b + c * c);
-      if (a < 0.0)
-         s = -s;
-      if (k > min_col)
+         s = sqrt(a * a + b * b + c * c);
+         if (a < 0.0)
+            s = -s;
          pH[k - 1] = -s * x;
+      }
       else if (min_row != min_col)
          pH[k - 1] = -pH[k - 1];
       a += s;
@@ -1511,8 +1511,8 @@ void BackSubstitute_Complex_Vector(double *H, double eigen_real[],
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-//  void Calculate_Eigenvectors(double *H, double *S,                  //
-//                          double eigen_real[], double eigen_imag[], int n)  //
+//  void Calculate_Eigenvectors(double *H, double *S,                          //
+//                             double eigen_imag[], int n)                    //
 //                                                                            //
 //  Description:                                                              //
 //     Multiply by transformation matrix.                                     //
@@ -1522,15 +1522,13 @@ void BackSubstitute_Complex_Vector(double *H, double eigen_real[],
 //            Pointer to the first element of the matrix in Hessenberg form.  //
 //     double *S                                                              //
 //            Pointer to the first element of the transformation matrix.      //
-//     double eigen_real[]                                                    //
-//            The real part of an eigenvalue.                                 //
 //     double eigen_imag[]                                                    //
 //            The imaginary part of an eigenvalue.                            //
 //     int    n                                                               //
-//            The dimension of H, S, eigen_real, and eigen_imag.              //
+//            The dimension of H, S, and eigen_imag.                          //
 ////////////////////////////////////////////////////////////////////////////////
 //                                                                            //
-void Calculate_Eigenvectors(double *H, double *S, double eigen_real[],
+void Calculate_Eigenvectors(double *H, double *S,
                             double eigen_imag[], int n)
 {
    double *pH;

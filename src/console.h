@@ -5,6 +5,12 @@
 
 #if CONFIG_USE_SLIMENRF_CONSOLE
 int console_serial_start(void);
+/* Soft DTR close discards unfinished input/echo, not complete lines accepted
+ * into the bounded queue. Reopen preserves their admission, including messages
+ * already dequeued. This does not guarantee delivery of unread host bytes. */
+void console_serial_close(void);
+/* Hard lifecycle loss invalidates queued/dequeued lines; a handler already
+ * admitted by the worker is allowed to finish. */
 void console_serial_stop(void);
 #else
 static inline int console_serial_start(void)
@@ -12,22 +18,13 @@ static inline int console_serial_start(void)
 	return 0;
 }
 
+static inline void console_serial_close(void)
+{
+}
+
 static inline void console_serial_stop(void)
 {
 }
 #endif
-
-// Command API for remote execution
-void cmd_sens_set(float x, float y, float z);
-void cmd_sens_auto(const char *axis_str, const char *rev_str);
-void cmd_sens_auto_request(uint8_t axis, uint16_t revolutions);
-void cmd_sens_reset(void);
-void cmd_reset_zro(void);
-void cmd_reset_acc(void);
-void cmd_reset_bat(void);
-void cmd_reset_tcal(void);
-void cmd_fusion_reset(void);
-void cmd_ping_start(void);
-void cmd_shutdown(void);
 
 #endif

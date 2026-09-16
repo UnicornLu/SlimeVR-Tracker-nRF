@@ -3,9 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define MHZ(value) ((value) * 1000000U)
+#define ARG_UNUSED(value) ((void)(value))
+
+/* Host SPI model has no devicetree-selected bitbang controller. */
+#define DT_NODE_HAS_COMPAT(node_id, compat) 0
 
 int64_t host_k_uptime_get(void);
 void host_k_busy_wait(uint32_t usec);

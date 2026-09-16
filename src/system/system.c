@@ -12,11 +12,12 @@
 #include <zephyr/sys/reboot.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/storage/flash_map.h>
-#include <zephyr/fs/nvs.h>
+#include <zephyr/kvss/nvs.h>
 #if defined(CONFIG_BOOTLOADER_MCUBOOT)
 #include <zephyr/retention/bootmode.h>
 #endif
 #include <hal/nrf_gpio.h>
+#include <errno.h>
 
 #include "system.h"
 #include "battery_tracker.h"
@@ -26,11 +27,35 @@ static struct nvs_fs fs;
 static K_MUTEX_DEFINE(sys_storage_lock);
 
 #define NVS_PARTITION storage_partition
-#define NVS_PARTITION_DEVICE FIXED_PARTITION_DEVICE(NVS_PARTITION)
-#define NVS_PARTITION_OFFSET FIXED_PARTITION_OFFSET(NVS_PARTITION)
-#define NVS_PARTITION_SIZE FIXED_PARTITION_SIZE(NVS_PARTITION)
+#define NVS_PARTITION_DEVICE PARTITION_DEVICE(NVS_PARTITION)
+#define NVS_PARTITION_OFFSET PARTITION_OFFSET(NVS_PARTITION)
+#define NVS_PARTITION_SIZE PARTITION_SIZE(NVS_PARTITION)
 
 LOG_MODULE_REGISTER(system, LOG_LEVEL_INF);
+
+/* Sole owner of RESETREAS: preserve every cause before clearing the W1C
+ * register. All APPLICATION init and main consumers use this boot snapshot,
+ * independently of whether task watchdog support is enabled. */
+static uint32_t boot_reset_reason;
+
+static int sys_reset_reason_init(void)
+{
+#ifdef NRF_RESET
+	boot_reset_reason = NRF_RESET->RESETREAS;
+	NRF_RESET->RESETREAS = boot_reset_reason;
+#else
+	boot_reset_reason = NRF_POWER->RESETREAS;
+	NRF_POWER->RESETREAS = boot_reset_reason;
+#endif
+	return 0;
+}
+
+SYS_INIT(sys_reset_reason_init, PRE_KERNEL_1, 0);
+
+uint32_t sys_get_reset_reason(void)
+{
+	return boot_reset_reason;
+}
 
 #if DT_NODE_HAS_PROP(DT_ALIAS(sw0), gpios) // Alternate button if available to use as "reset key"
 #define BUTTON_EXISTS true
@@ -171,9 +196,9 @@ static bool ram_retention_valid = false;
 static int sys_retained_init(void)
 {
 #ifdef NRF_RESET
-	bool reset_pin_reset = NRF_RESET->RESETREAS & 0x01;
+	bool reset_pin_reset = sys_get_reset_reason() & RESET_RESETREAS_RESETPIN_Msk;
 #else
-	bool reset_pin_reset = NRF_POWER->RESETREAS & 0x01;
+	bool reset_pin_reset = sys_get_reset_reason() & POWER_RESETREAS_RESETPIN_Msk;
 #endif
 	// on most nrf, reset by pin reset will clear retained
 	if (!reset_pin_reset) { // if reset reason is not by pin reset, system automatically trusts retained state
@@ -406,7 +431,7 @@ void sys_flush_warm(void)
 }
 
 // write to retained and nvs (cold / eager)
-void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
+int sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 {
 	k_mutex_lock(&sys_storage_lock, K_FOREVER);
 	if (!sys_nvs_init()) {
@@ -416,7 +441,7 @@ void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 			retained_update();
 		}
 		k_mutex_unlock(&sys_storage_lock);
-		return;
+		return -EIO;
 	}
 	if (retained_ptr) {
 		memcpy(retained_ptr, data, len);
@@ -429,7 +454,7 @@ void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 			retained_update();
 		}
 		k_mutex_unlock(&sys_storage_lock);
-		return;
+		return err;
 	}
 	/* Eager NVS write supersedes any deferred warm copy of this ID. */
 	warm_dirty_clear_id_locked(id);
@@ -437,6 +462,7 @@ void sys_write(uint16_t id, void *retained_ptr, const void *data, size_t len)
 		retained_update();
 	}
 	k_mutex_unlock(&sys_storage_lock);
+	return 0;
 }
 
 void sys_read(uint16_t id, void *data, size_t len)
@@ -481,13 +507,19 @@ void sys_clear(void)
 	}
 	printk("Resetting NVS and retained\n");
 
+	sensor_calibration_clear_begin();
 	k_mutex_lock(&sys_storage_lock, K_FOREVER);
-	sys_nvs_init();
+	int err = sys_nvs_init() ? nvs_clear(&fs) : -EIO;
+	reset_confirm = false;
+	if (err < 0) {
+		k_mutex_unlock(&sys_storage_lock);
+		sensor_calibration_clear_end();
+		LOG_ERR("NVS reset failed: %d", err);
+		return;
+	}
 	warm_dirty_count = 0;
 	memset(retained, 0, sizeof(*retained));
-	nvs_clear(&fs);
 	nvs_init = false;
-	reset_confirm = false;
 
 	// Re-initialize fields that need non-zero default values
 	retained->gyroSensScale[0] = 1.0f;
@@ -496,6 +528,7 @@ void sys_clear(void)
 	retained->build_timestamp = BUILD_TIMESTAMP;
 	retained_update();
 	k_mutex_unlock(&sys_storage_lock);
+	sensor_calibration_clear_end();
 
 	LOG_INF("NVS and retained reset");
 }
@@ -576,13 +609,13 @@ static int sys_button_init(void)
 {
 #ifdef NRF_RESET
 #ifdef RESET_RESETREAS_VBUS_Msk
-	bool reset_vbus_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_VBUS_Msk;
+	bool reset_vbus_reset = sys_get_reset_reason() & RESET_RESETREAS_VBUS_Msk;
 #else
 	/* SoCs without USB (e.g. nRF54L15) have no VBUS reset reason. */
 	bool reset_vbus_reset = false;
 #endif
 #else
-	bool reset_vbus_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_VBUS_Msk;
+	bool reset_vbus_reset = sys_get_reset_reason() & POWER_RESETREAS_VBUS_Msk;
 #endif
 	gpio_pin_configure_dt(&button0, GPIO_INPUT);
 	gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_BOTH);
@@ -655,7 +688,7 @@ static void button_thread(void)
 				if (test_mode_get()) {
 					LOG_INF("Button reboot blocked by test mode");
 				} else {
-					sys_request_system_reboot(false);
+					sys_request_system_reboot();
 				}
 			}
 #if CONFIG_USER_EXTRA_ACTIONS // TODO: extra actions are default until server can send commands to trackers
@@ -674,18 +707,25 @@ static void button_thread(void)
 				press_time = 0;
 				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_HIGHEST);
 				set_status(SYS_STATUS_BUTTON_PRESSED, false);
-			} else if (sys_user_shutdown()) {
+			} else {
+				int err = sys_user_shutdown();
+				if (err > 0) {
 #if CONFIG_USER_EXTRA_ACTIONS
-				LOG_INF("Button hold timeout, shutdown canceled");
+					LOG_INF("Button hold timeout, shutdown canceled");
 #else
-				LOG_INF("Pairing requested");
-				esb_reset_pair();
+					LOG_INF("Pairing requested");
+					esb_reset_pair();
 #endif
-				press_time = 0;
-				set_status(SYS_STATUS_BUTTON_PRESSED, false); // TODO: is needed?
-			} else                                            // shutting down or rebooting
-			{
-				k_thread_abort(button_thread_id);
+					press_time = 0;
+					set_status(SYS_STATUS_BUTTON_PRESSED, false); // TODO: is needed?
+				} else if (err == 0) { // shutting down or rebooting
+					k_thread_abort(button_thread_id);
+				} else {
+					LOG_WRN("Button shutdown rejected: %d", err);
+					press_time = 0;
+					set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
+					set_status(SYS_STATUS_BUTTON_PRESSED, false);
+				}
 			}
 		}
 
@@ -779,20 +819,19 @@ int sys_user_shutdown(void)
 		set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
 	}
 #if USER_SHUTDOWN_ENABLED
-	sys_request_system_off(false);
+	return sys_request_system_off();
 #else
-	sys_request_system_reboot(false);
+	return sys_request_system_reboot();
 #endif
-	return 0;
 }
 
-void sys_command_shutdown(void)
+int sys_command_shutdown(void)
 {
 	LOG_INF("Command shutdown requested");
 	reboot_counter_write(0);
 	set_led(SYS_LED_PATTERN_ONESHOT_POWEROFF, SYS_LED_PRIORITY_HIGHEST);
 	k_msleep(1500);
-	sys_request_system_off(false);
+	return sys_request_system_off();
 }
 
 void sys_enter_dfu(bool ota)
@@ -805,16 +844,16 @@ void sys_enter_dfu(bool ota)
 		return;
 	}
 	LOG_INF("MCUboot serial recovery requested");
-	sys_request_system_reboot(false);
+	sys_request_system_reboot();
 #elif ADAFRUIT_BOOTLOADER
 	NRF_POWER->GPREGRET = ota ? ADAFRUIT_DFU_MAGIC_OTA_RESET : ADAFRUIT_DFU_MAGIC_UF2_RESET;
 	k_msleep(100);
-	sys_request_system_reboot(false);
+	sys_request_system_reboot();
 #elif NRF5_BOOTLOADER
 	ARG_UNUSED(ota);
 	gpio_pin_configure(gpio_dev, 19, GPIO_OUTPUT | GPIO_OUTPUT_INIT_LOW);
 	k_msleep(100);
-	sys_request_system_reboot(false);
+	sys_request_system_reboot();
 #else
 	ARG_UNUSED(ota);
 #endif

@@ -46,16 +46,10 @@
 
 LOG_MODULE_REGISTER(cal_imu, LOG_LEVEL_INF);
 
-/* Owned by calibration.c */
-extern float accelBias[3];
-extern float gyroBias[3];
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-extern float accBAinv[4][3];
-#endif
 
 void sensor_calibrate_imu(void)
 {
-	float a_bias[3], g_bias[3];
+	float a_bias[3] = {0}, g_bias[3] = {0};
 	LOG_INF("Calibrating main accelerometer and gyroscope zero rate offset");
 	LOG_INF("Rest the device on a stable surface");
 
@@ -92,13 +86,12 @@ void sensor_calibrate_imu(void)
 		}
 		LOG_INF("Finished IMU specific calibration");
 		sys_write(MAIN_SENSOR_DATA_ID, &retained->sensor_data, sensor_data, sizeof(retained->sensor_data));
-		sensor_fusion_invalidate(); // only invalidate fusion if calibration was successful
+		sensor_request_fusion_reset(); // apply reset on the sensor's next frame
 		k_msleep(500);              // Delay before beginning acquisition
 	}
 #endif
 
 	LOG_INF("Reading data");
-	sensor_calibration_clear(a_bias, g_bias, false);
 #if CONFIG_SENSOR_USE_TCAL
 	int err = sensor_offsetBias(a_bias, g_bias, &avg_temp, &temp_range);
 #else
@@ -118,28 +111,21 @@ void sensor_calibrate_imu(void)
 		/* Do not run NAN-through-validate: CMSIS v_epsilon can treat NaN as
 		 * in-range and then apply cleared zero bias to NVS/fusion. */
 		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)gyroBias[0], (double)gyroBias[1], (double)gyroBias[2]);
-		sensor_calibration_validate(NULL, NULL, true); // verify old calibration still sane
+		LOG_INF("Previous calibration unchanged");
 		return;
 	}
 	LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)g_bias[0], (double)g_bias[1], (double)g_bias[2]);
-	if (sensor_calibration_validate(a_bias, g_bias, false)) {
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)gyroBias[0], (double)gyroBias[1], (double)gyroBias[2]);
-		sensor_calibration_validate(NULL, NULL, true); // additionally verify old calibration
-		return;
-	} else {
-		LOG_INF("Applying calibration");
-		memcpy(accelBias, a_bias, sizeof(accelBias));
-		memcpy(gyroBias, g_bias, sizeof(gyroBias));
-		sensor_fusion_update_bias(NULL); // Only bias changed, preserve orientation
-	}
-#if !CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	// In 6-side calibration mode, save accelerometer bias (full calibration matrix used elsewhere)
-	sys_write(MAIN_ACCEL_BIAS_ID, &retained->accelBias, accelBias, sizeof(accelBias));
+	bool persist_gyro = true;
+#if CONFIG_SENSOR_USE_TCAL
+	persist_gyro = !sensor_tcal_get_auto_calibration() || isnan(avg_temp);
 #endif
+	int commit_err = sensor_calibration_commit_bias(a_bias, g_bias, persist_gyro);
+	if (commit_err) {
+		LOG_WRN("Calibration candidate rejected: %d; previous calibration unchanged", commit_err);
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
+	}
+	LOG_INF("Calibration queued for next sensor frame");
 
 #if CONFIG_SENSOR_USE_TCAL
 	if (sensor_tcal_get_auto_calibration() && !isnan(avg_temp)) {
@@ -168,8 +154,6 @@ void sensor_calibrate_imu(void)
 			float closest_distance = INFINITY;
 			bool has_lower_bound = false; // Point below current temp
 			bool has_upper_bound = false; // Point above current temp
-			float lower_distance = INFINITY;
-			float upper_distance = INFINITY;
 			float sampling_interval = 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
 
 			for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
@@ -184,22 +168,13 @@ void sensor_calibrate_imu(void)
 					// Check if this point is below or above current temp
 					if (point_temp < avg_temp) {
 						has_lower_bound = true;
-						if (distance < lower_distance) {
-							lower_distance = distance;
-						}
 					} else if (point_temp > avg_temp) {
 						has_upper_bound = true;
-						if (distance < upper_distance) {
-							upper_distance = distance;
-						}
 					}
 				}
 			}
 
-			// Coverage is good if:
-			// 1. Closest point is within sampling interval (very close match)
-			// OR
-			// 2. Has both upper and lower bounds AND closest is within 1x sampling interval
+			// Coverage is good when the closest point is within the sampling interval.
 			if (closest_distance <= sampling_interval) {
 				// Very close to existing point - definitely good coverage
 				has_good_coverage = true;
@@ -207,15 +182,6 @@ void sensor_calibrate_imu(void)
 					"T-Cal: Excellent coverage at %.2fC (closest: %.2fC away, within sampling interval)",
 					(double)avg_temp,
 					(double)closest_distance
-				);
-			} else if (has_lower_bound && has_upper_bound && closest_distance <= sampling_interval * 1.0f) {
-				// Bounded interpolation with reasonable distance
-				has_good_coverage = true;
-				LOG_INF(
-					"T-Cal: Good coverage at %.2fC (bounded: lower %.2fC, upper %.2fC)",
-					(double)avg_temp,
-					(double)lower_distance,
-					(double)upper_distance
 				);
 			} else {
 				// Log why coverage is insufficient
@@ -300,14 +266,7 @@ void sensor_calibrate_imu(void)
 				);
 			}
 		}
-	} else {
-		// Auto tcal not enabled or no valid temperature: save gyro bias to NVS only
-		sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
-		LOG_INF("Saving gyro bias to NVS (auto tcal not enabled)");
 	}
-#else
-	// No tcal support: always save gyro bias to NVS
-	sys_write(MAIN_GYRO_BIAS_ID, &retained->gyroBias, gyroBias, sizeof(gyroBias));
 #endif
 
 	LOG_INF("Finished calibration");
@@ -325,7 +284,7 @@ void sensor_calibrate_6_side(void)
 	LOG_INF("Calibrating main accelerometer 6-side offset");
 	LOG_INF("Rest the device on a stable surface");
 
-	sensor_calibration_clear_6_side(a_inv, false);
+	sensor_calibration_identity_accel(a_inv);
 	int err = sensor_6_sideBias(a_inv, &captured_count);
 	if (err) {
 		if (err == -3) {
@@ -335,10 +294,8 @@ void sensor_calibrate_6_side(void)
 				// We have enough samples, try to calculate calibration from partial data
 				LOG_INF("Attempting partial calibration with %d poses...", captured_count);
 				wait_for_threads();
-				magneto_current_calibration(a_inv, ata, norm_sum, sample_count);
+				err = magneto_current_calibration(a_inv, mag_cal_workspace.ata, norm_sum, sample_count);
 				magneto_reset();
-				// Continue to validation below - err will be handled by validate function
-				err = 0; // Clear error to allow validation
 			} else {
 				// Not enough samples - discard and restore previous calibration
 				LOG_ERR("Insufficient poses for calibration, discarding data");
@@ -351,8 +308,12 @@ void sensor_calibrate_6_side(void)
 			if (err == -1) {
 				LOG_INF("Motion detected");
 			}
-			a_inv[0][0] = NAN; // invalidate calibration
 		}
+	}
+	if (err) {
+		LOG_WRN("Accelerometer calibration failed: %d; previous calibration unchanged", err);
+		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
+		return;
 	}
 
 	if (!err) {
@@ -367,27 +328,13 @@ void sensor_calibrate_6_side(void)
 			);
 		}
 	}
-	if (sensor_calibration_validate_6_side(a_inv, false)) {
+	int commit_err = sensor_calibration_commit_accel(a_inv);
+	if (commit_err) {
+		LOG_WRN("Accelerometer calibration candidate rejected: %d; previous calibration unchanged", commit_err);
 		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Accelerometer matrix:");
-		for (int i = 0; i < 3; i++) {
-			LOG_INF(
-				"%.5f %.5f %.5f %.5f",
-				(double)accBAinv[0][i],
-				(double)accBAinv[1][i],
-				(double)accBAinv[2][i],
-				(double)accBAinv[3][i]
-			);
-		}
-		sensor_calibration_validate_6_side(NULL, true); // additionally verify old calibration
 		return;
-	} else {
-		LOG_INF("Applying calibration");
-		memcpy(accBAinv, a_inv, sizeof(accBAinv));
-		sensor_fusion_invalidate(); // only invalidate fusion if calibration was successful
 	}
-	sys_write(MAIN_ACC_6_BIAS_ID, &retained->accBAinv, accBAinv, sizeof(accBAinv));
+	LOG_INF("Accelerometer calibration queued for next sensor frame");
 
 	LOG_INF("Finished calibration");
 	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);

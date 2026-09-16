@@ -37,17 +37,52 @@ uint8_t *sensor_calibration_get_sensor_data();
 
 void sensor_calibration_read(void);
 
-int sensor_calibration_validate(float *a_bias, float *g_bias, bool write);
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-int sensor_calibration_validate_6_side(float a_inv[][3], bool write);
-#endif
+typedef struct {
+	float accel_bias[3];
+	float gyro_bias[3];
+	float accel_matrix[4][3];
+} sensor_imu_calibration_t;
+
+/* Coherent applied coefficients, never a writable view of owner storage. */
+void sensor_calibration_snapshot(sensor_imu_calibration_t *out);
+/* Nonblocking submission: -EAGAIN without a ready consumer, -EBUSY for an
+ * occupied transaction/reset-all barrier, -ESHUTDOWN once terminally closed.
+ * Accepted candidates survive suspend/failed rescan for recovery or power drain;
+ * reset-all cancels them. Application remains at a sensor frame boundary. */
+int sensor_calibration_commit_bias(const float a_bias[3], const float g_bias[3], bool persist_gyro);
+int sensor_calibration_commit_accel(const float matrix[4][3]);
+int sensor_calibration_reset_imu(void);
+int sensor_calibration_reset_accel(void);
+/* Power owner calls only after the sensor is quiescent. No live fusion mutation. */
+void sensor_calibration_prepare_power_down(void);
+/* System reset-all barrier: call before storage lock, end after releasing it.
+ * Waits for in-flight persistence and cancels all pre-clear IMU transactions. */
+void sensor_calibration_clear_begin(void);
+void sensor_calibration_clear_end(void);
+
+int sensor_calibration_set_sensitivity(const float degrees[3]);
+int sensor_calibration_reset_sensitivity(void);
 int sensor_calibration_validate_mag(float m_inv[][3], bool write);
 
-void sensor_calibration_clear(float *a_bias, float *g_bias, bool write);
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-void sensor_calibration_clear_6_side(float a_inv[][3], bool write);
-#endif
+/* Candidate initialization only; live coefficients change through commits. */
+void sensor_calibration_identity_accel(float matrix[4][3]);
 void sensor_calibration_clear_mag(float m_inv[][3], bool write); // "request" mag cal
+
+enum sensor_calibration_request_id {
+	CAL_REQUEST_CLEAR = -1,
+	CAL_REQUEST_QUERY = 0,
+	CAL_REQUEST_IMU = 1,
+	CAL_REQUEST_ACCEL_6_SIDE = 2,
+	CAL_REQUEST_TCAL_BOOT = 3,
+	CAL_REQUEST_TCAL_RUNTIME = 4,
+	CAL_REQUEST_GYRO_SENS = 5,
+	/* Occupies the shared request slot throughout manual mag collection. */
+	CAL_REQUEST_MAG = 6,
+};
+
+/* QUERY returns the pending request ID, or 0 when idle. CLEAR ends sample
+ * admission and clears the slot. Other requests return 0 if accepted, -1 if busy. */
+int sensor_calibration_request(int id);
 
 void sensor_request_calibration(void);
 void sensor_request_calibration_6_side(void);
@@ -55,7 +90,9 @@ void sensor_request_calibration_mag(void);
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions);
 #endif
-void sensor_calibration_online_mag_sample(const float m[3]);
+/* Always service ownership, even when disabled. Gravity is reliable independent
+ * 6D up expressed in the raw magnetometer axis basis, never magnetic heading. */
+void sensor_calibration_online_mag_sample(const float raw[3], const float gravity_raw[3], bool gravity_valid);
 int sensor_calibration_online_mag_status(float *dir_bias);
 void sensor_calibration_track_mag_norm(float cal_norm);
 float sensor_calibration_get_mag_quality(void);
@@ -84,7 +121,7 @@ void sensor_calibration_get_last_gyro_offset(float offset[3]);
 void sensor_tcal_clear(void);
 void sensor_tcal_status(void);
 void sensor_tcal_remove_point(int index_to_remove);
-bool sensor_tcal_is_temp_outside_range(float temp, float *min_temp, float *max_temp);
+bool sensor_tcal_needs_nearby_point(float temp, float *closest_temp, float *distance_c);
 void sensor_tcal_check_auto_calibration(float current_temp);
 void sensor_tcal_set_auto_calibration(bool enabled);
 bool sensor_tcal_get_auto_calibration(void);

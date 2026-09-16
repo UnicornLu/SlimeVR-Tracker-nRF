@@ -67,11 +67,9 @@ int main(void)
 	bool reset_pin_reset = false;
 #else
 #ifdef NRF_RESET
-	bool reset_pin_reset = NRF_RESET->RESETREAS & RESET_RESETREAS_RESETPIN_Msk;
-	NRF_RESET->RESETREAS = NRF_RESET->RESETREAS; // Clear RESETREAS
+	bool reset_pin_reset = sys_get_reset_reason() & RESET_RESETREAS_RESETPIN_Msk;
 #else
-	bool reset_pin_reset = NRF_POWER->RESETREAS & POWER_RESETREAS_RESETPIN_Msk;
-	NRF_POWER->RESETREAS = NRF_POWER->RESETREAS; // Clear RESETREAS
+	bool reset_pin_reset = sys_get_reset_reason() & POWER_RESETREAS_RESETPIN_Msk;
 #endif
 #endif
 
@@ -105,7 +103,7 @@ int main(void)
 		}
 #if USER_SHUTDOWN_ENABLED
 		if (system_uptime_since_boot_ms() < 50 && booting_from_shutdown) { // debounce
-			sys_request_system_off(false);
+			sys_request_system_off();
 		}
 #endif
 		if (system_uptime_since_boot_ms() <= 5000) {

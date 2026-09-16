@@ -83,6 +83,9 @@ void esb_clear_pair(void);
 
 void esb_process_ota_rx_queue(void);
 int esb_write(uint8_t *data, bool no_ack, size_t data_length);
+/* Start the clock before guarded admission; -EAGAIN defers with HFXO warm.
+ * force_resync bypasses admission for unslotted startup recovery. */
+int esb_write_ping(uint8_t *data, bool force_resync);
 
 #define PING_INTERVAL_MS 997
 // Ping/Pong types for ACK payload validation
@@ -149,7 +152,9 @@ int esb_write(uint8_t *data, bool no_ack, size_t data_length);
 // Kept for wire-format docs / receiver + analyzer compatibility.
 #define ESB_RAW_IMU_TYPE    0x10  // DEPRECATED: legacy raw IMU (float)
 #define ESB_RAW_MAG_TYPE    0x11  // DEPRECATED: reserved raw mag
-#define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
+// Metadata (ODR, range, sensor IDs): captured once per collection session,
+// sent at session start, and replayed on explicit requests.
+#define ESB_RAW_META_TYPE   0x12
 #define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (packet-loss resistant)
 #define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
 
