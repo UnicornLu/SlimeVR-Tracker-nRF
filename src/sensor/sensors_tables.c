@@ -45,7 +45,8 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_IST8308) + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS2MDL)                                   \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS3MDL) + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5603NJ)                                 \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5983MA)                                                                         \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)                                  \
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883P)
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)                                  \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX))
 
 // Unimplemented WHO_AM_I rows (chips that map to sensor_*_none) are kept in full
@@ -81,6 +82,7 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 	(SLIME_MAG_KEEP_UNIMPL || IS_ENABLED(CONFIG_SENSOR_DRV_MMC5603NJ) || IS_ENABLED(CONFIG_SENSOR_DRV_MMC5983MA))
 #define SLIME_MAG_G9 (SLIME_MAG_KEEP_UNIMPL)
 #define SLIME_MAG_G10 (IS_ENABLED(CONFIG_SENSOR_DRV_QMC6309))
+#define SLIME_MAG_G11 (IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P))
 
 const char *dev_imu_names[SENSOR_DEV_IMU_COUNT]
 	= {"BMI160",
@@ -307,16 +309,21 @@ static const int i2c_dev_imu[] = {
 };
 
 const char *dev_mag_names[SENSOR_DEV_MAG_COUNT]
-	= {"HMC5883L",  "QMC5883L",        "QMC6309", "QMC6310",    "AK8963",    "AK09916",
-	   "AK09940",   "BMM150",          "BMM350",  "IST8306",    "IST8308",   "IST8320",
-	   "IST8321",   "IIS2MDC/LIS2MDL", "LIS3MDL", "MMC34160PJ", "MMC3630KJ", "MMC5603NJ/MMC5633NJL",
-	   "MMC5616WA", "MMC5983MA", "ICT-15312/ICT-15318"};
+	= {"HMC5883L",  "QMC5883L", "QMC5883P", "QMC6309",    "QMC6310",   "AK8963",
+	   "AK09916",   "AK09940",  "BMM150",   "BMM350",     "IST8306",   "IST8308",
+	   "IST8320",   "IST8321",  "IIS2MDC/LIS2MDL", "LIS3MDL", "MMC34160PJ", "MMC3630KJ",
+	   "MMC5603NJ/MMC5633NJL", "MMC5616WA", "MMC5983MA", "ICT-15312/ICT-15318"};
 const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 	&sensor_mag_none, // HMC5883 will not implement, too low quality
 #if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883L)
 	&sensor_mag_qmc5883l,
 #else
 	&sensor_mag_none, // QMC5883 not implemented
+#endif
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+	&sensor_mag_qmc5883p,
+#else
+	&sensor_mag_none,
 #endif
 #if IS_ENABLED(CONFIG_SENSOR_DRV_QMC6309)
 	&sensor_mag_qmc6309,
@@ -388,7 +395,7 @@ const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 #if SENSOR_MAG_DRV_COUNT > 0
 static const int i2c_dev_mag_addr_count = SLIME_MAG_G0 + SLIME_MAG_G1 + SLIME_MAG_G2 + SLIME_MAG_G3 + SLIME_MAG_G4
 										+ SLIME_MAG_G5 + SLIME_MAG_G6 + SLIME_MAG_G7 + SLIME_MAG_G8 + SLIME_MAG_G9
-										+ SLIME_MAG_G10;
+										+ SLIME_MAG_G10 + SLIME_MAG_G11;
 static const uint8_t i2c_dev_mag_addr[] = {
 #if SLIME_MAG_G0
 	1, 0x0C,
@@ -422,6 +429,9 @@ static const uint8_t i2c_dev_mag_addr[] = {
 #endif
 #if SLIME_MAG_G10
 	1, 0x7C,
+#endif
+#if SLIME_MAG_G11
+	1, 0x2C,
 #endif
 };
 static const uint8_t i2c_dev_mag_reg[] = {
@@ -463,6 +473,9 @@ static const uint8_t i2c_dev_mag_reg[] = {
 	1,    0x00,
 #endif
 #if SLIME_MAG_G10
+	1,    0x00,
+#endif
+#if SLIME_MAG_G11
 	1,    0x00,
 #endif
 };
@@ -618,6 +631,13 @@ static const uint8_t i2c_dev_mag_id[] = {
 	0x90, // QMC6309
 #endif
 #endif // SLIME_MAG_G10
+#if SLIME_MAG_G11
+	// 0x2C reg 0x00
+	(IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)),
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+	0x80, // QMC5883P
+#endif
+#endif // SLIME_MAG_G11
 };
 static const int i2c_dev_mag[] = {
 #if SLIME_MAG_G0
@@ -726,6 +746,11 @@ static const int i2c_dev_mag[] = {
 	MAG_QMC6309,
 #endif
 #endif // SLIME_MAG_G10
+#if SLIME_MAG_G11
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+	MAG_QMC5883P,
+#endif
+#endif // SLIME_MAG_G11
 };
 #endif // SENSOR_MAG_DRV_COUNT > 0
 

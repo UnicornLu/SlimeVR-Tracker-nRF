@@ -14,6 +14,7 @@ MAG_SOURCES := \
 	../../../src/sensor/mag/MMC5603NJ.c \
 	../../../src/sensor/mag/MMC5983MA.c \
 	../../../src/sensor/mag/QMC5883L.c \
+	../../../src/sensor/mag/QMC5883P.c \
 	../../../src/sensor/mag/QMC6309.c
 
 COMMON_HEADERS := ../../../src/sensor/sensor.h ../../../src/sensor/sensor_none.h \

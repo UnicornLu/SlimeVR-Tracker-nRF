@@ -19,6 +19,7 @@
 #include "sensor/mag/MMC5603NJ.h"
 #include "sensor/mag/MMC5983MA.h"
 #include "sensor/mag/QMC5883L.h"
+#include "sensor/mag/QMC5883P.h"
 #include "sensor/mag/QMC6309.h"
 
 enum fake_op_type {
@@ -284,6 +285,10 @@ static const struct expected_write mmc5983_writes[] = {
 static const struct expected_write qmc5883_writes[] = {
 	EXPECT_WRITE(0x09, 0x19),
 };
+static const struct expected_write qmc5883p_writes[] = {
+	EXPECT_WRITE(0x0B, 0x08),
+	EXPECT_WRITE(0x0A, 0xC9),
+};
 static const struct expected_write qmc6309_writes[] = {
 	EXPECT_WRITE(0x0B, 0x38),
 	EXPECT_WRITE(0x0A, 0x41),
@@ -300,6 +305,7 @@ static const struct odr_case odr_cases[] = {
 	{"MMC5603NJ", mmc5603_update_odr, mmc5603_mag_oneshot, mmc5603_shutdown, 0.012f, 1.0f / 150, mmc5603_writes, ARRAY_SIZE(mmc5603_writes), true, true},
 	{"MMC5983MA", mmc_update_odr, mmc_mag_oneshot, mmc_shutdown, 0.012f, 1.0f / 100, mmc5983_writes, ARRAY_SIZE(mmc5983_writes), true, true},
 	{"QMC5883L", qmc5883l_update_odr, qmc5883l_mag_oneshot, qmc5883l_shutdown, 0.012f, 1.0f / 100, qmc5883_writes, ARRAY_SIZE(qmc5883_writes), true, true},
+	{"QMC5883P", qmc5883p_update_odr, qmc5883p_mag_oneshot, qmc5883p_shutdown, 0.012f, 1.0f / 100, qmc5883p_writes, ARRAY_SIZE(qmc5883p_writes), true, true},
 	{"QMC6309", qmc_update_odr, qmc_mag_oneshot, qmc_shutdown, 0.012f, 1.0f / 100, qmc6309_writes, ARRAY_SIZE(qmc6309_writes), true, true},
 };
 
@@ -638,11 +644,19 @@ static int test_qmc_timeouts_stop_before_data(void)
 	CHECK(count_ops(FAKE_BURST_READ) == 0);
 	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
 
-	reset_driver(&odr_cases[10]);
+	reset_driver(&odr_cases[11]);
 	CHECK(qmc_update_odr(INFINITY, &actual_time) == 0);
 	qmc_mag_oneshot();
 	fake_bus_clear_transactions();
 	CHECK(!qmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc5883p_update_odr(INFINITY, &actual_time) == 0);
+	qmc5883p_mag_oneshot();
+	fake_bus_clear_transactions();
+	CHECK(!qmc5883p_mag_read(m));
 	CHECK(count_ops(FAKE_BURST_READ) == 0);
 	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
 	return 0;
@@ -667,6 +681,22 @@ static int test_qmc_trigger_and_burst_failures_are_not_published(void)
 	bus.fail_transaction = 1;
 	CHECK(!qmc5883l_mag_read(m));
 	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc5883p_update_odr(INFINITY, &actual_time) == 0);
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	qmc5883p_mag_oneshot();
+	bus.registers[0x09] = 0x01;
+	CHECK(!qmc5883p_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc5883p_update_odr(0.02f, &actual_time) == 0);
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	CHECK(!qmc5883p_mag_read(m));
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
 	return 0;
 }
 
@@ -681,11 +711,18 @@ static int test_qmc_oneshot_overflow_is_not_published(void)
 	CHECK(!qmc5883l_mag_read(m));
 	CHECK(count_ops(FAKE_BURST_READ) == 0);
 
-	reset_driver(&odr_cases[10]);
+	reset_driver(&odr_cases[11]);
 	CHECK(qmc_update_odr(INFINITY, &actual_time) == 0);
 	qmc_mag_oneshot();
 	bus.registers[0x09] = 0x03;
 	CHECK(!qmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc5883p_update_odr(INFINITY, &actual_time) == 0);
+	qmc5883p_mag_oneshot();
+	bus.registers[0x09] = 0x03;
+	CHECK(!qmc5883p_mag_read(m));
 	CHECK(count_ops(FAKE_BURST_READ) == 0);
 	return 0;
 }
@@ -729,7 +766,7 @@ static int test_qmc_direct_status_gate_and_variant_odr(void)
 	float actual = -1.0f;
 	float m[3] = {1.0f, 2.0f, 3.0f};
 
-	reset_driver(&odr_cases[10]);
+	reset_driver(&odr_cases[11]);
 	qmc_set_variant(false);
 	CHECK(qmc_update_odr(0.25f, &actual) == 0);
 	CHECK(float_equal(actual, 0.1f));
@@ -774,6 +811,24 @@ static int test_qmc_direct_status_gate_and_variant_odr(void)
 	fake_bus_clear_transactions();
 	CHECK(qmc5883l_mag_read(m));
 	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc5883p_update_odr(0.02f, &actual) == 0);
+	fake_bus_clear_transactions();
+	CHECK(!qmc5883p_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	bus.registers[0x09] = 0x02;
+	CHECK(!qmc5883p_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	bus.registers[0x09] = 0x01;
+	CHECK(qmc5883p_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 1);
+
+	bus.registers[0x01] = 2;
+	fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+	fake_bus_clear_transactions();
+	CHECK(qmc5883p_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
 	return 0;
 }
 
@@ -790,6 +845,10 @@ static int test_qmc_raw_decode_allows_unaligned_input(void)
 	CHECK(fabsf(m[0] - (4660.0f / 4000.0f)) < 0.00001f);
 	CHECK(fabsf(m[1] - (-52.0f / 4000.0f)) < 0.00001f);
 	CHECK(fabsf(m[2] - (-32768.0f / 4000.0f)) < 0.00001f);
+	qmc5883p_mag_process(&raw[1], m);
+	CHECK(fabsf(m[0] - (4660.0f / 3750.0f)) < 0.00001f);
+	CHECK(fabsf(m[1] - (-52.0f / 3750.0f)) < 0.00001f);
+	CHECK(fabsf(m[2] - (-32768.0f / 3750.0f)) < 0.00001f);
 	return 0;
 }
 
@@ -907,7 +966,7 @@ int main(void)
 {
 	static const struct test_case tests[] = {
 		{"BMM350 init and compensation", test_bmm350_init_and_compensation},
-		{"11-driver fixed-ODR transaction matrix", test_all_fixed_odr_transactions},
+		{"12-driver fixed-ODR transaction matrix", test_all_fixed_odr_transactions},
 		{"IST8308 init drive-rate write", test_ist8308_init_programs_drive_rate_first},
 		{"LIS3 oneshot timeout", test_lis3_oneshot_timeout_stops_before_data},
 		{"LIS temperatures", test_lis_temperatures_fail_loudly_and_apply_offset},
