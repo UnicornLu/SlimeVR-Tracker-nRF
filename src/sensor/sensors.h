@@ -84,6 +84,9 @@
 #if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883L)
 #include "mag/QMC5883L.h"
 #endif
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+#include "mag/QMC5883P.h"
+#endif
 #if IS_ENABLED(CONFIG_SENSOR_DRV_QMC6309)
 #include "mag/QMC6309.h"
 #endif
