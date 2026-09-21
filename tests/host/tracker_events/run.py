@@ -64,7 +64,11 @@ def main():
     parser.add_argument("--end-to-end", action="store_true")
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
-    cases = args.case or ["copies", "lifecycle", "progress", "online", "states", "receipts", "scheduling", "state-heartbeat", "entropy-error", "entropy-zero"]
+    cases = args.case or ["copies", "lifecycle", "progress", "online", "states", "receipts", "scheduling", "state-heartbeat", "entropy-error", "entropy-zero",
+                          "startup-boot", "startup-wake", "startup-watchdog", "startup-wake-watchdog",
+                          "startup-late", "startup-wrap", "startup-session", "power-priority", "wom-cancellation",
+                          "terminal-priority", "terminal-before-startup", "terminal-before-schedule",
+                          "startup-disconnected", "startup-wrap-sentinel", "next-send-wrap-sentinel"]
     cc = shlex.split(os.environ.get("CC", "cc"))
     with tempfile.TemporaryDirectory(prefix="tracker-events-") as temp:
         temp = Path(temp)
@@ -76,6 +80,9 @@ def main():
         source = temp / "core.c"
         source.write_text('#include "leaves.h"\n#include "' + str(ROOT / "src/connection/tracker_events.c") + '"\n' + (HERE / "test_core.c").read_text())
         flags = ["-std=c11", "-Wall", "-Wextra", "-Wno-unused-function", "-Wno-unused-variable", "-Wno-misleading-indentation", "-O0", "-g", "-I", str(temp), "-I", str(ROOT / "src")]
+        motion = temp / "motion"
+        subprocess.run(cc + flags + [str(HERE / "test_motion.c"), str(ROOT / "src/sensor/motion_state.c"), str(ROOT / "src/util.c"), "-lm", "-o", str(motion)], check=True)
+        subprocess.run([str(motion)], check=True)
         protocol = temp / "protocol"
         subprocess.run(cc + flags + [str(HERE / "test_protocol.c"), "-o", str(protocol)], check=True)
         subprocess.run([str(protocol)], check=True)
