@@ -311,7 +311,7 @@ const char *dev_mag_names[SENSOR_DEV_MAG_COUNT]
 	= {"HMC5883L",  "QMC5883L",        "QMC6309", "QMC6310",    "AK8963",    "AK09916",
 	   "AK09940",   "BMM150",          "BMM350",  "IST8306",    "IST8308",   "IST8320",
 	   "IST8321",   "IIS2MDC/LIS2MDL", "LIS3MDL", "MMC34160PJ", "MMC3630KJ", "MMC5603NJ/MMC5633NJL",
-	   "MMC5616WA", "MMC5983MA", "ICT-15312/ICT-15318"， "QMC5883P"};
+	   "MMC5616WA", "MMC5983MA", "ICT-15312/ICT-15318", "QMC5883P"};
 const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 	&sensor_mag_none, // HMC5883 will not implement, too low quality
 #if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883L)
