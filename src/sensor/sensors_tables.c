@@ -45,9 +45,8 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_IST8308) + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS2MDL)                                   \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS3MDL) + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5603NJ)                                 \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5983MA)                                                                         \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)    
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883P)                           \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX))
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)    							   \
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883P)                                 \
 
 // Unimplemented WHO_AM_I rows (chips that map to sensor_*_none) are kept in full
 // builds for probe-behavior parity, and dropped when that axis opts into MINIMAL.
