@@ -100,6 +100,9 @@
 		pwm_led1: pwm_led_1 {
 			pwms = <&pwm1 1 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
 		};
+		pwm_led2: pwm_led_2 {
+			pwms = <&pwm1 2 PWM_MSEC(1) PWM_POLARITY_INVERTED>;
+		};
 	};
 
 	leds {
