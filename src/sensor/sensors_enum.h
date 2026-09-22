@@ -135,7 +135,7 @@ enum dev_imu {
 	IMU_LSM6DST,
 	IMU_LSM6DSV,
 	IMU_ISM330BX  // LSM6DSV16B/ISM330BX
-}};
+};
 
 enum dev_mag {
 	MAG_HMC5883L,
@@ -160,6 +160,6 @@ enum dev_mag {
 	MAG_MMC5616WA,
 	MAG_MMC5983MA,
 	MAG_ICT153XX  // ICT-15312/ICT-15318
-}};
+};
 
 #endif
