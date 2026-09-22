@@ -45,8 +45,8 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_IST8308) + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS2MDL)                                   \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS3MDL) + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5603NJ)                                 \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5983MA)                                                                         \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)    							   \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883P))                                
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)                                  \
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883P))
 
 // Unimplemented WHO_AM_I rows (chips that map to sensor_*_none) are kept in full
 // builds for probe-behavior parity, and dropped when that axis opts into MINIMAL.
@@ -394,7 +394,7 @@ const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 #if SENSOR_MAG_DRV_COUNT > 0
 static const int i2c_dev_mag_addr_count = SLIME_MAG_G0 + SLIME_MAG_G1 + SLIME_MAG_G2 + SLIME_MAG_G3 + SLIME_MAG_G4
 										+ SLIME_MAG_G5 + SLIME_MAG_G6 + SLIME_MAG_G7 + SLIME_MAG_G8 + SLIME_MAG_G9
-										+ SLIME_MAG_G10;
+										+ SLIME_MAG_G10 + SLIME_MAG_G11;
 static const uint8_t i2c_dev_mag_addr[] = {
 #if SLIME_MAG_G0
 	1, 0x0C,
