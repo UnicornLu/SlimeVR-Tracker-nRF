@@ -1,0 +1,9 @@
+// Copyright (c) 2024 Nordic Semiconductor ASA
+// SPDX-License-Identifier: Apache-2.0
+
+/dts-v1/;
+#include "nini_slimevr_mag_uf2.dts"
+
+&{/zephyr,user} {
+	/delete-property/ clk-gpios;
+    };
