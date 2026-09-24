@@ -7,11 +7,12 @@
 #include <zephyr/pm/device.h>
 
 #include "led.h"
+#include "led_strip_fade.h"
 
 LOG_MODULE_REGISTER(led, LOG_LEVEL_INF);
 
 static void led_thread(void);
-K_THREAD_DEFINE(led_thread_id, 512, led_thread, NULL, NULL, NULL, LED_THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(led_thread_id, CONFIG_LED_THREAD_STACK_SIZE, led_thread, NULL, NULL, NULL, LED_THREAD_PRIORITY, 0, 0);
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 
@@ -25,6 +26,7 @@ static const struct gpio_dt_spec led_en = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, led
 #include <zephyr/drivers/led_strip.h>
 #define STRIP_NODE DT_ALIAS(led_strip)
 static const struct device *const strip = DEVICE_DT_GET(STRIP_NODE);
+static struct led_strip_fade led_fade;
 #endif
 
 #if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, led_gpios)
@@ -87,6 +89,9 @@ static int led_pattern_state;
 static int led_pin_init(void)
 {
 	LOG_DBG("led_pin_init");
+#ifdef LED_STRIP_EXISTS
+	led_strip_fade_reset(&led_fade);
+#endif
 #if LED_EXISTS
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT);
 	gpio_pin_set_dt(&led, 0);
@@ -244,6 +249,85 @@ static int led_pwm_period[5][1] = {
 
 // Using brightness and value if PWM is supported, otherwise value is coerced to on/off
 // TODO: use computed constants for high/low brightness and color values
+#if CONFIG_LED_STRIP_TIMING_LOG
+/*
+ * Diagnostic for the fade smoothness: the sub-level carry relies on the fade
+ * patterns refreshing at their nominal rate, so report the actual frame period
+ * (between two strip updates) and how long the update itself blocked, once per
+ * 1000 frames - about every 5 s while a pattern is fading.
+ */
+static void led_strip_timing_note(uint32_t start_ticks)
+{
+	static uint32_t frames;
+	static uint32_t previous_start;
+	static uint32_t period_min_us = UINT32_MAX;
+	static uint32_t period_max_us;
+	static uint64_t period_sum_us;
+	static uint32_t update_min_us = UINT32_MAX;
+	static uint32_t update_max_us;
+	static uint64_t update_sum_us;
+	static uint32_t late_frames;
+
+	uint32_t now = k_uptime_ticks();
+	uint32_t update_us = k_ticks_to_us_floor32(now - start_ticks);
+
+	if (frames > 0) {
+		uint32_t period_us = k_ticks_to_us_floor32(start_ticks - previous_start);
+
+		if (period_us < period_min_us) {
+			period_min_us = period_us;
+		}
+		if (period_us > period_max_us) {
+			period_max_us = period_us;
+		}
+		period_sum_us += period_us;
+		if (period_us > 20000) {
+			late_frames++;
+		}
+	}
+	if (update_us < update_min_us) {
+		update_min_us = update_us;
+	}
+	if (update_us > update_max_us) {
+		update_max_us = update_us;
+	}
+	update_sum_us += update_us;
+	previous_start = start_ticks;
+	frames++;
+
+	if (frames >= 1000) {
+		LOG_INF("strip frames %u: period %u/%u/%u us (min/avg/max), late(>20ms) %u; "
+			"update blocked %u/%u/%u us",
+			frames, period_min_us, (uint32_t)(period_sum_us / (frames - 1)),
+			period_max_us, late_frames, update_min_us,
+			(uint32_t)(update_sum_us / frames), update_max_us);
+		frames = 0;
+		period_min_us = UINT32_MAX;
+		period_max_us = 0;
+		period_sum_us = 0;
+		update_min_us = UINT32_MAX;
+		update_max_us = 0;
+		update_sum_us = 0;
+		late_frames = 0;
+	}
+}
+#endif
+
+/*
+ * Sleep the remainder of a nominal pattern step. A strip update blocks for over
+ * a millisecond, so sleeping the full step on top of it would stretch the
+ * pattern cadence by a third (measured: 6.65 s per breathing cycle instead of
+ * the intended 5 s) and make the fade steps that much coarser.
+ */
+static void led_pattern_sleep(uint32_t step_start_ticks, uint32_t step_us)
+{
+	uint32_t elapsed_us = k_ticks_to_us_floor32(k_uptime_ticks() - step_start_ticks);
+
+	if (elapsed_us < step_us) {
+		k_usleep(step_us - elapsed_us);
+	}
+}
+
 static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value_pptt)
 {
 	LOG_DBG("led_pin_set: color %d, brightness %d, value %d", color, brightness_pptt, value_pptt);
@@ -260,12 +344,20 @@ static void led_pin_set(enum sys_led_color color, int brightness_pptt, int value
 #if LED_STRIP_EXISTS
 	static struct led_rgb pixel[1];
 	value_pptt = value_pptt * brightness_pptt / 10000;
-	pixel[0].r = 255 * (led_pwm_period[color][0] * value_pptt / 10000) / 10000;
-	pixel[0].g = 255 * (led_pwm_period[color][1] * value_pptt / 10000) / 10000;
-	pixel[0].b = 255 * (led_pwm_period[color][2] * value_pptt / 10000) / 10000;
+	value_pptt = value_pptt * CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT / 10000;
+	pixel[0].r = led_strip_fade_next(&led_fade, led_pwm_period[color][0], value_pptt, 0);
+	pixel[0].g = led_strip_fade_next(&led_fade, led_pwm_period[color][1], value_pptt, 1);
+	pixel[0].b = led_strip_fade_next(&led_fade, led_pwm_period[color][2], value_pptt, 2);
+#if CONFIG_LED_STRIP_TIMING_LOG
+	uint32_t led_frame_start = k_uptime_ticks();
+#endif
 	led_strip_update_rgb(strip, pixel, 1);
+#if CONFIG_LED_STRIP_TIMING_LOG
+	led_strip_timing_note(led_frame_start);
+#endif
 #elif PWM_LED_EXISTS
 	value_pptt = value_pptt * brightness_pptt / 10000;
+	value_pptt = value_pptt * CONFIG_LED_GLOBAL_BRIGHTNESS_PPTT / 10000;
 	// only supporting color if PWM is supported
 	pwm_set_pulse_dt(&pwm_led, pwm_led.period / 10000 * (led_pwm_period[color][0] * value_pptt / 10000));
 #if PWM_LED1_EXISTS
@@ -364,11 +456,14 @@ static void led_thread(void)
 			break;
 		case SYS_LED_PATTERN_ONESHOT_POWEROFF:
 			if (led_pattern_state++ > 0) {
+				uint32_t fade_step_start = k_uptime_ticks();
+
 				led_pin_set(
 					SYS_LED_COLOR_DEFAULT,
 					(202 - led_pattern_state) * 50,
 					(led_pattern_state != 202 ? 10000 : 0)
 				);
+				led_pattern_sleep(fade_step_start, 5000);
 			} else {
 				led_pin_set(SYS_LED_COLOR_DEFAULT, 10000, 0);
 			}
@@ -376,8 +471,6 @@ static void led_thread(void)
 				set_led(SYS_LED_PATTERN_OFF_FORCE, SYS_LED_PRIORITY_HIGHEST);
 			} else if (led_pattern_state == 1) {
 				k_msleep(250);
-			} else {
-				k_msleep(5);
 			}
 			break;
 		case SYS_LED_PATTERN_ONESHOT_PROGRESS:
@@ -419,6 +512,7 @@ static void led_thread(void)
 			break;
 		case SYS_LED_PATTERN_PULSE_PERSIST:
 			led_pattern_state = (led_pattern_state + 1) % 1000;
+			uint32_t step_start = k_uptime_ticks();
 			//			float led_value = sinf(led_pattern_state * (M_PI / 1000));
 			//			led_pin_set(SYS_LED_COLOR_CHARGING, 10000, led_value * 10000);
 			int led_value = led_pattern_state > 500 ? 1000 - led_pattern_state : led_pattern_state;
@@ -432,7 +526,7 @@ static void led_thread(void)
 				led_value = (led_value - 400) * 5 + 9500;
 			}
 			led_pin_set(SYS_LED_COLOR_CHARGING, 10000, led_value);
-			k_msleep(5);
+			led_pattern_sleep(step_start, 5000);
 			break;
 		case SYS_LED_PATTERN_ACTIVE_PERSIST: // off duration first because the device may turn on multiple times rapidly
 											 // and waste battery power

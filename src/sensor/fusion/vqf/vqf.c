@@ -168,31 +168,31 @@ void vqf_update_sensor_ids(int imu)
 static void set_params()
 {
 	init_params(&params);
-	params.tauAcc = 3.8f;
+	params.tauAcc = 5.92f;
 	params.biasClip = 5.0f;
-	params.biasForgettingTime = 100.0f;
-	params.biasSigmaInit = 1.0f;
-	params.biasSigmaMotion = 0.28f;
-	params.biasSigmaRest = 0.05f;
+	params.biasForgettingTime = 1000.0f;
+	params.biasSigmaInit = 30.0f;
+	params.biasSigmaMotion = 0.0888f;
+	params.biasSigmaRest = 0.07f;
 	params.biasVerticalForgettingFactor = 0.0001f;
 	params.motionBiasEstEnabled = true;
 	params.restBiasEstEnabled = true;
-	params.restFilterTau = 1.34f;
-	params.restMinT = 2.8f;
-	params.restThGyr = 0.8f;
-	params.restThAcc = 0.08f;
+	params.restFilterTau = 2.565f;
+	params.restMinT = 1.832f;
+	params.restThGyr = 2.127f;
+	params.restThAcc = 0.104f;
 	params.magDistRejectionEnabled = true;
 	params.tauMag = 9.0f;
-	params.magCurrentTau = 0.50f;
+	params.magCurrentTau = 0.20f;
 	params.magNormTh = 0.10f;
-	params.magDipTh = 4.0f;
+	params.magDipTh = 5.0f;
 	params.magRefTau = 10.0f;
-	params.magNewTime = 3.0f;
-	params.magNewFirstTime = 3.0f;
-	params.magNewMinGyr = 20.0f;
+	params.magNewTime = 15.0f;
+	params.magNewFirstTime = 5.0f;
+	params.magNewMinGyr = 10.0f;
 	params.magMinUndisturbedTime = 0.5f;
-	params.magMaxRejectionTime = 3200.0f;
-	params.magRejectionFactor = 1150.0f;
+	params.magMaxRejectionTime = 60.0f;
+	params.magRejectionFactor = 1000.0f;
 }
 
 void vqf_init(float g_time, float a_time, float m_time)
@@ -517,6 +517,59 @@ void vqf_set_gyro_bias(float *g_off)
 		g_off_rad[i] = g_off[i] * DEG_TO_RAD;
 	}
 	setBiasEstimate(&state, g_off_rad, -1);
+}
+
+void vqf_rebase_gyro_bias(const float delta_dps[3])
+{
+	/* Change input coordinates, not the physical bias estimate. Do not use
+	 * setBiasEstimate(), reset covariance, or clip the translated residual. */
+	vqf_real_t delta[3];
+	for (int i = 0; i < 3; i++) {
+		delta[i] = delta_dps[i] * DEG_TO_RAD;
+		state.bias[i] += delta[i];
+		state.restLastGyrLp[i] += delta[i];
+	}
+
+	/* filterVec initially stores [NaN, count, sums...], then switches to
+	 * transposed direct-form II pairs. No samples means all-NaN: leave it
+	 * untouched so the first sample initializes in the new coordinates.
+	 * Use the bit-based finite check even for the native NaN markers. */
+	if (!vqf_float_finite((float)state.restGyrLpState[0])) {
+		if (vqf_float_finite((float)state.restGyrLpState[1])) {
+			for (int i = 0; i < 3; i++) {
+				state.restGyrLpState[2 + i] += state.restGyrLpState[1] * (vqf_double_t)delta[i];
+			}
+		}
+	} else {
+		for (int i = 0; i < 3; i++) {
+			state.restGyrLpState[2 * i] += (vqf_double_t)delta[i] * ((vqf_double_t)1 - coeffs.restGyrLpB[0]);
+			state.restGyrLpState[2 * i + 1] += (vqf_double_t)delta[i] * (coeffs.restGyrLpB[2] - coeffs.restGyrLpA[1]);
+		}
+	}
+
+	/* LP(R*b) becomes LP(R*b) + LP(R)*delta. Both native filters advance
+	 * together, including their averaging/count initialization. Translate
+	 * the two earth-horizontal rows using their actual R history, not the
+	 * current attitude or a constant steady-state approximation. */
+	if (!vqf_float_finite((float)state.motionBiasEstBiasLpState[0])) {
+		if (vqf_float_finite((float)state.motionBiasEstBiasLpState[1])) {
+			for (int row = 0; row < 2; row++) {
+				for (int col = 0; col < 3; col++) {
+					state.motionBiasEstBiasLpState[2 + row] +=
+						state.motionBiasEstRLpState[2 + 3 * row + col] * (vqf_double_t)delta[col];
+				}
+			}
+		}
+	} else {
+		for (int row = 0; row < 2; row++) {
+			for (int col = 0; col < 3; col++) {
+				for (int k = 0; k < 2; k++) {
+					state.motionBiasEstBiasLpState[2 * row + k] +=
+						state.motionBiasEstRLpState[2 * (3 * row + col) + k] * (vqf_double_t)delta[col];
+				}
+			}
+		}
+	}
 }
 
 void vqf_update_gyro_sanity(float *g, float *m)
@@ -987,6 +1040,7 @@ const sensor_fusion_t sensor_fusion_vqf = {
 
 	.get_gyro_bias = vqf_get_gyro_bias,
 	.set_gyro_bias = vqf_set_gyro_bias,
+	.rebase_gyro_bias = vqf_rebase_gyro_bias,
 
 	.update_gyro_sanity = vqf_update_gyro_sanity,
 	.get_gyro_sanity = vqf_get_gyro_sanity,
