@@ -82,6 +82,57 @@ config LED_DEFAULT_COLOR_B
 
 endmenu
 
+config LED_GLOBAL_BRIGHTNESS_PPTT
+    int "Global LED brightness (pptt)"
+    range 0 10000
+    default 10000
+    help
+        Scale LED output brightness in parts per ten-thousand.
+        10000 is full brightness, 2500 is 25%.
+
+config LED_STRIP_TIMING_LOG
+    bool "Log LED strip frame timing"
+    default n
+    depends on LED_STRIP
+    help
+        Log one line with the LED strip frame period and how long the strip
+        update blocked, once per 1000 frames (about every 5 seconds while a
+        pattern is fading). Diagnostic for fade smoothness on real hardware.
+
+menu "Thread stack sizes"
+
+config LED_THREAD_STACK_SIZE
+    int "LED thread stack size"
+    default 512
+    help
+        Stack size of the LED thread. LED strip drivers run the update path in
+        the caller's context, so this size also has to cover the strip driver.
+
+config STATUS_THREAD_STACK_SIZE
+    int "Status thread stack size"
+    default 512
+    help
+        Stack size of the status thread. Status changes call into the LED
+        driver, so the LED strip update path can run on this stack as well.
+
+config USB_INIT_THREAD_STACK_SIZE
+    int "USB init thread stack size"
+    default 512
+    help
+        Stack size of the USB init thread. It registers the descriptors and
+        enables the USB device, and the USBD callbacks for the first bus
+        events (bus reset, configuration, VBUS) run in this context, so the
+        whole USB device stack init and enumeration path has to fit here.
+
+config USB_CTRL_THREAD_STACK_SIZE
+    int "USB control thread stack size"
+    default 512
+    help
+        Stack size of the USB control thread, which services CDC line state
+        changes and the DFU touch window.
+
+endmenu
+
 config USER_EXTRA_ACTIONS
     bool "Multiple press actions"
     help
