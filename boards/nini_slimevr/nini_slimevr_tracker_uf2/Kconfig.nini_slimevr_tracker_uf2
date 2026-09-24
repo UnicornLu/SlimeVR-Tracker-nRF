@@ -1,5 +1,5 @@
 # Copyright (c) 2024 Nordic Semiconductor ASA
 # SPDX-License-Identifier: Apache-2.0
 
-config BOARD_NINI_SLIMEVR_MAG_TRACKER_UF2
+config BOARD_NINI_SLIMEVR_TRACKER_UF2
 	select SOC_NRF52833_QDAA
