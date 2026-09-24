@@ -65,7 +65,6 @@
 					<NRF_PSEL(PWM_OUT1, 0, 20)>,
 					<NRF_PSEL(PWM_OUT1, 0, 9)>;
 			nordic,drive-mode = <NRF_DRIVE_D0S1>;
-			nordic,invert;
 		};
 	};
 
