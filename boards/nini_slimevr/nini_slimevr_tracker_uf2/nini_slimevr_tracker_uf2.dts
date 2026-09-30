@@ -61,18 +61,22 @@
 
 	pwm1_default: pwm1_default {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 10)>,
-					<NRF_PSEL(PWM_OUT1, 0, 20)>,
-					<NRF_PSEL(PWM_OUT2, 0, 9)>;
+			/* led.c indexes its color table as 0=red, 1=green, 2=blue and
+			 * feeds those indexes straight to pwm_led0/1/2, so the channel
+			 * order has to match the wiring: green on P0.20 (led_1),
+			 * blue on P0.09 (led_2), red on P0.10 (led_3). */
+			psels = <NRF_PSEL(PWM_OUT0, 0, 20)>,
+					<NRF_PSEL(PWM_OUT1, 0, 9)>,
+					<NRF_PSEL(PWM_OUT2, 0, 10)>;
 			nordic,drive-mode = <NRF_DRIVE_S0H1>;
 		};
 	};
 
 	pwm1_sleep: pwm1_sleep {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 10)>,
-					<NRF_PSEL(PWM_OUT1, 0, 20)>,
-					<NRF_PSEL(PWM_OUT2, 0, 9)>;
+			psels = <NRF_PSEL(PWM_OUT0, 0, 20)>,
+					<NRF_PSEL(PWM_OUT1, 0, 9)>,
+					<NRF_PSEL(PWM_OUT2, 0, 10)>;
 			low-power-enable;
 		};
 	};
