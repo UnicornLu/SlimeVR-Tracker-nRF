@@ -22,6 +22,7 @@
 */
 #include "globals.h"
 #include "sensor/calibration/calibration.h"
+#include "sensor/calibration/tcal_heated.h"
 #include "sensor/sensor.h"
 #include "system/system.h"
 #include "system/battery_tracker.h"
@@ -269,6 +270,22 @@ static void esb_remote_cmd_tcal_off(void)
 #if CONFIG_SENSOR_USE_TCAL
 	LOG_INF("Executing remote command: TCAL_OFF");
 	sensor_tcal_set_enabled(false);
+#endif
+}
+
+static void esb_remote_cmd_tcal_heated_start(void)
+{
+#if CONFIG_SENSOR_TCAL_HEATED
+	/* Consume this request even on refusal; never retry a rejected start later.
+	 * The radio echo acknowledges delivery, not heater acceptance. */
+	int err = sensor_tcal_heated_start(CONFIG_SENSOR_TCAL_HEATED_DEFAULT_TARGET_C);
+	if (err) {
+		LOG_WRN("Remote command: TCAL_HEATED_START rejected: %d", err);
+	} else {
+		LOG_INF("Executing remote command: TCAL_HEATED_START");
+	}
+#else
+	LOG_WRN("Remote command: TCAL_HEATED_START unsupported (heated T-Cal disabled)");
 #endif
 }
 
@@ -574,6 +591,7 @@ static const struct esb_remote_cmd esb_remote_cmds[] = {
 	{ESB_PONG_FLAG_RESET_TCAL, "RESET_TCAL", esb_remote_cmd_reset_tcal},
 	{ESB_PONG_FLAG_TCAL_AUTO_ON, "TCAL_AUTO_ON", esb_remote_cmd_tcal_auto_on},
 	{ESB_PONG_FLAG_TCAL_AUTO_OFF, "TCAL_AUTO_OFF", esb_remote_cmd_tcal_auto_off},
+	{ESB_PONG_FLAG_TCAL_HEATED_START, "TCAL_HEATED_START", esb_remote_cmd_tcal_heated_start},
 	{ESB_PONG_FLAG_PING, "PING", esb_remote_cmd_ping},
 	{ESB_PONG_FLAG_FUSION_RESET, "FUSION_RESET", esb_remote_cmd_fusion_reset},
 	{ESB_PONG_FLAG_TCAL_BOOT_ON, "TCAL_BOOT_ON", esb_remote_cmd_tcal_boot_on},
@@ -2223,6 +2241,38 @@ void esb_get_ping_request_data(uint8_t out[4])
 		memset(out, 0, 4);
 	}
 	irq_unlock(key);
+}
+
+bool esb_get_status_clock(uint32_t *local_ticks, uint32_t *network_ticks)
+{
+	/* ESB RX publishes these fields in interrupt context. Capture the kernel
+	 * timestamp and all eligibility/estimator state together; do the 64-bit
+	 * conversions and skew arithmetic after releasing the interrupt lock. */
+	unsigned key = irq_lock();
+	uint64_t kernel_ticks = k_uptime_ticks();
+	bool synced = server_time_synced && esb_conn_state == ESB_ST_PAIRED
+		&& get_status(SYS_STATUS_CONNECTION_ERROR) == 0;
+	int64_t max_age_ms = tdma_status_clock_max_age_ms();
+	int64_t last_sync_ms = g_last_sync_timestamp;
+	uint32_t offset = g_server_ticks_offset;
+	uint32_t reference_ticks = g_last_sync_local_ticks;
+	int32_t skew_ppb = g_clock_skew_ppb;
+	irq_unlock(key);
+
+	uint32_t local = (uint32_t)net_ticks_from_kernel64(kernel_ticks);
+	*local_ticks = local;
+	*network_ticks = local;
+	int64_t age_ms = (int64_t)k_ticks_to_ms_floor64(kernel_ticks) - last_sync_ms;
+	if (!synced || max_age_ms < 0 || age_ms < 0 || age_ms > max_age_ms) {
+		return false;
+	}
+
+	uint32_t elapsed = local - reference_ticks;
+	int64_t correction = (int64_t)skew_ppb * elapsed / 1000000000LL;
+	/* Unsigned additions deliberately retain the receiver's low32 epoch;
+	 * zero is a valid synchronized timestamp, not an unavailable sentinel. */
+	*network_ticks = local + offset + (uint32_t)correction;
+	return true;
 }
 
 uint64_t esb_get_server_time_ticks_64(void)
