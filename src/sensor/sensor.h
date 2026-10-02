@@ -55,6 +55,10 @@ void sensor_mag_ref_reset(void);
 /* Fusion policy accessors (backend-agnostic; prefer over vqf_* / eqf_*). */
 bool sensor_fusion_get_rest_detected(void);
 bool sensor_fusion_get_mag_dist_detected(void);
+
+/* Milliseconds since the last observation that was not quiet (LED resting dim). */
+int64_t sensor_ms_since_motion(void);
+
 /* Thread-safe requests, applied only by sensor before the next magnetic feed. */
 void sensor_fusion_reset_mag_ref(void);
 void sensor_fusion_set_mag_ref(float norm, float dip);

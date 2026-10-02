@@ -93,6 +93,14 @@ config LED_TRI_COLOR
     help
         Use the default color mapping for LED status.
 
+        On boards that expose three PWM LED aliases, selecting this also opts
+        into the three-channel renderer in src/system/led.c: red, green and blue
+        are arbitrated and phased independently (green work breathe plus blue
+        link heartbeat, red power domain) with the daily/debug assignment
+        tables. Boards that do not select it keep the single-arbitration
+        renderer. The ledmode, ledbright and ledmap console commands configure
+        it at runtime.
+
 endchoice
 
 menu "Status LED default status color"

@@ -155,6 +155,10 @@ static int force_scan_request_count = 0;
 // Periodic retained save interval (ms) for crash recovery
 #define RETAINED_SAVE_INTERVAL_MS 5000
 
+/* Timestamp of the most recent observation that was not quiet. Consumed by the
+ * LED worker for the resting dim; -1 means "no sample yet". */
+static int64_t sensor_last_active_ms = -1;
+
 /* Magnetometer reads share one deadline regardless of the selected bus backend. */
 static int64_t mag_read_period_ticks = 1;
 static int64_t next_mag_read_ticks;
@@ -713,6 +717,7 @@ static bool sensor_motion_observe(
 		memcpy(sensor_motion_state.reference_q, current_q, sizeof(sensor_motion_state.reference_q));
 		sensor_motion_state.initialized = true;
 		elapsed = 0;
+		sensor_last_active_ms = now; // first sample counts as active: no dim at boot
 	}
 #if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
 	if (sensor_session_woke_from_wom && !sensor_session_meaningful_motion) {
@@ -732,8 +737,15 @@ static bool sensor_motion_observe(
 #endif
 	float angle = sensor_motion_quat_angle(sensor_motion_state.reference_q, current_q);
 	uint32_t dt = elapsed > 0 ? (uint32_t)elapsed : 0;
+	/* Any meaningful motion refreshes the activity clock used by the resting LED
+	 * dim; the predicates are pure and evaluated once for the state machine. */
+	bool quiet = sensor_motion_is_quiet(*linear, angle, &evidence);
+	bool active = sensor_motion_is_active(*linear, angle, &evidence);
+	if (active) {
+		sensor_last_active_ms = now;
+	}
 	if (sensor_motion_state.resting) {
-		if (sensor_motion_is_active(*linear, angle, &evidence)) {
+		if (active) {
 			/* Start the high-threshold dwell at this observation. */
 			if (sensor_motion_state.motion_ms == 0) sensor_motion_state.motion_ms = 1;
 			else sensor_motion_state.motion_ms += dt;
@@ -745,7 +757,7 @@ static bool sensor_motion_observe(
 		} else {
 			sensor_motion_state.motion_ms = 0;
 		}
-	} else if (sensor_motion_is_quiet(*linear, angle, &evidence)) {
+	} else if (quiet) {
 		if (sensor_motion_state.quiet_ms == 0) sensor_motion_state.quiet_ms = 1;
 		else sensor_motion_state.quiet_ms += dt;
 		if (sensor_motion_state.quiet_ms > SENSOR_REST_ENTER_STABLE_MS) {
@@ -760,6 +772,18 @@ static bool sensor_motion_observe(
 	}
 	*resting = sensor_motion_state.resting;
 	return true;
+}
+
+/* Milliseconds since the last observation that was not quiet (LED resting dim).
+ * Returns 0 while no sample has been seen yet, so configurations without an IMU
+ * never dim. */
+int64_t sensor_ms_since_motion(void)
+{
+	if (sensor_last_active_ms < 0) {
+		return 0;
+	}
+	int64_t since = k_uptime_get() - sensor_last_active_ms;
+	return since < 0 ? 0 : since;
 }
 
 static int sensor_scan(void);

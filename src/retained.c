@@ -102,6 +102,13 @@ bool retained_validate(void)
 		retained->watchdog_state.last_reset_uptime = 0;
 		/* Stored channel encoding: 0xFF = default (see esb.h helpers). */
 		retained->rf_channel = 0xFF;
+		/* LED preferences need explicit defaults: a memset gives brightness 0
+		 * (all off) and a degenerate binding, which is never intended. */
+		retained->led_mode = 0;    /* LED_MODE_DAILY */
+		retained->led_bright = 25; /* 25%: every effect output scales to this */
+		retained->led_bind[0] = 0; /* LED1 = R */
+		retained->led_bind[1] = 1; /* LED2 = G */
+		retained->led_bind[2] = 2; /* LED3 = B */
 	}
 
 	/* Reset to accrue runtime from this session. */

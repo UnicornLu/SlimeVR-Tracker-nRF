@@ -140,6 +140,13 @@ struct retained_data {
 		uint32_t total_wdt_resets;     // Cumulative WDT reset count (for debugging)
 		uint32_t magic;                // Magic number to validate watchdog state
 	} watchdog_state;
+
+	/* LED display preferences for three-channel boards. Outside the CRC so
+	 * changing them never invalidates calibration data. 0xFF means "not
+	 * initialized" and falls back to the board defaults. */
+	uint8_t led_mode;    // assignment table: 0 = daily (breathing), 1 = debug (flashing)
+	uint8_t led_bright;  // global brightness percent (0-100); all effects scale to it
+	uint8_t led_bind[3]; // semantic color on physical LED1/2/3 (0 = R, 1 = G, 2 = B)
 };
 
 /* Magic number to validate watchdog state */
