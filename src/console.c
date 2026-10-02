@@ -1265,6 +1265,132 @@ static void print_button_help(void)
 	printk("\n");
 }
 
+static void console_cmd_ledmode(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (arg == NULL) {
+		printk("ledmode: %s (daily = breathing family / debug = flashing family, kept across reboot)\n",
+		       get_led_mode() == LED_MODE_DEBUG ? "debug" : "daily");
+	} else if (strcmp(arg, "debug") == 0) {
+		set_led_mode(LED_MODE_DEBUG);
+		printk("ledmode: debug (flashing family) applied and persisted\n");
+	} else if (strcmp(arg, "daily") == 0) {
+		set_led_mode(LED_MODE_DAILY);
+		printk("ledmode: daily (breathing family) applied and persisted\n");
+	} else {
+		printk("Error: unknown argument '%s'. Use 'ledmode [daily|debug]'.\n", arg);
+	}
+}
+
+static void console_cmd_ledbright(size_t argc, char **argv)
+{
+	char *arg = argc > 1 ? argv[1] : NULL;
+
+	if (arg == NULL) {
+		printk("ledbright: %u%% (0-100, scales every effect, kept across reboot)\n",
+		       get_led_brightness());
+		return;
+	}
+	char *endptr = NULL;
+	long value = strtol(arg, &endptr, 10);
+	if (endptr == arg || *endptr != '\0' || value < 0 || value > 100) {
+		printk("Error: brightness out of range (0-100).\n");
+		return;
+	}
+	set_led_brightness((uint8_t)value);
+	printk("ledbright: %ld%% applied and persisted\n", value);
+}
+
+/* LED binding: which semantic color sits on each physical position LED1/2/3
+ * (= devicetree pwm-led0/1/2). A full assignment has to be a permutation of
+ * R/G/B (duplicates are rejected); naming a single position swaps it with the
+ * position that currently holds that color, so duplicates cannot appear. */
+static void console_cmd_ledmap(size_t argc, char **argv)
+{
+	static const char color_names[3] = {'R', 'G', 'B'};
+
+	if (argc == 1) {
+		uint8_t cur[3];
+		get_led_binding(cur);
+		printk("ledmap: LED1=%c LED2=%c LED3=%c (physical -> color; "
+		       "ledmap [LEDx R|G|B ...], or reset for the defaults)\n",
+		       color_names[cur[0]], color_names[cur[1]], color_names[cur[2]]);
+		return;
+	}
+	if (strcmp(argv[1], "reset") == 0) {
+		reset_led_binding();
+		printk("ledmap: reset to LED1=R LED2=G LED3=B, persisted\n");
+		return;
+	}
+
+	size_t pairs = (argc - 1) / 2;
+	if ((argc - 1) % 2 != 0 || pairs < 1 || pairs > 3) {
+		printk("Error: arguments must be pairs: ledmap [LED1 R] [LED2 G] [LED3 B], or ledmap reset\n");
+		return;
+	}
+	int positions[3];
+	int colors[3];
+	for (size_t i = 0; i < pairs; i++) {
+		const char *pos = argv[1 + i * 2];
+		const char *col = argv[2 + i * 2];
+
+		positions[i] = (strcmp(pos, "led1") == 0) ? 0 :
+			       (strcmp(pos, "led2") == 0) ? 1 :
+			       (strcmp(pos, "led3") == 0) ? 2 : -1;
+		colors[i] = (strlen(col) == 1 && col[0] == 'r') ? 0 :
+			    (strlen(col) == 1 && col[0] == 'g') ? 1 :
+			    (strlen(col) == 1 && col[0] == 'b') ? 2 : -1;
+		if (positions[i] < 0 || colors[i] < 0) {
+			printk("Error: cannot parse '%s %s' - position must be LED1/LED2/LED3, "
+			       "color must be R/G/B\n", pos, col);
+			return;
+		}
+		for (size_t j = 0; j < i; j++) {
+			if (positions[j] == positions[i]) {
+				printk("Error: LED%d is named twice\n", positions[i] + 1);
+				return;
+			}
+		}
+	}
+
+	uint8_t next[3];
+	get_led_binding(next);
+	if (pairs == 3) {
+		for (size_t i = 0; i < 3; i++) {
+			next[positions[i]] = (uint8_t)colors[i];
+		}
+		if (!set_led_binding(next)) {
+			printk("Error: binding rejected - the three colors must be exactly "
+			       "one R, one G and one B (or this board has no runtime binding)\n");
+			return;
+		}
+	} else {
+		for (size_t i = 0; i < pairs; i++) {
+			int p = positions[i];
+			uint8_t want = (uint8_t)colors[i];
+
+			if (next[p] == want) {
+				continue;
+			}
+			for (int holder = 0; holder < 3; holder++) {
+				if (next[holder] == want) {
+					next[holder] = next[p];
+					next[p] = want;
+					break;
+				}
+			}
+		}
+		if (!set_led_binding(next)) {
+			printk("Error: resulting binding is not a permutation "
+			       "(or this board has no runtime binding)\n");
+			return;
+		}
+	}
+	printk("ledmap: LED1=%c LED2=%c LED3=%c applied and persisted\n",
+	       color_names[next[0]], color_names[next[1]], color_names[next[2]]);
+}
+
 static void print_help(void)
 {
 	printk("\n=== Available Commands ===\n\n");
@@ -1323,6 +1449,10 @@ static void print_help(void)
 #endif
 #endif
 	printk("\n");
+	printk("Status LEDs:\n");
+	printk("  ledmode [daily|debug]      Assignment table: breathing (default) / flashing\n");
+	printk("  ledbright [0-100]          Global brightness, every effect scales to it\n");
+	printk("  ledmap [LEDx R|G|B ...]    Physical position to color binding, or reset\n");
 	printk("Other:\n");
 	printk("  ping                       Flash LED (same as remote PING command)\n");
 	printk("  meow                       Meow!\n");
@@ -2309,6 +2439,9 @@ static const struct console_cmd console_cmds[] = {
 	{"reset", console_cmd_reset},
 	{"tdma", console_cmd_tdma},
 	{"test", console_cmd_test},
+	{"ledmode", console_cmd_ledmode},
+	{"ledbright", console_cmd_ledbright},
+	{"ledmap", console_cmd_ledmap},
 };
 
 static void console_thread(void)
