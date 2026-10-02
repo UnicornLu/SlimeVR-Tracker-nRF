@@ -1210,6 +1210,7 @@ void event_handler(struct esb_evt const *event)
 							connection_error_start_time = 0;
 							shutdown_requested = false;
 							ping_success_streak = 0;
+							esb_restore_conn_led();
 						}
 						break;
 					}
@@ -1231,6 +1232,7 @@ void event_handler(struct esb_evt const *event)
 							connection_error_start_time = 0;
 							shutdown_requested = false;
 							ping_success_streak = 0;
+							esb_restore_conn_led();
 						}
 					} else {
 						ping_success_streak = 0;
@@ -1769,6 +1771,26 @@ void esb_set_pair(uint64_t addr)
 			  sizeof(paired_addr)); // Write new address and tracker id
 }
 
+/* Restore the link-domain indication: paired = heartbeat, unpaired = searching.
+ * Every path that can clear the connection slot has to call this. A tracker that
+ * boots already paired never enters the first-pair branch, which used to be the
+ * only place that set the link indication.
+ * Boards with the single-arbitration renderer keep their previous behaviour: the
+ * link slot yields once paired, the searching indication stays while unpaired. */
+void esb_restore_conn_led(void)
+{
+	if (esb_ota_is_active()) {
+		return; /* the OTA session owns the blue channel */
+	}
+	if (!led_uses_color_channels()) {
+		set_led(paired_addr[0] ? SYS_LED_PATTERN_OFF : SYS_LED_PATTERN_SHORT,
+			SYS_LED_PRIORITY_CONNECTION);
+		return;
+	}
+	set_led(paired_addr[0] ? SYS_LED_PATTERN_CONNECT_HEARTBEAT : SYS_LED_PATTERN_SHORT,
+		SYS_LED_PRIORITY_CONNECTION);
+}
+
 void esb_pair(void)
 {
 	// Reset ping state when starting pairing
@@ -1842,7 +1864,16 @@ void esb_pair(void)
 			esb_send_pair_step(2); // "acknowledge" pairing from receiver
 			k_msleep(996);
 		}
-		set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_CONNECTION);
+		/* Green confirmation on the highest slot, blue link heartbeat on the
+		 * connection slot: different slots, so they do not overwrite each
+		 * other and both channels show. Single-arbitration boards keep the
+		 * original single confirmation. */
+		if (led_uses_color_channels()) {
+			set_led(SYS_LED_PATTERN_CONNECT_HEARTBEAT, SYS_LED_PRIORITY_CONNECTION);
+			set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_HIGHEST);
+		} else {
+			set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_CONNECTION);
+		}
 		LOG_INF("Paired");
 		/* RX only copied the identity; entropy and queue reset belong here,
 		 * in the pairing thread, before the new radio session is ready. */
@@ -1864,6 +1895,7 @@ void esb_pair(void)
 
 	esb_set_addr_paired();
 	esb_conn_state = ESB_ST_PAIRED;
+	esb_restore_conn_led(); /* also restores the heartbeat when booting paired */
 	clocks_stop();
 }
 

@@ -210,6 +210,7 @@ void magneto_reset(void)
 	magneto_progress = 0;
 	last_magneto_progress = 0;
 	magneto_progress_time = 0;
+	led_cal_progress = 0;
 	mag_cal_last_status_log = 0;
 	mag_cal_coverage = 0;
 	memset(mag_cal_workspace.ata, 0, sizeof(mag_cal_workspace.ata));
@@ -303,10 +304,18 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 	// Main loop: until target number of samples collected
 	while (captured_count < CALIB_TARGET_SAMPLES) {
 
+		led_cal_progress = (uint16_t)(captured_count * 10000u / CALIB_TARGET_SAMPLES);
+		if (led_uses_color_channels()) {
+			/* Three-channel boards show the pose progress as a red -> green bar.
+			 * Re-asserted every pose because the capture events below replace
+			 * this slot with their own indication. */
+			set_led(SYS_LED_PATTERN_CAL_PROGRESS, SYS_LED_PRIORITY_SENSOR);
+		} else {
+			/* Indicate searching for a stationary state, as before. */
+			set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR);
+		}
 		cal_event_step(op, CAL_PHASE_WAIT_POSE, captured_count + 1);
 		tracker_events_notify();
-		// 1. Wait for device to be stationary
-		set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR); // Indicate searching for stationary state
 		bool pose_timeout = false;
 		while (1) {
 			/* Feed watchdog during user interaction wait */
@@ -567,6 +576,12 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 		} else {
 			LOG_INF("Mag cal: not ready yet, keep rotating (%d samples)", (int)sample_count);
 			set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
+		}
+		/* Hold the progress bar at 90% until the quality check passes; the
+		 * remaining 10% is the readiness window. */
+		uint16_t cap = (magneto_progress & 0b01111111) ? 10000 : 9000;
+		if (led_cal_progress > cap) {
+			led_cal_progress = cap;
 		}
 	}
 }

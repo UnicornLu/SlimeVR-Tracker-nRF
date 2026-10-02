@@ -78,6 +78,10 @@ static void status_thread(void)
 			(void)k_sem_take(&status_wake_sem, K_MSEC(5000));
 		}
 		if (status & SYS_STATUS_CONNECTION_ERROR) {
+			/* Yield the link channel so the error indication is visible: on
+			 * three-channel boards the heartbeat would otherwise win its
+			 * channel (lower slot index) over this error pattern. */
+			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_CONNECTION);
 			set_led(SYS_LED_PATTERN_ERROR_B, SYS_LED_PRIORITY_STATUS);
 			(void)k_sem_take(&status_wake_sem, K_MSEC(5000));
 		}

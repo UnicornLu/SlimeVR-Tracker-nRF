@@ -80,6 +80,9 @@ void esb_set_pair(uint64_t addr);
 void esb_pair(void);
 void esb_reset_pair(void);
 void esb_clear_pair(void);
+/* Restore the link-domain indication: paired = heartbeat, unpaired = searching.
+ * Ignored while an OTA session owns the blue channel. */
+void esb_restore_conn_led(void);
 
 void esb_process_ota_rx_queue(void);
 int esb_write(uint8_t *data, bool no_ack, size_t data_length);

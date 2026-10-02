@@ -844,8 +844,13 @@ static void ota_update_led(void)
 		return;
 	}
 	led_active = active;
-	set_led(active ? SYS_LED_PATTERN_DFU : SYS_LED_PATTERN_OFF,
-		SYS_LED_PRIORITY_CONNECTION);
+	if (active) {
+		set_led(SYS_LED_PATTERN_DFU, SYS_LED_PRIORITY_CONNECTION);
+	} else {
+		/* Never leave the link channel dark after OTA: restore heartbeat or
+		 * searching indication instead of writing a bare OFF. */
+		esb_restore_conn_led();
+	}
 }
 
 static void ota_send_status(void)
