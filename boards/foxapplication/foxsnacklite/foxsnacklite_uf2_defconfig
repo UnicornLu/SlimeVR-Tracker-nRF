@@ -10,6 +10,9 @@ CONFIG_SLIMEVR_USB_DEVICE_PRODUCT="FoxApplication FoxSnackLite Tracker"
 CONFIG_BATTERY_USE_REG_BUCK_MAPPING=y
 CONFIG_IGNORE_CHARGE_WAKE_ON_VBUS=y
 CONFIG_SENSOR_ROTATION_0=y
+# Keep the single-arbitration LED renderer: this board exposes three PWM LED
+# aliases, which would otherwise opt into the three-channel renderer (led.c).
+CONFIG_LED_RGB_COLOR=y
 
 #generate for adafruit uf2 bootloader flashing
 CONFIG_BUILD_OUTPUT_UF2=y
