@@ -23,6 +23,9 @@
 #ifndef SLIMENRF_CAL_BIAS_COLLECT_H
 #define SLIMENRF_CAL_BIAS_COLLECT_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 // =============================================================================
 // Offset-bias collection constants
 // =============================================================================
@@ -36,10 +39,6 @@
 
 #ifndef BIAS_COLLECT_MIN_SAMPLE_TIME_MS
 #define BIAS_COLLECT_MIN_SAMPLE_TIME_MS 3000 // 3 seconds min
-#endif
-
-#ifndef BIAS_COLLECT_TEMP_CHECK_TIME_MS
-#define BIAS_COLLECT_TEMP_CHECK_TIME_MS 3000 // 3 seconds - prioritize sampling time over temp stability
 #endif
 
 #ifndef BIAS_COLLECT_GYRO_MOTION_THRESHOLD
@@ -58,18 +57,26 @@
 #define BIAS_COLLECT_INSUFFICIENT_SAMPLES (-4)
 
 int sensor_offsetBias_internal(
-	float *dest1,
-	float *dest2,
+	float *gyro_bias,
 	float *avg_temp,
 	float *temp_range,
 	int max_sample_time_ms,
 	int min_sample_time_ms
 );
-int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_range);
+int sensor_offsetBias(float *gyro_bias, float *avg_temp, float *temp_range);
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-/* Rest detector used by 6-side capture in calibration.c */
-int isAccRest(float *acc, float *pre_acc, float threshold, int *t, int restdelta);
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+struct sensor_accel_observation;
+struct accel_rest_state {
+	float previous[3];
+	uint32_t last_sequence;
+	uint32_t last_observed_ms;
+	uint32_t stable_since_ms;
+	bool initialized;
+};
+/* Classify distinct fresh observations using their publication times. */
+bool isAccRest(const struct sensor_accel_observation *observation, uint32_t now_ms,
+	uint32_t max_gap_ms, float threshold, struct accel_rest_state *state);
 #endif
 
 #endif /* SLIMENRF_CAL_BIAS_COLLECT_H */

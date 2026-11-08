@@ -25,10 +25,13 @@ void cal_event_end(uint16_t op, uint8_t outcome, uint8_t phase, uint8_t reason);
 void cal_event_reject(uint8_t kind, uint8_t reason);
 /* Latch a success reason before submitting the owner's pending candidate. */
 void cal_event_set_completion_reason(uint16_t op, uint8_t reason);
-/* Latest value per rest kind, not a history of all observed edges. */
-void tracker_event_set_state(uint8_t kind, uint8_t phase, uint8_t detail);
 /* Independent action/intent; never merged with another notice. */
 void tracker_event_notice(uint8_t kind, uint8_t phase, uint8_t detail);
+/* One physical-boot observation, scheduled once after reset classification.
+ * The connection owner materializes it after BOOT_DELAY_MS; pending startup
+ * survives pairing changes and queue pressure until first local admission.
+ * A shutdown/reboot intent retires pending startup. Wakes after unlock. */
+void tracker_events_schedule_boot(bool wake, bool watchdog_reset);
 /* Owner-lock-free wake only; does not transmit or guarantee delivery. */
 void tracker_events_notify(void);
 /* Sensor owner captures before acquisition; stale epochs cannot publish. */
@@ -63,6 +66,7 @@ uint32_t tracker_events_deadline(uint32_t now_ms);
 /*
  * Serialized thread-only identity reset; never call from RADIO IRQ.
  * Clears queued telemetry and tokens, rotates nonce, and invalidates sensor epoch.
+ * Unadmitted startup observations retain their original deadline across reset.
  * Entropy failure disables events for the rest of this boot, not calibration.
  */
 void tracker_events_session_changed(void);

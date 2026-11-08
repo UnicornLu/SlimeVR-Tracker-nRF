@@ -217,7 +217,7 @@ static inline float v3_norm(const float *v)
 
 static inline float eqf_resolve_dt(float time, float fallback_dt)
 {
-	return (isfinite(time) && time > 0.0f && time < 1.0f) ? time : fallback_dt;
+	return (v_finite(&time, 1) && time > 0.0f && time < 1.0f) ? time : fallback_dt;
 }
 
 static inline float eqf_alpha_from_tau(float tau, float dt)
@@ -248,6 +248,7 @@ static inline float eqf_get_mag_ref_dip(void)
 	return atan2f(-st.d_mag[2], st.d_mag[0]);
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static void eqf_set_mag_ref(float norm, float dip)
 {
 	float c = cosf(dip);
@@ -258,6 +259,7 @@ static void eqf_set_mag_ref(float norm, float dip)
 	st.d_mag[1] = 0.0f;
 	st.d_mag[2] = -s;
 }
+#endif
 
 static void eqf_reset_mag_runtime_state(bool trust_ref_now)
 {
@@ -275,6 +277,7 @@ static void eqf_reset_mag_runtime_state(bool trust_ref_now)
 	mag_active = trust_ref_now && mag_ref_valid;
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static void eqf_get_mag_norm_dip(const float *m, float *norm_out, float *dip_out)
 {
 	float mn = v3_norm(m);
@@ -292,6 +295,7 @@ static void eqf_get_mag_norm_dip(const float *m, float *norm_out, float *dip_out
 	*norm_out = mn;
 	*dip_out = asinf(sin_dip);
 }
+#endif
 
 static inline void v3_normalise(float *v)
 {
@@ -465,6 +469,7 @@ static void p_set(float *P, int bi, int bj, const float *B)
 			P[(bi * 3 + i) * 6 + bj * 3 + j] = B[i * 3 + j];
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 /* ── TRIAD initialisation ──────────────────────────────────────────── */
 /*
  * Build an initial R from averaged accel (gravity) and mag readings.
@@ -534,6 +539,7 @@ static void triad_init(const float *acc_avg, const float *mag_avg, float mag_nor
 	st.magic = EQF_MAGIC;
 	eqf_reset_mag_runtime_state(true);
 }
+#endif
 
 /*
  * gravity_init – accel-only initialisation when mag is unavailable.
@@ -1092,31 +1098,29 @@ void eqf_init(float g_time, float a_time, float m_time)
 	eqf_reset_mag_runtime_state(false);
 }
 
-void eqf_load(const void *data)
+void eqf_load(const void *data, float g_time, float a_time, float m_time)
 {
-	rest_observation_pending = false;
+	eqf_init(g_time, a_time, m_time);
 	BUILD_ASSERT(sizeof(eqf_saved_t) <= sizeof(((struct retained_data *)0)->fusion_data),
 		     "EqF state exceeds fusion_data buffer");
 
 	memcpy(&st, data, sizeof(st));
-	if (st.magic != EQF_MAGIC) {
-		/* corrupt / first-boot – will re-init on next eqf_init */
-		mode = EQF_INIT;
+	if (st.magic != EQF_MAGIC || !v_finite(st.A, 9) ||
+	    !v_finite(st.a_vec, 3) || !v_finite(st.P, 36) ||
+	    !v_finite(st.d_mag, 3) || !v_finite(&st.mag_ref_norm, 1)) {
+		eqf_init(g_time, a_time, m_time);
 		return;
 	}
+#if !CONFIG_SENSOR_USE_MAGNETOMETER
+	memset(st.d_mag, 0, sizeof(st.d_mag));
+	st.mag_ref_norm = 0.0f;
+	mag_ref_valid = false;
+	mag_rebase_pending = false;
+	eqf_reset_mag_runtime_state(false);
+#endif
 	mode = EQF_RUNNING;
-	ortho_counter = 0;
-	memset(last_a_ms2, 0, sizeof(last_a_ms2));
-	/* rest detection starts fresh each boot */
-	memset(rest_gyr_lp, 0, sizeof(rest_gyr_lp));
-	memset(rest_acc_lp, 0, sizeof(rest_acc_lp));
-	rest_gyr_dev = 0.0f;
-	rest_acc_dev = 0.0f;
-	rest_t = 0.0f;
-	rest_detected = false;
-	rest_gyr_lp_init = false;
-	rest_acc_lp_init = false;
-	mag_ref_valid = isfinite(st.mag_ref_norm) && st.mag_ref_norm > 0.01f;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	mag_ref_valid = st.mag_ref_norm > 0.01f;
 	if (!mag_ref_valid) {
 		st.d_mag[0] = 1.0f;
 		st.d_mag[1] = 0.0f;
@@ -1124,6 +1128,7 @@ void eqf_load(const void *data)
 		st.mag_ref_norm = 1.0f;
 	}
 	eqf_reset_mag_runtime_state(mag_ref_valid);
+#endif
 }
 
 void eqf_save(void *data)
@@ -1141,7 +1146,7 @@ void eqf_save(void *data)
 
 void eqf_update_gyro(float *g, float time)
 {
-	if (mode != EQF_RUNNING)
+	if (mode != EQF_RUNNING || !v_finite(g, 3))
 		return;
 	float dt = eqf_resolve_dt(time, dt_gyr);
 
@@ -1170,6 +1175,8 @@ void eqf_update_gyro(float *g, float time)
 
 void eqf_update_accel(float *a, float time)
 {
+	if (!v_finite(a, 3))
+		return;
 	float dt = eqf_resolve_dt(time, dt_acc);
 
 	/* store in m/s² for get_lin_a */
@@ -1181,6 +1188,7 @@ void eqf_update_accel(float *a, float time)
 		acc_sum[0] += a[0]; acc_sum[1] += a[1]; acc_sum[2] += a[2];
 		acc_init_count++;
 		have_acc = true;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		if (have_mag)
 			init_count++;
 		if (init_count >= EQF_INIT_SAMPLES && acc_init_count > 0 && mag_init_count > 0) {
@@ -1191,6 +1199,7 @@ void eqf_update_accel(float *a, float time)
 			triad_init(aa, mm, mag_norm_sum * mag_inv);
 			mode = EQF_RUNNING;
 		}
+#endif
 		/* fallback: accel-only init if mag never appears */
 		if (mode == EQF_INIT) {
 			acc_only_init_count++;
@@ -1264,8 +1273,11 @@ void eqf_update_accel(float *a, float time)
 	rest_observation_pending = true;
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void eqf_update_mag(float *m, float time)
 {
+	if (!v_finite(m, 3))
+		return;
 	float dt = eqf_resolve_dt(time, dt_mag);
 	float mn = v3_norm(m);
 	if (mn < 1e-10f)
@@ -1374,13 +1386,18 @@ void eqf_update_mag(float *m, float time)
 	}
 #endif
 }
+#endif
 
 void eqf_update(float *g, float *a, float *m, float time)
 {
 	if (g[0] != 0 || g[1] != 0 || g[2] != 0)
 		eqf_update_gyro(g, time);
 	eqf_update_accel(a, time);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	eqf_update_mag(m, time);
+#else
+	(void)m;
+#endif
 }
 
 /* ── State queries ─────────────────────────────────────────────────── */
@@ -1408,6 +1425,8 @@ void eqf_get_gyro_bias(float *g_off)
 
 void eqf_set_gyro_bias(float *g_off)
 {
+	if (!v_finite(g_off, 3))
+		return;
 	/* given b in deg/s → set a_vec = −A · b_rad */
 	float b_rad[3] = {
 		g_off[0] * DEG_TO_RAD,
@@ -1421,6 +1440,27 @@ void eqf_set_gyro_bias(float *g_off)
 	st.a_vec[2] = -Ab[2];
 }
 
+void eqf_rebase_gyro_bias(const float delta_dps[3])
+{
+	if (!v_finite(delta_dps, 3))
+		return;
+	/* b_hat = -A^T*a_vec: b_hat += delta requires a_vec -= A*delta.
+	 * Preserve attitude, covariance, rest evidence and LP initialization. */
+	float delta[3] = {
+		delta_dps[0] * DEG_TO_RAD,
+		delta_dps[1] * DEG_TO_RAD,
+		delta_dps[2] * DEG_TO_RAD
+	};
+	float rotated_delta[3];
+	m3v(st.A, delta, rotated_delta);
+	for (int i = 0; i < 3; i++) {
+		st.a_vec[i] -= rotated_delta[i];
+		if (rest_gyr_lp_init) {
+			rest_gyr_lp[i] += delta[i];
+		}
+	}
+}
+
 void eqf_get_lin_a(float *lin_a)
 {
 	/* gravity direction in body frame = A^T · [0,0,1] = row 2 of A */
@@ -1429,16 +1469,6 @@ void eqf_get_lin_a(float *lin_a)
 	lin_a[0] = last_a_ms2[0] - grav[0] * CONST_EARTH_GRAVITY;
 	lin_a[1] = last_a_ms2[1] - grav[1] * CONST_EARTH_GRAVITY;
 	lin_a[2] = last_a_ms2[2] - grav[2] * CONST_EARTH_GRAVITY;
-}
-
-void eqf_update_gyro_sanity(float *g, float *m)
-{
-	(void)g; (void)m;
-}
-
-int eqf_get_gyro_sanity(void)
-{
-	return 0;
 }
 
 bool eqf_get_rest_detected(void)
@@ -1456,13 +1486,7 @@ static bool eqf_take_rest_observation(bool *out)
 	return pending;
 }
 
-void eqf_get_relative_rest_deviations(float out[2])
-{
-	float gyr_th_rad = EQF_REST_TH_GYR * DEG_TO_RAD;
-	out[0] = sqrtf(rest_gyr_dev) / gyr_th_rad;
-	out[1] = sqrtf(rest_acc_dev) / EQF_REST_TH_ACC;
-}
-
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 bool eqf_get_mag_dist_detected(void)
 {
 	return mag_dist_detected;
@@ -1470,6 +1494,8 @@ bool eqf_get_mag_dist_detected(void)
 
 static void eqf_rebase_mag(float norm, float dip)
 {
+	if (!v_finite(&norm, 1) || !v_finite(&dip, 1))
+		return;
 	eqf_set_mag_ref(norm, dip);
 	mag_ref_valid = norm > 0.0f;
 	eqf_reset_mag_runtime_state(false);
@@ -1486,6 +1512,7 @@ void eqf_get_mag_ref(float *norm, float *dip)
 	*norm = st.mag_ref_norm;
 	*dip = eqf_get_mag_ref_dip();
 }
+#endif
 
 
 /* ── Fusion vtable ─────────────────────────────────────────────────── */
@@ -1496,19 +1523,23 @@ const sensor_fusion_t sensor_fusion_eqf = {
 	.save = eqf_save,
 	.update_gyro = eqf_update_gyro,
 	.update_accel = eqf_update_accel,
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	.update_mag = eqf_update_mag,
+#endif
 	.update = eqf_update,
 	.get_gyro_bias = eqf_get_gyro_bias,
 	.set_gyro_bias = eqf_set_gyro_bias,
-	.update_gyro_sanity = eqf_update_gyro_sanity,
-	.get_gyro_sanity = eqf_get_gyro_sanity,
+	.rebase_gyro_bias = eqf_rebase_gyro_bias,
 	.get_lin_a = eqf_get_lin_a,
 	.get_quat = eqf_get_quat,
 	.get_rest_detected = eqf_get_rest_detected,
 	.take_rest_observation = eqf_take_rest_observation,
-	.get_relative_rest_deviations = eqf_get_relative_rest_deviations,
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	.get_mag_dist_detected = eqf_get_mag_dist_detected,
+#endif
 	.get_quat6 = NULL, /* EqF attitude is magnetically coupled. */
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	.rebase_mag = eqf_rebase_mag,
 	.get_mag_ref = eqf_get_mag_ref,
+#endif
 };

@@ -28,7 +28,10 @@
 #include "connection/tracker_events.h"
 
 #include <math.h>
+#include <errno.h>
 #include <string.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys/reboot.h>
 
 #if CONFIG_CMSIS_DSP
 #include <arm_math.h>
@@ -39,9 +42,11 @@
 #include "cal_sample.h"
 #include "calibration.h"
 #include "imu_calibration.h"
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 #include "mag_common.h"
 #include "magneto.h"
 #include "online_mag.h"
+#endif
 #include "cal_imu.h"
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 #include "cal_sens.h"
@@ -50,25 +55,184 @@
 #include "tcal_mls_lut.h"
 #include "tcal_runtime.h"
 #endif
+#if CONFIG_SENSOR_TCAL_HEATED
+#include "tcal_heated.h"
+#endif
 
-static uint8_t imu_id;
-static uint8_t sensor_data[128]; // any use sensor data
-
-static float magBias[3] = {0};
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 float magBAinv[4][3];
+#endif
 
-K_MUTEX_DEFINE(calibration_request_lock);
+static K_MUTEX_DEFINE(calibration_request_lock);
 static int requested_calibration;
 static uint16_t requested_operation;
+static struct led_token requested_feedback;
+static atomic_t calibration_generation;
+static atomic_t calibration_kind;
+static uint32_t requested_generation;
+
+static uint32_t calibration_next_generation(void)
+{
+	uint32_t generation = (uint32_t)atomic_inc(&calibration_generation) + 1;
+	if (!generation) {
+		generation = (uint32_t)atomic_inc(&calibration_generation) + 1;
+	}
+	return generation;
+}
+
+bool sensor_calibration_generation_valid(uint32_t generation)
+{
+	return !generation || generation == (uint32_t)atomic_get(&calibration_generation);
+}
+
+/* Nonblocking so accepted coefficient resets can invalidate a matching
+ * collector while holding their coefficient admission lock. */
+void sensor_calibration_invalidate_kind(int kind)
+{
+	if (atomic_get(&calibration_kind) == kind) {
+		(void)calibration_next_generation();
+	}
+}
+
+static enum led_owner calibration_led_owner(int id)
+{
+	switch (id) {
+	case CAL_REQUEST_IMU: return LED_OWNER_IMU;
+	case CAL_REQUEST_ACCEL_POSES: return LED_OWNER_ACC;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	case CAL_REQUEST_MAG: return LED_OWNER_MAG;
+#endif
+	case CAL_REQUEST_GYRO_SENS: return LED_OWNER_SENS;
+	default: return LED_OWNER_TCAL;
+	}
+}
+
+static struct led_token calibration_led_accept(int id)
+{
+	struct led_token token = led_begin(calibration_led_owner(id), led_request_id());
+	sensor_calibration_result(token, LED_ACCEPTED);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_calibration_stage(token, id == CAL_REQUEST_MAG ? LED_PROCESSING : LED_WAIT_STILL);
+#else
+	sensor_calibration_stage(token, LED_WAIT_STILL);
+#endif
+	return token;
+}
 static K_SEM_DEFINE(calibration_wake_sem, 0, 1);
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 /* Identify LED on cal thread — never k_msleep on ESB/connection. */
 static bool mag_cal_led_pending;
+#endif
+
+static bool calibration_mag_pending(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	return (magneto_progress & 0x80) || mag_cal_led_pending;
+#else
+	return false;
+#endif
+}
 
 static void calibration_signal_wake(void)
 {
 	k_sem_give(&calibration_wake_sem);
 }
+
+#if CONFIG_SENSOR_TCAL_HEATED
+/* Explicit sensitivity replacement must not steal the running worker's slot. */
+static bool sensitivity_maintenance;
+
+void sensor_tcal_heated_lock(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+}
+
+void sensor_tcal_heated_unlock(void)
+{
+	k_mutex_unlock(&calibration_request_lock);
+}
+
+int sensor_calibration_heated_reserve_locked(void)
+{
+	if (requested_calibration != 0 || sensitivity_maintenance ||
+	    calibration_mag_pending() ||
+	    sensor_tcal_heated_resetting_locked()) {
+		return -EBUSY;
+	}
+	int err = sensor_calibration_imu_reserve_heated();
+	if (!err) {
+		requested_calibration = CAL_REQUEST_TCAL_HEATED;
+		requested_operation = 0;
+		calibration_signal_wake();
+	}
+	return err;
+}
+
+void sensor_calibration_heated_release_locked(void)
+{
+	if (requested_calibration == CAL_REQUEST_TCAL_HEATED) {
+		requested_calibration = 0;
+		sensor_calibration_imu_release_heated();
+	}
+}
+
+#endif
+
+int sensor_calibration_maintenance_begin(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	int err = 0;
+	if (requested_calibration != 0 || calibration_mag_pending()
+#if CONFIG_SENSOR_TCAL_HEATED
+	    || sensitivity_maintenance || sensor_tcal_heated_resetting_locked()
+#endif
+	) {
+		err = -EBUSY;
+	} else {
+		requested_calibration = CAL_REQUEST_MAINTENANCE;
+	}
+	k_mutex_unlock(&calibration_request_lock);
+	return err;
+}
+
+void sensor_calibration_maintenance_end(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	if (requested_calibration == CAL_REQUEST_MAINTENANCE) {
+		requested_calibration = 0;
+	}
+	k_mutex_unlock(&calibration_request_lock);
+}
+
+#if CONFIG_SENSOR_TCAL_HEATED
+int sensor_calibration_sensitivity_maintenance_begin(void)
+{
+	sensor_tcal_heated_lock();
+	int err = 0;
+	if ((requested_calibration != 0 && requested_calibration != CAL_REQUEST_GYRO_SENS) ||
+	    sensitivity_maintenance || calibration_mag_pending() ||
+	    sensor_tcal_heated_resetting_locked()) {
+		err = -EBUSY;
+	} else {
+		sensitivity_maintenance = true;
+	}
+	sensor_tcal_heated_unlock();
+	return err;
+}
+
+void sensor_calibration_sensitivity_maintenance_end(void)
+{
+	sensor_tcal_heated_lock();
+	sensitivity_maintenance = false;
+	sensor_tcal_heated_unlock();
+}
+
+bool sensor_calibration_maintenance_active_locked(void)
+{
+	return requested_calibration == CAL_REQUEST_MAINTENANCE || sensitivity_maintenance;
+}
+#endif
 
 #if CONFIG_SENSOR_USE_SENS_CALIBRATION
 // Parameters for the requested gyro sensitivity calibration, latched by
@@ -90,6 +254,8 @@ LOG_MODULE_REGISTER(calibration, LOG_LEVEL_INF);
 
 #if CONFIG_SENSOR_USE_TCAL
 static float last_gyro_tcal_offset[3] = {0.0f, 0.0f, 0.0f};
+static uint32_t last_gyro_reference_generation;
+static bool last_gyro_reference_valid;
 #endif
 
 static void calibration_thread(void);
@@ -101,44 +267,50 @@ K_THREAD_DEFINE(calibration_thread_id, 4096, calibration_thread, NULL, NULL, NUL
 void sensor_calibration_process_accel(float a[3])
 {
 	sensor_sample_accel(a);
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
 	sensor_calibration_apply_accel(a);
 #endif
 }
 
-void sensor_calibration_process_gyro(float g[3])
+bool sensor_calibration_process_gyro(float g[3], float dt, float reference_delta[3])
 {
-	sensor_sample_gyro(g);
+	sensor_sample_gyro(g, dt);
+	memset(reference_delta, 0, sizeof(float) * 3);
 #if CONFIG_SENSOR_USE_TCAL
 	float calculated_offset[3];
 	bool offset_calculated = false;
 
 	const bool auto_cal = sensor_tcal_get_auto_calibration();
-	const bool curve_ready = sensor_tcal_curve_apply_ready();
+	bool curve_ready = sensor_tcal_curve_apply_ready();
 	float temp = NAN;
-	if (auto_cal || curve_ready) {
+	if (auto_cal || curve_ready || IS_ENABLED(CONFIG_SENSOR_TCAL_HEATED)) {
 		temp = sensor_get_current_imu_temperature();
 	}
 
-	/* Continuous collect only when auto-cal on. */
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (!sensor_tcal_heated_feed(g, temp) && auto_cal) {
+#else
 	if (auto_cal) {
+#endif
 		sensor_tcal_feed_continuous_sample(g, temp);
 	}
 
-	/* Cached enable∧points≥min — LUT/MLS; else ZRO below. */
+	sensor_tcal_lock();
+	curve_ready = sensor_tcal_curve_apply_ready();
+	/* Mode may have changed while collecting the raw sample. */
+	if (curve_ready && !v_finite(&temp, 1)) {
+		temp = sensor_get_current_imu_temperature();
+	}
+	/* A canonical curve is independent of incremental LUT availability. */
 	if (curve_ready) {
-		if (sensor_tcal_lut_lookup(temp, calculated_offset) == 0) {
-			offset_calculated = true;
-		} else if (sensor_tcal_mls_lookup(temp, calculated_offset) == 0) {
-			offset_calculated = true;
-		}
+		offset_calculated = sensor_tcal_curve_lookup(temp, calculated_offset) == 0;
 	}
 
 	if (!offset_calculated) {
 		sensor_calibration_gyro_bias(calculated_offset);
 	}
 
-	if (retained->bootCalState.doffset_valid) {
+	if (offset_calculated && retained->bootCalState.doffset_valid) {
 #if CONFIG_CMSIS_DSP
 		arm_add_f32(calculated_offset, retained->bootCalState.doffset, calculated_offset, 3);
 #else
@@ -156,97 +328,131 @@ void sensor_calibration_process_gyro(float g[3])
 	}
 #endif
 
+	uint32_t generation = sensor_tcal_reference_generation();
+	bool reset = sensor_tcal_take_bias_reset();
+	if (last_gyro_reference_valid && generation != last_gyro_reference_generation) {
+		for (int i = 0; i < 3; i++) {
+			reference_delta[i] = last_gyro_tcal_offset[i] - calculated_offset[i];
+		}
+	}
+	last_gyro_reference_generation = generation;
+	last_gyro_reference_valid = true;
 	memcpy(last_gyro_tcal_offset, calculated_offset, sizeof(last_gyro_tcal_offset));
+	sensor_tcal_feedback_applied(generation, offset_calculated && retained->bootCalState.doffset_valid);
+	sensor_tcal_unlock();
+	return reset;
 #else
 	sensor_calibration_subtract_gyro_bias(g);
+	return false;
 #endif
 }
 
+void sensor_calibration_reset_gyro_reference(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_tcal_lock();
+	last_gyro_reference_valid = false;
+	sensor_tcal_unlock();
+#endif
+}
+
+bool sensor_calibration_gyro_reference_pending(void)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_tcal_lock();
+	bool pending = !last_gyro_reference_valid ||
+		last_gyro_reference_generation != sensor_tcal_reference_generation();
+	sensor_tcal_unlock();
+	return pending;
+#else
+	return false;
+#endif
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_calibration_process_mag(float m[3])
 {
-	//	for (int i = 0; i < 3; i++)
-	//		m[i] -= magBias[i];
 	sensor_sample_mag(m);
 	float snap[4][3];
 	magneto_online_snapshot_BAinv(snap);
 	apply_BAinv(m, snap);
 }
+#endif
 
-void sensor_calibration_update_sensor_ids(int imu)
+bool sensor_calibration_sensitivity_valid(float scale)
 {
-	imu_id = imu;
-}
-
-uint8_t sensor_calibration_get_imu_id(void)
-{
-	return imu_id;
-}
-
-uint8_t *sensor_calibration_get_sensor_data()
-{
-	return sensor_data;
+	return v_finite(&scale, 1) && scale >= 0.9f && scale <= 1.1f;
 }
 
 void sensor_calibration_read(void)
 {
-	/* Heal NaN/±inf persisted by older builds: validation used v_epsilon(),
-	 * whose CMSIS path treated NaN as in-range, so invalid calibrations could
-	 * be stored with a valid CRC. Clean retained first so the copies below
-	 * and the online-mag install stay finite. */
+	/* Heal invalid coefficients persisted by older builds before any copies
+	 * or fusion use. Sensitivity axes are independent: preserve valid gains. */
 	bool healed = false;
-	if (!v_finite(retained->magBias, 3)) {
-		memset(retained->magBias, 0, sizeof(retained->magBias));
-		healed = true;
-	}
-	if (!v_finite(&retained->magBAinv[0][0], 12)) {
-		float identity[4][3] = {{0}};
-		for (int i = 0; i < 3; i++) {
-			identity[i + 1][i] = 1.0f;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	bool retained_mag_valid = mag_bainv_structurally_ok(retained->magBAinv, 0.0f);
+	if (!retained_mag_valid) {
+		static const float empty_matrix[4][3];
+		static const uint8_t empty_metadata[sizeof(retained->onlineMagState)];
+		if (memcmp(retained->magBAinv, empty_matrix, sizeof(empty_matrix)) != 0 ||
+		    memcmp(&retained->onlineMagState, empty_metadata, sizeof(empty_metadata)) != 0) {
+			memset(retained->magBAinv, 0, sizeof(retained->magBAinv));
+			memset(&retained->onlineMagState, 0, sizeof(retained->onlineMagState));
+			healed = true;
 		}
-		memcpy(retained->magBAinv, identity, sizeof(identity));
-		healed = true;
 	}
-	if (!v_finite(retained->gyroSensScale, 3)) {
-		retained->gyroSensScale[0] = 1.0f;
-		retained->gyroSensScale[1] = 1.0f;
-		retained->gyroSensScale[2] = 1.0f;
-		healed = true;
+#endif
+	bool sensitivity_healed = false;
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION && CONFIG_SENSOR_VQF_CYCLE_BIAS_OBSERVATION
+	/* This seeds the sensor-owned snapshot before imu_load publishes ready. */
+	sensitivity_healed = sensor_calibration_sensitivity_init();
+#else
+	for (int axis = 0; axis < 3; axis++) {
+		if (!sensor_calibration_sensitivity_valid(retained->gyroSensScale[axis])) {
+			retained->gyroSensScale[axis] = 1.0f;
+			sensitivity_healed = true;
+		}
 	}
-	if (healed) {
-		LOG_WRN("Calibration: cleared non-finite values persisted by an older build");
+#endif
+	if (healed || sensitivity_healed) {
+		LOG_WRN("Calibration: cleared invalid values persisted by an older build");
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION && CONFIG_SENSOR_VQF_CYCLE_BIAS_OBSERVATION
+		/* Sensitivity healing was already sealed under its writer locks. */
+		if (healed) {
+			retained_update();
+		}
+#else
 		retained_update();
+#endif
 	}
-	memcpy(sensor_data, retained->sensor_data, sizeof(sensor_data));
-	memcpy(magBias, retained->magBias, sizeof(magBias));
 	sensor_calibration_imu_load();
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	if (retained->mag_online_calibration_mode > MAG_ONLINE_CALIBRATION_DISABLED) {
 		retained->mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_DEFAULT;
 	}
-	magneto_online_replace_BAinv_and_reset(retained->magBAinv, 0);
+	magneto_online_replace_BAinv_and_reset(retained->magBAinv, 0, (struct led_token){0});
 	magneto_online_runtime_configure(
 		retained->mag_online_calibration_mode != MAG_ONLINE_CALIBRATION_DISABLED
 	);
 	LOG_INF("Online mag calibration: %s", sensor_calibration_get_online_mag_enabled() ? "enabled" : "disabled");
-	if (sensor_calibration_get_online_mag_enabled()) {
-		float live_snapshot[4][3];
-		magneto_online_snapshot_BAinv(live_snapshot);
-		if (mag_bainv_structurally_ok(live_snapshot, 0.0f)) {
-			magneto_online_runtime_load_retained();
-			if (cal_online_mag_update_count() > 0 || cal_online_mag_norm_count() > 0) {
-				LOG_INF(
-					"Online mag runtime restored (%d updates, %u norm samples)",
-					cal_online_mag_update_count(),
-					cal_online_mag_norm_count()
-				);
-			}
+	if (sensor_calibration_get_online_mag_enabled() && retained_mag_valid) {
+		magneto_online_runtime_load_retained();
+		if (cal_online_mag_update_count() > 0 || cal_online_mag_norm_count() > 0) {
+			LOG_INF(
+				"Online mag runtime restored (%d updates, %u norm samples)",
+				cal_online_mag_update_count(),
+				cal_online_mag_norm_count()
+			);
 		}
 	}
+#endif
 #if CONFIG_SENSOR_USE_TCAL
 	sensor_tcal_runtime_init_from_retained();
 #endif
 }
 
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 {
 	bool validating_live_state = m_inv == NULL;
@@ -256,7 +462,10 @@ int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 		m_inv = live_snapshot;
 	}
 	if (!mag_bainv_structurally_ok(m_inv, 0.0f)) {
-		sensor_calibration_clear_mag(validating_live_state ? NULL : m_inv, write);
+		int err = sensor_calibration_clear_mag(validating_live_state ? NULL : m_inv, write, false);
+		if (err) {
+			return err;
+		}
 		LOG_WRN("Invalidated calibration");
 		LOG_WRN("The magnetometer may be damaged or calibration was not completed properly");
 		return -1;
@@ -265,12 +474,13 @@ int sensor_calibration_validate_mag(float m_inv[][3], bool write)
 }
 
 
-void sensor_calibration_clear_mag(float m_inv[][3], bool write)
+static int calibration_clear_mag_owned(float m_inv[][3], bool write, struct led_token feedback)
 {
 	bool clearing_live_state = (m_inv == NULL || m_inv == magBAinv);
 	float cleared[4][3] = {0};
+	int err = 0;
 	if (clearing_live_state) {
-		magneto_online_replace_BAinv_and_reset(cleared, 0);
+		magneto_online_replace_BAinv_and_reset(cleared, 0, feedback);
 		m_inv = cleared;
 	} else {
 		memset(m_inv, 0, sizeof(magBAinv));
@@ -278,20 +488,59 @@ void sensor_calibration_clear_mag(float m_inv[][3], bool write)
 	if (write) {
 		LOG_INF("Clearing stored calibration data");
 		sensor_calibration_online_mag_retained_clear();
-		sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, m_inv, sizeof(magBAinv));
+		err = sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, m_inv, sizeof(magBAinv));
 		sensor_refresh_sensor_ids(); // Refresh reported mag status after clear
 	}
+	if (clearing_live_state) {
+		magneto_online_feedback_storage(feedback, err);
+	} else {
+		sensor_calibration_result(feedback, err < 0 ? LED_APPLIED_NOT_SAVED : LED_SUCCESS);
+	}
+	return err;
 }
 
-void sensor_request_calibration(void)
+int sensor_calibration_clear_mag(float m_inv[][3], bool write, bool user_feedback)
 {
-	sensor_calibration_request(CAL_REQUEST_IMU, CAL_REQUEST_USER);
+#if CONFIG_SENSOR_TCAL_HEATED
+	bool changes_live = write || m_inv == NULL || m_inv == magBAinv;
+	sensor_tcal_heated_lock();
+	/* Manual-mag validation may clear an invalid old model on its owning
+	 * worker. Other callers must reserve a new maintenance transaction. */
+	bool already_owned = k_current_get() == calibration_thread_id &&
+	                     requested_calibration == CAL_REQUEST_MAG;
+	bool maintenance = changes_live && !already_owned;
+	int err = maintenance ? sensor_calibration_maintenance_begin() : 0;
+	sensor_tcal_heated_unlock();
+	if (err) {
+		LOG_WRN("Magnetometer clear rejected: calibration busy");
+		return user_feedback ? sensor_operation_result(LED_OWNER_MAG, err, false) : err;
+	}
+#endif
+	struct led_token feedback = user_feedback ? led_begin(LED_OWNER_MAG, led_request_id()) : (struct led_token){0};
+	sensor_calibration_result(feedback, LED_ACCEPTED);
+	sensor_calibration_stage(feedback, LED_MAINTENANCE);
+	if (user_feedback) {
+		sensor_calibration_invalidate_kind(CAL_REQUEST_MAG);
+	}
+	int result = calibration_clear_mag_owned(m_inv, write, feedback);
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (maintenance) {
+		sensor_calibration_maintenance_end();
+	}
+#endif
+	return result;
+}
+#endif
+
+int sensor_request_calibration(void)
+{
+	return sensor_calibration_request(CAL_REQUEST_IMU, CAL_REQUEST_USER);
 }
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-void sensor_request_calibration_6_side(void)
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+int sensor_request_calibration_accel(void)
 {
-	sensor_calibration_request(CAL_REQUEST_ACCEL_6_SIDE, CAL_REQUEST_USER);
+	return sensor_calibration_request(CAL_REQUEST_ACCEL_POSES, CAL_REQUEST_USER);
 }
 #endif
 
@@ -300,6 +549,7 @@ int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
 {
 	if (axis > 2 || revolutions > 100) {
 		cal_event_reject(CAL_KIND_GYRO_SENS, CAL_REASON_INVALID_ARGUMENT);
+		sensor_operation_result(LED_OWNER_SENS, -EINVAL, false);
 		tracker_events_notify();
 		return -EINVAL;
 	}
@@ -308,8 +558,13 @@ int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
 	}
 
 	k_mutex_lock(&calibration_request_lock, K_FOREVER);
-	if (requested_calibration != 0 || (magneto_progress & 0x80)) {
+	if (requested_calibration != 0 || calibration_mag_pending()
+#if CONFIG_SENSOR_TCAL_HEATED
+	    || sensitivity_maintenance || sensor_tcal_heated_resetting_locked()
+#endif
+	) {
 		cal_event_reject(CAL_KIND_GYRO_SENS, CAL_REASON_BUSY);
+		sensor_operation_result(LED_OWNER_SENS, -EBUSY, false);
 		k_mutex_unlock(&calibration_request_lock);
 		tracker_events_notify();
 		LOG_ERR("Sensor calibration is already running");
@@ -320,6 +575,9 @@ int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
 	sens_cal_revolutions = revolutions;
 	requested_calibration = CAL_REQUEST_GYRO_SENS;
 	requested_operation = cal_event_accept(CAL_KIND_GYRO_SENS);
+	requested_feedback = calibration_led_accept(CAL_REQUEST_GYRO_SENS);
+	atomic_set(&calibration_kind, CAL_REQUEST_GYRO_SENS);
+	requested_generation = calibration_next_generation();
 	k_mutex_unlock(&calibration_request_lock);
 	tracker_events_notify();
 	calibration_signal_wake();
@@ -327,28 +585,38 @@ int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions)
 }
 #endif
 
-void sensor_request_calibration_mag(void)
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+int sensor_request_calibration_mag(void)
 {
 	k_mutex_lock(&calibration_request_lock, K_FOREVER);
-	if (magneto_progress & 0x80 || mag_cal_led_pending) {
+	if (calibration_mag_pending()) {
 		cal_event_reject(CAL_KIND_MAG_MANUAL, CAL_REASON_BUSY);
+		sensor_operation_result(LED_OWNER_MAG, -EBUSY, false);
 		k_mutex_unlock(&calibration_request_lock);
 		tracker_events_notify();
 		if (!get_status(SYS_STATUS_CALIBRATION_RUNNING)) {
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
 		}
-		return;
+		return -EBUSY;
 	}
-	if (requested_calibration != 0) {
+	if (requested_calibration != 0
+#if CONFIG_SENSOR_TCAL_HEATED
+	    || sensitivity_maintenance || sensor_tcal_heated_resetting_locked()
+#endif
+	) {
 		cal_event_reject(CAL_KIND_MAG_MANUAL, CAL_REASON_BUSY);
+		sensor_operation_result(LED_OWNER_MAG, -EBUSY, false);
 		k_mutex_unlock(&calibration_request_lock);
 		tracker_events_notify();
 		LOG_ERR("Sensor calibration is already running");
-		return;
+		return -EBUSY;
 	}
 	/* Claim slot immediately; LED + magneto_progress arm on cal thread. */
 	requested_calibration = CAL_REQUEST_MAG;
 	requested_operation = cal_event_accept(CAL_KIND_MAG_MANUAL);
+	requested_feedback = calibration_led_accept(CAL_REQUEST_MAG);
+	atomic_set(&calibration_kind, CAL_REQUEST_MAG);
+	requested_generation = calibration_next_generation();
 	mag_cal_led_pending = true;
 	k_mutex_unlock(&calibration_request_lock);
 	tracker_events_notify();
@@ -358,18 +626,22 @@ void sensor_request_calibration_mag(void)
 	}
 	calibration_signal_wake();
 	LOG_INF("Magnetometer calibration requested");
+	return 0;
 }
+#endif
 
 
 static uint8_t calibration_request_kind(int id)
 {
 	switch (id) {
 	case CAL_REQUEST_IMU: return CAL_KIND_IMU_ZRO;
-	case CAL_REQUEST_ACCEL_6_SIDE: return CAL_KIND_ACCEL_POSES;
+	case CAL_REQUEST_ACCEL_POSES: return CAL_KIND_ACCEL_POSES;
 	case CAL_REQUEST_TCAL_BOOT: return CAL_KIND_TCAL_BOOT;
 	case CAL_REQUEST_TCAL_RUNTIME: return CAL_KIND_TCAL_RUNTIME;
 	case CAL_REQUEST_GYRO_SENS: return CAL_KIND_GYRO_SENS;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	case CAL_REQUEST_MAG: return CAL_KIND_MAG_MANUAL;
+#endif
 	default: return 0;
 	}
 }
@@ -382,6 +654,34 @@ uint16_t sensor_calibration_current_operation(void)
 	return operation;
 }
 
+struct led_token sensor_calibration_current_feedback(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	struct led_token token = requested_feedback;
+	k_mutex_unlock(&calibration_request_lock);
+	return token;
+}
+
+uint32_t sensor_calibration_current_generation(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	uint32_t generation = requested_generation;
+	k_mutex_unlock(&calibration_request_lock);
+	return generation;
+}
+
+void sensor_calibration_invalidate_requests(void)
+{
+	k_mutex_lock(&calibration_request_lock, K_FOREVER);
+	(void)calibration_next_generation();
+	struct led_token feedback = requested_feedback;
+	k_mutex_unlock(&calibration_request_lock);
+	sensor_calibration_result(feedback, LED_CANCELLED);
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_tcal_feedback_cancel();
+#endif
+}
+
 int sensor_calibration_request(int id, enum cal_request_origin origin)
 {
 	int result;
@@ -389,10 +689,23 @@ int sensor_calibration_request(int id, enum cal_request_origin origin)
 	k_mutex_lock(&calibration_request_lock, K_FOREVER);
 	switch (id) {
 	case CAL_REQUEST_CLEAR:
+		if (requested_calibration == CAL_REQUEST_MAINTENANCE
+#if CONFIG_SENSOR_TCAL_HEATED
+		    || requested_calibration == CAL_REQUEST_TCAL_HEATED
+#endif
+		) {
+			result = -EBUSY;
+			break;
+		}
 		sensor_calibration_samples_end();
 		requested_calibration = 0;
 		requested_operation = 0;
+		requested_feedback = (struct led_token){0};
+		requested_generation = 0;
+		atomic_set(&calibration_kind, 0);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		mag_cal_led_pending = false;
+#endif
 		result = 0;
 		break;
 	case CAL_REQUEST_QUERY:
@@ -400,16 +713,27 @@ int sensor_calibration_request(int id, enum cal_request_origin origin)
 		break;
 	default:
 		if (!kind) {
+			if (origin == CAL_REQUEST_USER) {
+				sensor_operation_result(calibration_led_owner(id), -EINVAL, false);
+			}
 			result = -EINVAL;
-		} else if (requested_calibration != 0 || (magneto_progress & 0x80)) {
+		} else if (requested_calibration != 0 || calibration_mag_pending()
+#if CONFIG_SENSOR_TCAL_HEATED
+		           || sensitivity_maintenance || sensor_tcal_heated_resetting_locked()
+#endif
+		) {
 			if (origin == CAL_REQUEST_USER) {
 				cal_event_reject(kind, CAL_REASON_BUSY);
+				sensor_operation_result(calibration_led_owner(id), -EBUSY, false);
 			}
 			result = -1;
 		} else {
 			requested_calibration = id;
 			requested_operation = origin == CAL_REQUEST_AUTO_SILENT ? 0
 				: cal_event_accept(kind | (origin == CAL_REQUEST_AUTO ? CAL_EVENT_ORIGIN_AUTO : 0));
+			requested_feedback = origin == CAL_REQUEST_USER ? calibration_led_accept(id) : (struct led_token){0};
+			atomic_set(&calibration_kind, id);
+			requested_generation = calibration_next_generation();
 			result = 0;
 		}
 		break;
@@ -425,7 +749,11 @@ int sensor_calibration_request(int id, enum cal_request_origin origin)
 static void calibration_thread(void)
 {
 	/* Register calibration thread with watchdog - use long timeout for lengthy operations */
-	watchdog_register_thread(WDT_CHANNEL_CALIBRATION, 0);
+	if (watchdog_register_thread(WDT_CHANNEL_CALIBRATION, 0) < 0) {
+		LOG_ERR("Calibration watchdog registration failed");
+		sys_reboot(SYS_REBOOT_COLD);
+		return;
+	}
 
 	sensor_calibration_read();
 
@@ -474,23 +802,48 @@ static void calibration_thread(void)
 #endif
 
 	// TODO: be able to block the sensor while doing certain operations
-	// TODO: reset fusion on calibration finished
 	// TODO: start and run thread from request?
 	// TODO: replace wait_for_motion with isAccRest
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	// Verify calibrations only after the sensor stack is initialized.
 	if (sensor_ready) {
 		if (sensor_get_mag_available()) {
 			sensor_calibration_validate_mag(NULL, true);
 		}
 	}
+#endif
 
 	// requested calibrations run here
 	while (1) {
 		sensor_calibration_persist_pending();
+#if CONFIG_SENSOR_TCAL_HEATED
+		sensor_tcal_heated_finalize();
+#endif
 		int requested = sensor_calibration_request(CAL_REQUEST_QUERY, CAL_REQUEST_USER);
 		uint16_t operation = sensor_calibration_current_operation();
-		if (requested > CAL_REQUEST_QUERY && requested != CAL_REQUEST_MAG) {
+		if (requested > CAL_REQUEST_QUERY && requested != CAL_REQUEST_MAINTENANCE
+#if CONFIG_SENSOR_TCAL_HEATED
+		    && requested != CAL_REQUEST_TCAL_HEATED
+#endif
+		    && !sensor_calibration_generation_valid(sensor_calibration_current_generation())) {
+			sensor_calibration_result(sensor_calibration_current_feedback(), LED_CANCELLED);
+			cal_event_end(operation, CAL_OUTCOME_CANCELLED, CAL_PHASE_WAIT_STILL, CAL_REASON_RESET);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+			magneto_progress = 0;
+#endif
+			magneto_reset();
+			sensor_calibration_request(CAL_REQUEST_CLEAR, CAL_REQUEST_USER);
+			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
+			tracker_events_notify();
+			continue;
+		}
+		if (requested > CAL_REQUEST_QUERY && requested != CAL_REQUEST_MAG &&
+		    requested != CAL_REQUEST_MAINTENANCE
+#if CONFIG_SENSOR_TCAL_HEATED
+		    && requested != CAL_REQUEST_TCAL_HEATED
+#endif
+		) {
 			cal_event_start(operation, CAL_PHASE_WAIT_STILL, 0);
 			tracker_events_notify();
 		}
@@ -502,11 +855,11 @@ static void calibration_thread(void)
 			sensor_calibration_request(CAL_REQUEST_CLEAR, CAL_REQUEST_USER);
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 			break;
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-		case CAL_REQUEST_ACCEL_6_SIDE:
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+		case CAL_REQUEST_ACCEL_POSES:
 			sensor_calibration_samples_begin(CAL_SAMPLE_ACCEL);
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, true);
-			sensor_calibrate_6_side();
+			sensor_calibrate_accel();
 			sensor_calibration_request(CAL_REQUEST_CLEAR, CAL_REQUEST_USER);
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 			break;
@@ -536,25 +889,36 @@ static void calibration_thread(void)
 			set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
 			break;
 #endif
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		case CAL_REQUEST_MAG:
 			if (mag_cal_led_pending) {
 				mag_cal_led_pending = false;
-				sensor_calibration_clear_mag(NULL, true);
+				sys_warm_transaction_begin();
+				if (!sensor_calibration_generation_valid(sensor_calibration_current_generation())) {
+					sys_warm_transaction_end(false);
+					sensor_calibration_result(sensor_calibration_current_feedback(), LED_CANCELLED);
+					cal_event_end(operation, CAL_OUTCOME_CANCELLED, CAL_PHASE_IDENTIFY, CAL_REASON_RESET);
+					sensor_calibration_request(CAL_REQUEST_CLEAR, CAL_REQUEST_USER);
+					set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
+					tracker_events_notify();
+					break;
+				}
+				magneto_online_reset();
+				sys_warm_transaction_end(false);
 				cal_event_start(operation, CAL_PHASE_IDENTIFY, 0);
 				tracker_events_notify();
 				LOG_INF("Magnetometer calibration: identify tracker");
-				set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR);
+				sensor_calibration_stage(sensor_calibration_current_feedback(), LED_PROCESSING);
 				watchdog_feed(WDT_CHANNEL_CALIBRATION);
 				k_msleep(2000);
 				watchdog_feed(WDT_CHANNEL_CALIBRATION);
-				set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
 				k_msleep(800);
 				watchdog_feed(WDT_CHANNEL_CALIBRATION);
 				sensor_calibration_samples_begin(CAL_SAMPLE_MAG);
 				cal_event_step(operation, CAL_PHASE_COLLECT, 0);
+				sensor_calibration_stage(sensor_calibration_current_feedback(), LED_COLLECT_MOVE);
 				tracker_events_notify();
 				magneto_reset();
-				magneto_online_reset();
 				magneto_progress |= 1 << 7;
 				LOG_INF("Magnetometer calibration started (rotate tracker in all orientations)");
 				break;
@@ -569,13 +933,15 @@ static void calibration_thread(void)
 				sensor_calibration_request(CAL_REQUEST_CLEAR, CAL_REQUEST_USER);
 			}
 			break;
+#endif
 		default:
 			break;
 		}
 
 #if CONFIG_SENSOR_USE_TCAL
 		// Continue LUT background build if in progress
-		if (sensor_tcal_lut_get_build_state() == MLS_LUT_BUILD_BACKGROUND) {
+		if (sensor_tcal_lut_get_build_state() == MLS_LUT_BUILD_PRIORITY ||
+		    sensor_tcal_lut_get_build_state() == MLS_LUT_BUILD_BACKGROUND) {
 			if (sensor_tcal_build_lut_continue()) {
 				LOG_INF(
 					"T-Cal LUT: Background build complete (%d/%d entries)",
@@ -586,10 +952,12 @@ static void calibration_thread(void)
 		}
 #endif
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		// Phase 2: Background online magnetometer calibration check
 		if (requested == 0) {
 			sensor_calibration_online_mag_check();
 		}
+#endif
 
 		/* Feed watchdog at end of each loop iteration */
 		watchdog_feed(WDT_CHANNEL_CALIBRATION);
@@ -690,10 +1058,7 @@ void sensor_tcal_status(void)
 		printk("  - Boot Cal completed: %s\n", retained->bootCalState.completed ? "Failed/Skipped" : "Not yet");
 	}
 
-	// Display runtime calibration status
-	int64_t last_runtime_cal_time = 0;
-	int64_t current_rest_duration = 0;
-	sensor_runtime_cal_get_status(&last_runtime_cal_time, &current_rest_duration);
+	int64_t last_runtime_cal_time = sensor_runtime_cal_last_time();
 
 	printk("  - Last calibration temp: ");
 	if (!isnan(runtime_cal_last_temp)) {
@@ -705,7 +1070,7 @@ void sensor_tcal_status(void)
 	printk("  - Current temp: %.2fC", (double)current_temp);
 	if (!isnan(runtime_cal_last_temp)) {
 		float temp_diff = fabsf(current_temp - runtime_cal_last_temp);
-		printk(" (diff: %.2fC, threshold: %.1fC)", (double)temp_diff, (double)RUNTIME_CAL_TEMP_CHANGE_MIN);
+		printk(" (diff: %.2fC)", (double)temp_diff);
 	}
 	printk("\n");
 
@@ -717,13 +1082,6 @@ void sensor_tcal_status(void)
 		printk("Not yet performed\n");
 	}
 
-	if (current_rest_duration > 0) {
-		printk(
-			"  - Current rest duration: %lld ms (trigger at %d ms)\n",
-			current_rest_duration,
-			RUNTIME_CAL_REST_TIME_MS
-		);
-	}
 
 	// Display mode info
 	if (quality.point_count > 0) {
@@ -734,16 +1092,20 @@ void sensor_tcal_status(void)
 }
 
 // Public function for 'tcal clear' and 'reset tcal'
-void sensor_tcal_clear(void)
+int sensor_tcal_clear(void)
 {
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (sensor_calibration_maintenance_begin() != 0) {
+#else
 	if (sensor_calibration_request(CAL_REQUEST_QUERY, CAL_REQUEST_USER) != 0) {
+#endif
 		LOG_ERR("Another calibration is running. Cannot clear T-Cal data.");
 		printk("Error: Another calibration is running.\n");
-		return;
+		return sensor_operation_result(LED_OWNER_TCAL, -EBUSY, false);
 	}
 
-	// Invalidate lookup cache since calibration data will be cleared
-	sensor_tcal_cache_invalidate();
+	sys_warm_transaction_begin();
+	sensor_tcal_lock();
 
 	// Reset temperature direction tracking
 	tcal_current_direction = TCAL_DIR_UNKNOWN;
@@ -753,62 +1115,62 @@ void sensor_tcal_clear(void)
 	memset(retained->tempCalPoints, 0, sizeof(retained->tempCalPoints));
 	memset(retained->tempCalCoeffs, 0, sizeof(retained->tempCalCoeffs));
 	memset(&retained->tempCalState, 0, sizeof(retained->tempCalState)); // Clear the whole state struct
+	tcal_accum_request_reset();
+	sensor_tcal_refresh_model();
+	sensor_tcal_unlock();
 
 	// Save cleared state to NVS directly (don't call update_tcal_state which refreshes runtime state)
-	sys_write(
+	int state_err = sys_write(
 		MAIN_GYRO_TCAL_STATE_ID,
 		&retained->tempCalState,
 		&retained->tempCalState,
 		sizeof(retained->tempCalState)
 	);
-	sys_write(
+	int points_err = sys_write(
 		MAIN_GYRO_TCAL_POINTS_ID,
 		retained->tempCalPoints,
 		retained->tempCalPoints,
 		sizeof(retained->tempCalPoints)
 	);
-	sys_write(
+	int coeffs_err = sys_write(
 		MAIN_GYRO_TCAL_COEFFS_ID,
 		retained->tempCalCoeffs,
 		retained->tempCalCoeffs,
 		sizeof(retained->tempCalCoeffs)
 	);
-
-	// Also clear boot/runtime calibration D_offset since T-Cal is being reset
-	retained->bootCalState.doffset_valid = false;
-	retained->bootCalState.doffset[0] = 0.0f;
-	retained->bootCalState.doffset[1] = 0.0f;
-	retained->bootCalState.doffset[2] = 0.0f;
-	LOG_INF("Clearing D_offset along with T-Cal data");
-
-	// Reset continuous accumulator sampling state
-	tcal_accum_reset();
-	sensor_tcal_refresh_apply_cache();
-
-	// Manual command: invalidate fusion to force quaternion recalculation
-	sensor_request_fusion_reset();
+	sys_warm_transaction_end(false);
+#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_calibration_maintenance_end();
+#endif
 
 	printk("All temperature calibration data and D_offset have been cleared.\n");
+	int err = state_err < 0 ? state_err : points_err < 0 ? points_err : coeffs_err;
+	return sensor_operation_result(LED_OWNER_TCAL, err, true);
 }
 
 // Public function for 'tcal remove <index>'
-void sensor_tcal_remove_point(int index_to_remove)
+int sensor_tcal_remove_point(int index_to_remove)
 {
-	if (sensor_calibration_request(CAL_REQUEST_QUERY, CAL_REQUEST_USER) != 0) {
-		LOG_ERR("Another calibration is running. Cannot remove T-Cal point.");
-		printk("Error: Another calibration is running.\n");
-		return;
-	}
-
 	if (index_to_remove < 0 || index_to_remove >= TCAL_BUFFER_SIZE) {
 		printk("Error: Index %d is out of valid range (0 to %d).\n", index_to_remove, TCAL_BUFFER_SIZE - 1);
-		return;
+		return sensor_operation_result(LED_OWNER_TCAL, -EINVAL, false);
+	}
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (sensor_calibration_maintenance_begin() != 0) {
+#else
+	if (sensor_calibration_request(CAL_REQUEST_QUERY, CAL_REQUEST_USER) != 0) {
+#endif
+		LOG_ERR("Another calibration is running. Cannot remove T-Cal point.");
+		printk("Error: Another calibration is running.\n");
+		return sensor_operation_result(LED_OWNER_TCAL, -EBUSY, false);
 	}
 
+
+	int err = 0;
+	sys_warm_transaction_begin();
+	sensor_tcal_lock();
 	// Check if there was actually data in that slot
 	if (retained->tempCalPoints[index_to_remove].temp != 0.0f) {
-		// Invalidate lookup cache since a point is being removed
-		sensor_tcal_cache_invalidate();
 
 		LOG_INF("Removing T-Cal point at index %d.", index_to_remove);
 
@@ -825,13 +1187,22 @@ void sensor_tcal_remove_point(int index_to_remove)
 		}
 		retained->tempCalState.count = new_count;
 		retained->tempCalState.valid = false;
+		tcal_accum_request_reset();
+		sensor_tcal_refresh_model();
+		sensor_tcal_unlock();
 
 		printk("Point at index %d removed. Recalculating MLS state...\n", index_to_remove);
 		update_tcal_state();
-		sys_flush_warm(); /* console/user action: durable immediately */
+		err = sys_flush_warm(); /* console/user action: durable immediately */
 	} else {
+		sensor_tcal_unlock();
 		printk("No data found at index %d. Nothing to remove.\n", index_to_remove);
 	}
+	sys_warm_transaction_end(false);
+#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_calibration_maintenance_end();
+#endif
+	return sensor_operation_result(LED_OWNER_TCAL, err, true);
 }
 
 // Check if current temperature needs calibration (missing nearby calibration point)
@@ -880,7 +1251,9 @@ bool sensor_tcal_needs_nearby_point(float temp, float *closest_temp, float *dist
 
 void sensor_calibration_get_last_gyro_offset(float offset[3])
 {
+	sensor_tcal_lock();
 	memcpy(offset, last_gyro_tcal_offset, sizeof(last_gyro_tcal_offset));
+	sensor_tcal_unlock();
 }
 
 #endif

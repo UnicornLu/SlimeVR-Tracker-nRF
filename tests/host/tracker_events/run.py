@@ -47,6 +47,10 @@ static int sys_csrand_get(void *dest,size_t len) {
 }
 void connection_tracker_event_wake(void) { assert(lock_depth==0); wake_calls++; }
 #define CONFIG_APPLICATION_INIT_PRIORITY 90
+#define CONFIG_TRACKER_EVENT_CALIBRATION 1
+#define CONFIG_TRACKER_EVENT_TRACKER_REST 1
+#define CONFIG_TRACKER_EVENT_FUSION_REST 1
+#define CONFIG_TRACKER_EVENT_POWER 1
 #define APPLICATION 0
 #define SYS_INIT(fn,level,priority) static int (*host_init)(void)=fn
 #define LOG_MODULE_REGISTER(...)
@@ -64,7 +68,11 @@ def main():
     parser.add_argument("--end-to-end", action="store_true")
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
-    cases = args.case or ["copies", "lifecycle", "progress", "online", "states", "receipts", "scheduling", "state-heartbeat", "entropy-error", "entropy-zero"]
+    cases = args.case or ["copies", "lifecycle", "progress", "online", "states", "receipts", "scheduling", "state-heartbeat", "entropy-error", "entropy-zero",
+                          "startup-boot", "startup-wake", "startup-watchdog", "startup-wake-watchdog",
+                          "startup-late", "startup-wrap", "startup-session", "power-priority", "wom-cancellation",
+                          "terminal-priority", "terminal-before-startup", "terminal-before-schedule",
+                          "startup-disconnected", "startup-wrap-sentinel", "next-send-wrap-sentinel"]
     cc = shlex.split(os.environ.get("CC", "cc"))
     with tempfile.TemporaryDirectory(prefix="tracker-events-") as temp:
         temp = Path(temp)
@@ -75,7 +83,10 @@ def main():
         (temp / "leaves.h").write_text(LEAVES)
         source = temp / "core.c"
         source.write_text('#include "leaves.h"\n#include "' + str(ROOT / "src/connection/tracker_events.c") + '"\n' + (HERE / "test_core.c").read_text())
-        flags = ["-std=c11", "-Wall", "-Wextra", "-Wno-unused-function", "-Wno-unused-variable", "-Wno-misleading-indentation", "-O0", "-g", "-I", str(temp), "-I", str(ROOT / "src")]
+        flags = ["-std=c11", "-Wall", "-Wextra", "-Wno-unused-function", "-Wno-unused-variable", "-Wno-misleading-indentation", "-O0", "-g", "-DCONFIG_CONNECTION_RAW_COLLECTION=1", "-DCONFIG_SENSOR_USE_MAGNETOMETER=1", "-I", str(temp), "-I", str(ROOT / "src")]
+        motion = temp / "motion"
+        subprocess.run(cc + flags + [str(HERE / "test_motion.c"), str(ROOT / "src/sensor/motion_state.c"), str(ROOT / "src/util.c"), "-lm", "-o", str(motion)], check=True)
+        subprocess.run([str(motion)], check=True)
         protocol = temp / "protocol"
         subprocess.run(cc + flags + [str(HERE / "test_protocol.c"), "-o", str(protocol)], check=True)
         subprocess.run([str(protocol)], check=True)
@@ -83,6 +94,22 @@ def main():
         subprocess.run(cc + flags + [str(source), "-o", str(binary)], check=True)
         for case in cases:
             subprocess.run([str(binary), case], check=True)
+        if not args.case:
+            switches = ("CALIBRATION", "TRACKER_REST", "FUSION_REST", "POWER")
+            for mask in range(16):
+                disabled = "".join(
+                    f"#undef CONFIG_TRACKER_EVENT_{name}\n"
+                    for bit, name in enumerate(switches) if not mask & (1 << bit)
+                )
+                source.write_text(
+                    '#include "leaves.h"\n' + disabled
+                    + f"#define TEST_EVENT_MASK {mask}\n"
+                    + '#include "' + str(ROOT / "src/connection/tracker_events.c") + '"\n'
+                    + (HERE / "test_config.c").read_text()
+                )
+                config_binary = temp / "config"
+                subprocess.run(cc + flags + [str(source), "-o", str(config_binary)], check=True)
+                subprocess.run([str(config_binary)], check=True)
         if args.wire_output or args.end_to_end:
             wire = subprocess.check_output([str(binary), "wire"], text=True)
             destination = args.wire_output or temp / "wire.txt"

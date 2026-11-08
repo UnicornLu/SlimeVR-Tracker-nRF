@@ -5,24 +5,19 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness/python'))
+from c_extract import extract_block
+
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get('SOURCE_ROOT', HERE.parents[2]))
 # Baseline trees may contain only saved changed files; unchanged headers come from HEADER_ROOT.
 HEADERS = Path(os.environ.get('HEADER_ROOT', HERE.parents[2]))
 
 def function(source, name):
-    match = re.search(rf'^(?:static )?(?:void|int|float|uint16_t) {name}\([^;{{]*\)\s*\{{', source, re.MULTILINE)
-    if match is None: raise ValueError(name)
-    start = source.index('{', match.start())
-    tokens = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', re.DOTALL)
-    depth = 0
-    for token in tokens.finditer(source, start):
-        if token.group() == '{': depth += 1
-        elif token.group() == '}':
-            depth -= 1
-            if depth == 0: return source[match.start():token.end()]
-    raise ValueError(name)
+    return extract_block(source, rf'^(?:static )?(?:void|int|float|uint16_t) {re.escape(name)}\([^;{{]*\)\s*\{{')
 
 preamble = r'''
 #include <assert.h>
@@ -36,6 +31,11 @@ preamble = r'''
 #define LOG_ERR(...) ((void)0)
 #define LOG_WRN(...) ((void)0)
 #define LOG_INF(...) ((void)0)
+#define NRF_GPIO_PIN_PULLUP 1
+#define NRF_GPIO_PIN_SENSE_LOW 2
+static int ssi_burst_write(int dev, uint8_t reg, const uint8_t *buf, uint32_t len) {
+    (void)dev;(void)reg;(void)buf;(void)len;return 0;
+}
 static uint8_t fifo_model[80];
 static uint16_t available, next_chunk_available;
 static unsigned model_offset, data_reads;
@@ -145,9 +145,11 @@ with tempfile.TemporaryDirectory(prefix='sensor-temp-') as directory:
         names={'INIT':f'{prefix}_init','SHUTDOWN':f'{prefix}_shutdown','FIFO_READ':f'{prefix}_fifo_read','TEMP_READ':f'{prefix}_temp_read','UPDATE_ODR':f'{prefix}_update_odr','COUNT_REG':f'{model}_FIFO_COUNTH','TEMP_REG':f'{model}_TEMP_DATA1'}
         aliases='\n'.join(f'#define {key} {value}' for key,value in names.items())
         state=source[source.index('static uint8_t last_accel_odr'):source.index('LOG_MODULE_REGISTER')]
-        decoder=(ROOT/'src/sensor/imu/icm426xx_hires.h').read_text()
+        decoder=(ROOT/'src/sensor/imu/icm_hires.h').read_text()
+        io_path = ROOT/'src/sensor/imu/icm426xx_io.h'
+        io = io_path.read_text().replace('#include "icm_hires.h"', '') if io_path.exists() else ''
         unit=tmp/f'{model}.c'
-        unit.write_text(defines+'\n'+aliases+'\n'+preamble+'\n'+decoder+'\n#define PACKET_SIZE ICM426XX_HIRES_PACKET_SIZE\n'+state+'\n'+'\n'.join(function(source,names[key]) for key in ('INIT','SHUTDOWN','FIFO_READ','TEMP_READ'))+main)
+        unit.write_text(defines+'\n'+aliases+'\n'+preamble+'\n'+decoder+'\n'+io+'\n#define PACKET_SIZE ICM_HIRES_PACKET_SIZE\n'+state+'\n'+'\n'.join(function(source,names[key]) for key in ('INIT','SHUTDOWN','FIFO_READ','TEMP_READ'))+main)
         binary=tmp/model
         subprocess.run(shlex.split(os.environ.get('CC','cc'))+['-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-g','-O1','-fsanitize=address,undefined','-fno-omit-frame-pointer','-fno-pie','-no-pie',str(unit),'-lm','-o',str(binary)],check=True)
         subprocess.run([str(binary)],check=True)

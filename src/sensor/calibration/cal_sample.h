@@ -42,12 +42,40 @@ void sensor_calibration_samples_end(void);
 
 void sensor_sample_accel(const float a[3]);
 int sensor_wait_accel(float a[3], k_timeout_t timeout);
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+/* Publication time, not a hardware acquisition timestamp. */
+struct sensor_accel_observation {
+	float v[3];
+	uint32_t sequence;
+	uint32_t observed_ms;
+};
+/* Wait for a queued sample, then return the newest published observation. */
+int sensor_wait_accel_observation(struct sensor_accel_observation *observation, k_timeout_t timeout);
+/* Discard only pending accel vectors, without changing session admission. */
+void sensor_discard_pending_accel(void);
+#endif
 /* Non-blocking: copy last accel sample if any has been published. */
 bool sensor_peek_accel(float a[3]);
-void sensor_sample_gyro(const float g[3]);
-int sensor_wait_gyro(float g[3], k_timeout_t timeout);
+#if CONFIG_SENSOR_TCAL_HEATED
+bool sensor_peek_accel_fresh(float a[3], int64_t max_age_ms);
+#endif
+/* One raw FIFO vector represents dt seconds, independent of delivery time.
+ * Positive finite dt is required; dt == 0 is a driver-reported acquisition
+ * discontinuity and must reject collection, even without a following vector.
+ * Sequence advances for every admitted publish, including discontinuities and
+ * queue overflow, so losing a marker also exposes loss without stretching dt.
+ * Both sequence and queued samples restart at each owner session boundary. */
+struct sensor_gyro_sample {
+	float v[3];
+	float dt;
+	uint32_t sequence;
+};
+void sensor_sample_gyro(const float g[3], float dt);
+int sensor_wait_gyro(struct sensor_gyro_sample *sample, k_timeout_t timeout);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_sample_mag(const float m[3]);
 int sensor_wait_mag(float m[3], k_timeout_t timeout);
+#endif
 bool wait_for_motion(bool motion, int samples);
 
 #endif /* SLIMENRF_CAL_SAMPLE_H */

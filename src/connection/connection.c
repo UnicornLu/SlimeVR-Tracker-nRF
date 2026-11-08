@@ -23,13 +23,18 @@
 #include "globals.h"
 #include "sensor/sensor.h"
 #include "sensor/calibration/calibration.h"
+#if CONFIG_CONNECTION_RAW_COLLECTION && CONFIG_SENSOR_USE_MAGNETOMETER
 #include "sensor/calibration/online_mag.h"
+#endif
 #include "connection.h"
 #include "util.h"
 #include "esb.h"
+#include "network_ticks.h"
 #include "sensor_data_snapshot.h"
 #include "tracker_events.h"
+#if CONFIG_CONNECTION_RAW_COLLECTION
 #include "raw_retx.h"
+#endif
 #include "tdma.h"
 #include "build_defines.h"
 #include "hid.h"
@@ -38,6 +43,7 @@
 #include "system/watchdog.h"
 #include "system/test_mode.h"
 #include "system/esb_ota.h"
+#include "system/led.h"
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
 #include "radio_capture.h"
 #endif
@@ -48,6 +54,8 @@
 #include <zephyr/irq.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/reboot.h>
 
 static uint8_t tracker_id, batt, batt_v, sensor_temp, imu_id, mag_id, tracker_status;
 static uint8_t tracker_svr_status = SVR_STATUS_OK;
@@ -55,21 +63,6 @@ static sensor_data_snapshot_t sensor_data_snapshot;
 static float sensor_last_q[4];
 static bool sensor_ids_set = false; /* true after connection_update_sensor_ids() first called */
 static K_SEM_DEFINE(connection_wake_sem, 0, 1);
-
-static void connection_sensor_snap_q_a(float q_out[4], float a_out[3])
-{
-	sensor_data_snapshot_read_qa(&sensor_data_snapshot, q_out, a_out);
-}
-
-static void connection_sensor_snap_q_m(float q_out[4], float m_out[3])
-{
-	sensor_data_snapshot_read_qm(&sensor_data_snapshot, q_out, m_out);
-}
-
-static bool connection_sensor_get_precise_quat(void)
-{
-	return sensor_data_snapshot_is_precise(&sensor_data_snapshot);
-}
 
 static uint8_t packet_sequence = 0;
 static atomic_t next_ping_deadline_ms = ATOMIC_INIT(0);
@@ -112,18 +105,18 @@ static uint32_t ping_next_periodic_deadline(uint32_t previous_deadline, uint32_t
 
 static uint32_t ping_server_phase_delay_ms(uint32_t interval_ms)
 {
-	uint64_t server_ticks = esb_get_server_time_ticks_64();
-	if (server_ticks == 0 || interval_ms == 0) {
+	struct esb_network_clock clock;
+	if (interval_ms == 0 || !esb_get_network_clock(&clock)) {
 		return 0;
 	}
 
-	uint32_t interval_ticks = (uint32_t)(((uint64_t)interval_ms * 32768U + 500U) / 1000U);
+	uint32_t interval_ticks = net_ticks_from_ms_near32(interval_ms);
 	uint32_t phase_ticks
-		= (uint32_t)(((uint64_t)ping_phase_ms(interval_ms) * 32768U + 500U) / 1000U);
-	uint32_t server_phase_ticks = (uint32_t)(server_ticks % interval_ticks);
+		= net_ticks_from_ms_near32(ping_phase_ms(interval_ms));
+	uint32_t server_phase_ticks = clock.receiver_ticks % interval_ticks;
 	uint32_t delay_ticks = phase_ticks >= server_phase_ticks ? phase_ticks - server_phase_ticks
 											  : interval_ticks - server_phase_ticks + phase_ticks;
-	uint32_t delay_ms = (uint32_t)(((uint64_t)delay_ticks * 1000U + 32767U) / 32768U);
+	uint32_t delay_ms = net_ticks_to_ms_ceil32(delay_ticks);
 	if (delay_ms <= PING_SERVER_PHASE_TOLERANCE_MS) {
 		delay_ms += interval_ms;
 	}
@@ -196,26 +189,6 @@ uint32_t get_ping_interval_ms(void)
 static void connection_thread(void);
 K_THREAD_DEFINE(connection_thread_id, 2048, connection_thread, NULL, NULL, NULL, CONNECTION_THREAD_PRIORITY, K_FP_REGS, 0);
 
-void connection_clocks_request_start(void)
-{
-	clocks_request_start(0);
-}
-
-void connection_clocks_request_start_delay_us(uint32_t delay_us)
-{
-	clocks_request_start(delay_us);
-}
-
-void connection_clocks_request_stop(void)
-{
-	clocks_stop();
-}
-
-void connection_clocks_request_stop_delay_us(uint32_t delay_us)
-{
-	clocks_request_stop(delay_us);
-}
-
 uint8_t connection_get_id(void)
 {
 	return tracker_id;
@@ -231,11 +204,6 @@ void connection_set_id(uint8_t id)
 		(atomic_val_t)(k_uptime_get_32() + ping_phase_ms(PING_INTERVAL_MS))
 	);
 	tdma_init(id);
-}
-
-uint8_t connection_get_packet_sequence(void)
-{
-	return packet_sequence;
 }
 
 enum sub_packet_type {
@@ -260,8 +228,9 @@ enum sub_packet_type {
 #define SUB_DATA_LEN_RUNTIME 8  /* type 5: remaining runtime estimate */
 
 /* Fill sub-packet payload (without type/id prefix) into buf, return bytes written */
-static int fill_sub_info(uint8_t *buf)
+static int fill_sub_info(uint8_t *buf, const sensor_data_capture_t *capture)
 {
+	(void)capture;
 	buf[0] = batt;
 	buf[1] = batt_v;
 	buf[2] = sensor_temp;
@@ -270,76 +239,70 @@ static int fill_sub_info(uint8_t *buf)
 	buf[5] = 0; /* resv */
 	buf[6] = imu_id;
 	buf[7] = mag_id;
-	uint16_t *fw = (uint16_t *)&buf[8];
-	fw[0] = ((BUILD_YEAR - 2020) & 127) << 9 | (BUILD_MONTH & 15) << 5 | (BUILD_DAY & 31);
+	sys_put_le16(((BUILD_YEAR - 2020) & 127) << 9 | (BUILD_MONTH & 15) << 5 | (BUILD_DAY & 31), &buf[8]);
 	buf[10] = FW_VERSION_MAJOR & 255;
 	buf[11] = FW_VERSION_MINOR & 255;
 	buf[12] = FW_VERSION_PATCH & 255;
 	return SUB_DATA_LEN_INFO;
 }
 
-static int fill_sub_quat_accel(uint8_t *buf)
+static int fill_sub_quat_accel(uint8_t *buf, const sensor_data_capture_t *capture)
 {
-	float q[4], a[3];
-	connection_sensor_snap_q_a(q, a);
-	uint16_t *b = (uint16_t *)buf;
-	b[0] = TO_FIXED_15(q[1]);
-	b[1] = TO_FIXED_15(q[2]);
-	b[2] = TO_FIXED_15(q[3]);
-	b[3] = TO_FIXED_15(q[0]);
-	b[4] = TO_FIXED_7(a[0]);
-	b[5] = TO_FIXED_7(a[1]);
-	b[6] = TO_FIXED_7(a[2]);
+	sys_put_le16(TO_FIXED_15(capture->q[1]), &buf[0]);
+	sys_put_le16(TO_FIXED_15(capture->q[2]), &buf[2]);
+	sys_put_le16(TO_FIXED_15(capture->q[3]), &buf[4]);
+	sys_put_le16(TO_FIXED_15(capture->q[0]), &buf[6]);
+	sys_put_le16(TO_FIXED_7(capture->a[0]), &buf[8]);
+	sys_put_le16(TO_FIXED_7(capture->a[1]), &buf[10]);
+	sys_put_le16(TO_FIXED_7(capture->a[2]), &buf[12]);
 	return SUB_DATA_LEN_QUAT;
 }
 
-static int fill_sub_compact_quat(uint8_t *buf)
+static int fill_sub_compact_quat(uint8_t *buf, const sensor_data_capture_t *capture)
 {
-	float q[4], a[3];
-	connection_sensor_snap_q_a(q, a);
 	buf[0] = batt;
 	buf[1] = batt_v;
 	buf[2] = sensor_temp;
 	float v[3] = {0};
-	q_fem(q, v);
+	q_fem(capture->q, v);
 	for (int i = 0; i < 3; i++) {
 		v[i] = (v[i] + 1) / 2;
 	}
 	uint16_t v_buf[3]
 		= {SATURATE_UINT10((1 << 10) * v[0]), SATURATE_UINT11((1 << 11) * v[1]), SATURATE_UINT11((1 << 11) * v[2])};
-	uint32_t *q_buf = (uint32_t *)&buf[3];
-	*q_buf = v_buf[0] | (v_buf[1] << 10) | (v_buf[2] << 21);
-	uint16_t *ab = (uint16_t *)&buf[7];
-	ab[0] = TO_FIXED_7(a[0]);
-	ab[1] = TO_FIXED_7(a[1]);
-	ab[2] = TO_FIXED_7(a[2]);
+	uint32_t q_buf = (uint32_t)v_buf[0] | ((uint32_t)v_buf[1] << 10) | ((uint32_t)v_buf[2] << 21);
+	sys_put_le32(q_buf, &buf[3]);
+	sys_put_le16(TO_FIXED_7(capture->a[0]), &buf[7]);
+	sys_put_le16(TO_FIXED_7(capture->a[1]), &buf[9]);
+	sys_put_le16(TO_FIXED_7(capture->a[2]), &buf[11]);
 	return SUB_DATA_LEN_COMPACT;
 }
 
-static int fill_sub_status(uint8_t *buf)
+static int fill_sub_status(uint8_t *buf, const sensor_data_capture_t *capture)
 {
+	(void)capture;
 	buf[0] = tracker_svr_status;
 	buf[1] = tracker_status;
 	return SUB_DATA_LEN_STATUS;
 }
 
-static int fill_sub_mag(uint8_t *buf)
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static int fill_sub_mag(uint8_t *buf, const sensor_data_capture_t *capture)
 {
-	float q[4], m[3];
-	connection_sensor_snap_q_m(q, m);
-	uint16_t *b = (uint16_t *)buf;
-	b[0] = TO_FIXED_15(q[1]);
-	b[1] = TO_FIXED_15(q[2]);
-	b[2] = TO_FIXED_15(q[3]);
-	b[3] = TO_FIXED_15(q[0]);
-	b[4] = TO_FIXED_10(m[0]);
-	b[5] = TO_FIXED_10(m[1]);
-	b[6] = TO_FIXED_10(m[2]);
+	sys_put_le16(TO_FIXED_15(capture->q[1]), &buf[0]);
+	sys_put_le16(TO_FIXED_15(capture->q[2]), &buf[2]);
+	sys_put_le16(TO_FIXED_15(capture->q[3]), &buf[4]);
+	sys_put_le16(TO_FIXED_15(capture->q[0]), &buf[6]);
+	sys_put_le16(TO_FIXED_10(capture->m[0]), &buf[8]);
+	sys_put_le16(TO_FIXED_10(capture->m[1]), &buf[10]);
+	sys_put_le16(TO_FIXED_10(capture->m[2]), &buf[12]);
 	return SUB_DATA_LEN_MAG;
 }
+#endif
 
-static int fill_sub_runtime(uint8_t *buf)
+static int fill_sub_runtime(uint8_t *buf, const sensor_data_capture_t *capture)
 {
+	(void)capture;
 	uint64_t runtime_us = k_ticks_to_us_floor64(sys_get_battery_remaining_time_estimate());
 	memcpy(buf, &runtime_us, sizeof(runtime_us));
 	return SUB_DATA_LEN_RUNTIME;
@@ -355,22 +318,24 @@ struct composite_builder {
 	struct tracker_event_tx event;
 };
 
-typedef int (*sub_fill_fn)(uint8_t *buf);
+typedef int (*sub_fill_fn)(uint8_t *buf, const sensor_data_capture_t *capture);
 
 struct sub_packet_desc {
 	uint8_t data_len;
 	bool pad_byte15; /* normal 16-byte packet: force data[15]=0 after fill */
+	uint8_t streams;
 	sub_fill_fn fill;
 };
 
-/* Indexed by sub-packet type. One source for len + fill used by normal + composite. */
 static const struct sub_packet_desc sub_packet_table[] = {
-	[SUB_PACKET_INFO] = {SUB_DATA_LEN_INFO, true, fill_sub_info},
-	[SUB_PACKET_QUAT_ACCEL] = {SUB_DATA_LEN_QUAT, false, fill_sub_quat_accel},
-	[SUB_PACKET_COMPACT_QUAT] = {SUB_DATA_LEN_COMPACT, true, fill_sub_compact_quat},
-	[SUB_PACKET_STATUS] = {SUB_DATA_LEN_STATUS, true, fill_sub_status},
-	[SUB_PACKET_QUAT_MAG] = {SUB_DATA_LEN_MAG, false, fill_sub_mag},
-	[SUB_PACKET_RUNTIME] = {SUB_DATA_LEN_RUNTIME, true, fill_sub_runtime},
+	[SUB_PACKET_INFO] = {SUB_DATA_LEN_INFO, true, 0, fill_sub_info},
+	[SUB_PACKET_QUAT_ACCEL] = {SUB_DATA_LEN_QUAT, false, SENSOR_STREAM_QA, fill_sub_quat_accel},
+	[SUB_PACKET_COMPACT_QUAT] = {SUB_DATA_LEN_COMPACT, true, SENSOR_STREAM_QA, fill_sub_compact_quat},
+	[SUB_PACKET_STATUS] = {SUB_DATA_LEN_STATUS, true, 0, fill_sub_status},
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	[SUB_PACKET_QUAT_MAG] = {SUB_DATA_LEN_MAG, false, SENSOR_STREAM_M, fill_sub_mag},
+#endif
+	[SUB_PACKET_RUNTIME] = {SUB_DATA_LEN_RUNTIME, true, 0, fill_sub_runtime},
 };
 
 static const struct sub_packet_desc *sub_packet_get(uint8_t type)
@@ -396,84 +361,103 @@ static bool connection_hid_output_ready(void)
 #endif
 }
 
-static void fill_normal_packet(uint8_t type, uint8_t data[16])
+static void fill_normal_packet(uint8_t type, uint8_t data[16], const sensor_data_capture_t *capture)
 {
 	memset(data, 0, 16);
 	const struct sub_packet_desc *d = sub_packet_get(type);
-	if (!d) {
-		type = SUB_PACKET_QUAT_ACCEL;
-		d = sub_packet_get(SUB_PACKET_QUAT_ACCEL);
-	}
 	data[0] = type;
 	data[1] = tracker_id;
-	d->fill(&data[2]);
+	d->fill(&data[2], capture);
 	if (d->pad_byte15) {
 		data[15] = 0;
 	}
 }
 
-static bool write_normal_packet(const uint8_t data[16])
-{
-	/* Radio unavailable: HID is the configured output path, so its
-	 * enqueue success is the send success. */
-	if (!esb_ready()) {
 #if CONFIG_CONNECTION_OVER_HID
-		if (!connection_hid_output_ready()) {
-			return false;
+static uint8_t write_hid_composite_as_normal_packets(const uint8_t *encoded, int business_count)
+{
+	uint8_t accepted = 0;
+	int pos = 3;
+	for (int i = 0; i < business_count; i++) {
+		uint8_t type = encoded[pos++];
+		const struct sub_packet_desc *d = sub_packet_get(type);
+		uint8_t data[16] = {0};
+		data[0] = type;
+		data[1] = encoded[1];
+		memcpy(&data[2], &encoded[pos], d->data_len);
+		if (d->pad_byte15) {
+			data[15] = 0;
 		}
-		return hid_write_packet_n(data);
-#else
-		return false;
-#endif
+		if (connection_hid_output_ready() && hid_write_packet_n(data)) {
+			accepted |= (uint8_t)(1u << type);
+		}
+		pos += d->data_len;
 	}
-
-	/* Radio available: only ESB queue success counts, so a failed
-	 * admission cannot consume the test-rate slot or mirror to HID;
-	 * HID stays a mirror of successful sends. */
-	uint8_t esb_pkt[ESB_SENSOR_DATA_LEN];
-
-	memcpy(esb_pkt, data, 16);
-	esb_pkt[16] = packet_sequence;
-	if (esb_write(esb_pkt, no_ack, ESB_SENSOR_DATA_LEN) != 0) {
-		return false;
-	}
-	packet_sequence++;
-#if CONFIG_CONNECTION_OVER_HID
-	if (connection_hid_output_ready()) {
-		hid_write_packet_n(data);
-	}
-#endif
-	return true;
-}
-
-#if CONFIG_CONNECTION_OVER_HID
-static bool write_hid_packet_type(uint8_t type)
-{
-	if (!connection_hid_output_ready()) {
-		return false;
-	}
-
-	uint8_t data[16];
-
-	fill_normal_packet(type, data);
-	return hid_write_packet_n(data);
-}
-
-static bool write_hid_composite_as_normal_packets(const struct composite_builder *builder)
-{
-	bool queued = true;
-	for (int i = 0; i < builder->n; i++) {
-		queued &= write_hid_packet_type(builder->types[i]);
-	}
-	return queued;
+	return accepted;
 }
 #endif
 
-static bool connection_write_packet_type(uint8_t type)
+static uint8_t get_server_constant_imu_id(int id)
 {
-	uint8_t data[16];
-	fill_normal_packet(type, data);
-	return write_normal_packet(data);
+	switch (id)
+	{
+	case IMU_BMI160:
+		return SVR_IMU_BMI160;
+	case IMU_BMI270:
+		return SVR_IMU_BMI270;
+	case IMU_BMI323:
+		return 0;
+	case IMU_MPU6050:
+		return SVR_IMU_MPU6050;
+	case IMU_MPU6500:
+		return SVR_IMU_MPU6500;
+	case IMU_MPU9250:
+		return SVR_IMU_MPU9250;
+	case IMU_ICM20948:
+		return SVR_IMU_ICM20948;
+	case IMU_ICM42688:
+		return SVR_IMU_ICM42688;
+	case IMU_ICM42686:
+		// currently just report as 42688 since it's close enough and doesn't have a server constant yet
+		// todo: add a proper constant for it in the server and update this
+		return SVR_IMU_ICM42688;
+	case IMU_ICM45686:
+		return SVR_IMU_ICM45686;
+	case IMU_ICM45688:
+		return SVR_IMU_ICM45686; // compatible with driver, but not really
+	case IMU_ISM330IS:
+		return 0;
+	case IMU_LSM6DS3:
+		return 0;
+	case IMU_LSM6DSM:
+		return SVR_IMU_LSM6DS3TRC;
+	case IMU_LSM6DSR:
+		return SVR_IMU_LSM6DSR;
+	case IMU_LSM6DSO:
+		return SVR_IMU_LSM6DSO;
+	case IMU_LSM6DST:
+		return 0;
+	case IMU_LSM6DSV:
+		return SVR_IMU_LSM6DSV;
+	case IMU_ISM330BX:
+		return SVR_IMU_LSM6DSV; // not really
+	default:
+		return SVR_IMU_UNKNOWN;
+	}
+}
+
+static uint8_t get_server_constant_mag_id(int id)
+{
+	if (id < 0)
+		return SVR_MAG_STATUS_NOT_SUPPORTED;
+	return sensor_get_mag_enabled() ? SVR_MAG_STATUS_ENABLED : SVR_MAG_STATUS_DISABLED;
+}
+
+static uint8_t get_server_constant_tracker_status(int status)
+{
+	if (status & (SYS_STATUS_SENSOR_ERROR | SYS_STATUS_SYSTEM_ERROR))
+		return SVR_STATUS_ERROR;
+	return SVR_STATUS_OK;
 }
 
 void connection_update_sensor_ids(int imu, int mag)
@@ -483,11 +467,8 @@ void connection_update_sensor_ids(int imu, int mag)
 	sensor_ids_set = true;
 }
 
-void connection_update_sensor_data(float *q, float *a, int64_t data_time)
+void connection_update_sensor_data(float *q, float *a)
 {
-	// data_time is in system ticks, nonzero means valid measurement
-	// TODO: use data_time to measure latency! the latency should be calculated up to before radio sent data
-
 	// Reject NaN quaternions to prevent sending invalid data to server
 	if (isnan(q[0]) || isnan(q[1]) || isnan(q[2]) || isnan(q[3])) {
 		LOG_WRN("Rejected NaN quaternion");
@@ -500,17 +481,22 @@ void connection_update_sensor_data(float *q, float *a, int64_t data_time)
 	connection_signal_wake();
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static int64_t last_mag_time = 0;
+#endif
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void connection_update_sensor_mag(float *m)
 {
 	sensor_data_snapshot_publish_m(&sensor_data_snapshot, m);
 	connection_signal_wake();
 }
+#endif
 
 void connection_update_sensor_temp(float temp)
 {
 	// sensor_temp == zero means no data
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	if (sensor_get_mag_available() && sensor_get_mag_enabled()) {
 		// temp hack to display fusion mag disturbance detection status
 		if (sensor_fusion_get_mag_dist_detected()) {
@@ -520,6 +506,7 @@ void connection_update_sensor_temp(float temp)
 			}
 		}
 	}
+#endif
 	if (temp < -38.5f) {
 		sensor_temp = 1;
 	} else if (temp > 88.5f) {
@@ -588,6 +575,12 @@ static int64_t last_info_time = 0;
 static int64_t last_status_time = 0;
 static int64_t last_runtime_time = 0;
 
+static struct k_spinlock ota_suppress_lock;
+static bool ota_suppressed; /* Reduce poll rate during parallel OTA */
+static int64_t ota_suppress_start_time; /* Timestamp when suppress was enabled */
+#define OTA_SUPPRESS_TIMEOUT_MS (10 * 60 * 1000)
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
 /*
  * Raw sensor data collection subsystem.
  *
@@ -628,7 +621,11 @@ struct raw_imu_queued {
 	uint32_t session;
 };
 
-K_MSGQ_DEFINE(raw_imu_msgq, sizeof(struct raw_imu_queued), RAW_IMU_QUEUE_SIZE, 4);
+static char __noinit __aligned(4) _k_fifo_buf_raw_imu_msgq[
+	RAW_IMU_QUEUE_SIZE * sizeof(struct raw_imu_queued)];
+static STRUCT_SECTION_ITERABLE(k_msgq, raw_imu_msgq) =
+	Z_MSGQ_INITIALIZER(raw_imu_msgq, _k_fifo_buf_raw_imu_msgq,
+			   sizeof(struct raw_imu_queued), RAW_IMU_QUEUE_SIZE);
 
 static uint16_t raw_sequence = 0;
 static atomic_t data_collection_active;
@@ -639,9 +636,6 @@ static int64_t dc_conn_error_start;
  * side minimally alive; 10 TPS leaves the radio almost fully to raw+TDMA.
  * 0 restores the built-in 100 TPS default on every batch exit path. */
 #define DC_BATCH_FUSION_TPS 10U
-static volatile bool ota_suppressed = false; /* Reduce poll rate during parallel OTA */
-static int64_t ota_suppress_start_time = 0;  /* Timestamp when suppress was enabled */
-#define OTA_SUPPRESS_TIMEOUT_MS (10 * 60 * 1000)
 
 /*
  * ARQ ring buffer: stores the last RAW_RING_SIZE sent packets for
@@ -684,7 +678,6 @@ static void raw_ring_store(const uint8_t packet[RAW_PACKET_SIZE])
  * Connection thread drains this before sending new data.
  */
 static struct raw_retx_requests raw_retx;
-static volatile uint32_t raw_retx_total; /* lifetime retransmit count */
 
 int connection_request_raw_retransmit(uint16_t sequence)
 {
@@ -725,7 +718,9 @@ static bool raw_request_token_valid;
 #define RAW_META_MASK_ALL        0x3f
 static int64_t raw_collection_start_ms;
 static bool connection_raw_collection_active(void);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static void connection_align_mag_BAinv_body(float out[4][3], const float in[4][3]);
+#endif
 
 struct raw_cal_snapshot {
 	float acc_BAinv[4][3];
@@ -743,10 +738,12 @@ struct raw_cal_snapshot {
 };
 static struct raw_cal_snapshot raw_cal_snapshot;
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static struct k_spinlock latest_mag_lock;
 static float latest_mag[3];
 static uint32_t latest_mag_session;
 static bool latest_mag_valid;
+#endif
 static atomic_t raw_collection_session;
 
 
@@ -765,49 +762,39 @@ static void connection_schedule_calibration(uint8_t mask, uint8_t chunk)
 	}
 	raw_cal_pending = raw_cal_pending_mask != 0;
 }
-#if CONFIG_SENSOR_USE_TCAL
-static bool connection_tcal_point_valid(const struct TempCalPoint *point)
-{
-	return point->temp != 0.0f;
-}
-#endif
 
-static void connection_capture_calibration_snapshot(bool include_tcal)
+static void connection_capture_calibration_snapshot(struct raw_cal_snapshot *snapshot)
 {
 	sensor_imu_calibration_t calibration;
 	sensor_calibration_snapshot(&calibration);
-	memcpy(raw_cal_snapshot.acc_BAinv, calibration.accel_matrix, sizeof(raw_cal_snapshot.acc_BAinv));
-	memcpy(raw_cal_snapshot.gyro_bias, calibration.gyro_bias, sizeof(raw_cal_snapshot.gyro_bias));
-	memcpy(raw_cal_snapshot.gyro_scale, retained->gyroSensScale, sizeof(raw_cal_snapshot.gyro_scale));
+	memcpy(snapshot->acc_BAinv, calibration.accel_matrix, sizeof(snapshot->acc_BAinv));
+	memcpy(snapshot->gyro_bias, calibration.gyro_bias, sizeof(snapshot->gyro_bias));
+	memcpy(snapshot->gyro_scale, retained->gyroSensScale, sizeof(snapshot->gyro_scale));
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	float mag_BAinv[4][3];
-	float mag_body_BAinv[4][3];
 	magneto_online_snapshot_BAinv(mag_BAinv);
-	connection_align_mag_BAinv_body(mag_body_BAinv, mag_BAinv);
-	memcpy(raw_cal_snapshot.mag_BAinv, mag_body_BAinv, sizeof(raw_cal_snapshot.mag_BAinv));
-	raw_cal_snapshot.tcal_flags = 0;
-	raw_cal_snapshot.tcal_count = 0;
-	raw_cal_snapshot.tcal_temp_min = 0.0f;
-	raw_cal_snapshot.tcal_temp_max = 0.0f;
-	raw_cal_snapshot.tcal_apply_mode = 0;
-#if CONFIG_SENSOR_USE_TCAL
-	if (include_tcal) {
-		if (retained->tcal_enabled) raw_cal_snapshot.tcal_flags |= 0x01;
-		switch (sensor_tcal_get_apply_mode()) {
-		case SENSOR_TCAL_APPLY_CURVE: raw_cal_snapshot.tcal_flags |= 0x02; break;
-		case SENSOR_TCAL_APPLY_ZRO_FALLBACK: raw_cal_snapshot.tcal_flags |= 0x04; break;
-		default: break;
-		}
-		raw_cal_snapshot.tcal_apply_mode = (uint8_t)sensor_tcal_get_apply_mode();
-	raw_cal_snapshot.tcal_temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
-	raw_cal_snapshot.tcal_temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
-		for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
-			if (connection_tcal_point_valid(&retained->tempCalPoints[i])) {
-				raw_cal_snapshot.tcal_points[raw_cal_snapshot.tcal_count++] = retained->tempCalPoints[i];
-			}
-		}
-	}
+	connection_align_mag_BAinv_body(snapshot->mag_BAinv, mag_BAinv);
 #else
-	(void)include_tcal;
+	memset(snapshot->mag_BAinv, 0, sizeof(snapshot->mag_BAinv));
+#endif
+	snapshot->tcal_flags = 0;
+	snapshot->tcal_count = 0;
+	snapshot->tcal_temp_min = 0.0f;
+	snapshot->tcal_temp_max = 0.0f;
+	snapshot->tcal_apply_mode = 0;
+#if CONFIG_SENSOR_USE_TCAL
+	bool enabled;
+	sensor_tcal_apply_mode_t mode = sensor_tcal_snapshot(
+		&enabled, snapshot->tcal_points, &snapshot->tcal_count);
+	if (enabled) snapshot->tcal_flags |= 0x01;
+	switch (mode) {
+	case SENSOR_TCAL_APPLY_CURVE: snapshot->tcal_flags |= 0x02; break;
+	case SENSOR_TCAL_APPLY_ZRO_FALLBACK: snapshot->tcal_flags |= 0x04; break;
+	default: break;
+	}
+	snapshot->tcal_apply_mode = (uint8_t)mode;
+	snapshot->tcal_temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
+	snapshot->tcal_temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
 #endif
 }
 
@@ -832,6 +819,7 @@ void connection_request_raw_metadata(uint8_t mask, uint8_t chunk, uint16_t token
 	connection_signal_wake();
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static void connection_align_mag_body(const float in[3], float out[3])
 {
 	float mx = in[0];
@@ -873,12 +861,25 @@ static void connection_align_mag_BAinv_body(float out[4][3], const float in[4][3
 		}
 	}
 }
+#endif
 
 static bool connection_raw_collection_active(void)
 {
 	return connection_get_data_collection() || connection_get_data_collection_batch();
 }
+#endif
 
+void connection_feedback_maintenance_update(void)
+{
+	bool active = connection_get_data_collection() || connection_get_data_collection_batch()
+		|| sensor_diagnostics_maintenance_active();
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	active = active || radio_capture_user_active();
+#endif
+	led_maintenance_publish(LED_OWNER_SENSOR, active);
+}
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
 static void connection_reset_raw_collection(bool reset_arq)
 {
 	k_msgq_purge(&raw_imu_msgq);
@@ -896,17 +897,23 @@ static void connection_reset_raw_collection(bool reset_arq)
 	k_spin_unlock(&raw_request_lock, request_key);
 	raw_collection_start_ms = k_uptime_get();
 	atomic_inc(&raw_collection_session);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
 	latest_mag_valid = false;
 	k_spin_unlock(&latest_mag_lock, mag_key);
+#endif
 	if (reset_arq) {
 		memset(raw_ring_valid_bits, 0, sizeof(raw_ring_valid_bits));
 		unsigned key = irq_lock();
 		raw_retx_reset(&raw_retx);
 		irq_unlock(key);
-		raw_retx_total = 0;
 	}
 }
+uint32_t connection_get_raw_collection_session(void)
+{
+	return (uint32_t)atomic_get(&raw_collection_session);
+}
+
 void connection_set_data_collection(bool enable)
 {
 	bool was_active = connection_get_data_collection();
@@ -918,20 +925,29 @@ void connection_set_data_collection(bool enable)
 	}
 	if (!enable) atomic_set(&data_collection_active, 0);
 	if (enable && !was_active) connection_reset_raw_collection(true);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	if (!enable && was_active) {
 		k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
 		latest_mag_valid = false;
 		k_spin_unlock(&latest_mag_lock, mag_key);
 	}
+#endif
 	if (enable) atomic_set(&data_collection_active, 1);
 	LOG_INF("Data collection %s", enable ? "STARTED" : "STOPPED");
+	connection_feedback_maintenance_update();
 }
+#endif
 
 bool connection_get_data_collection(void)
 {
+#if CONFIG_CONNECTION_RAW_COLLECTION
 	return atomic_get(&data_collection_active) != 0;
+#else
+	return false;
+#endif
 }
 
+#if CONFIG_CONNECTION_RAW_COLLECTION
 int connection_set_data_collection_batch(bool enable, uint16_t rate_hz)
 {
 	bool was_active = connection_get_data_collection_batch();
@@ -965,37 +981,67 @@ int connection_set_data_collection_batch(bool enable, uint16_t rate_hz)
 	if (!enable) {
 		LOG_INF("Batch data collection STOPPED");
 	}
+	connection_feedback_maintenance_update();
 	return 0;
 }
+#endif
 
 bool connection_get_data_collection_batch(void)
 {
+#if CONFIG_CONNECTION_RAW_COLLECTION
 	return atomic_get(&data_collection_batch_active) != 0;
+#else
+	return false;
+#endif
 }
 
 uint16_t connection_get_data_collection_batch_rate(void)
 {
+#if CONFIG_CONNECTION_RAW_COLLECTION
 	return data_collection_batch_rate_hz;
+#else
+	return 0;
+#endif
 }
 
 
 void connection_set_ota_suppressed(bool suppressed)
 {
+	k_spinlock_key_t key = k_spin_lock(&ota_suppress_lock);
 	ota_suppressed = suppressed;
-	if (suppressed) {
-		ota_suppress_start_time = k_uptime_get();
-	} else {
-		ota_suppress_start_time = 0;
-	}
+	ota_suppress_start_time = suppressed ? k_uptime_get() : 0;
+	k_spin_unlock(&ota_suppress_lock, key);
 	LOG_INF("OTA suppression %s", suppressed ? "ENABLED (slow poll)" : "DISABLED (normal poll)");
 }
 
 bool connection_get_ota_suppressed(void)
 {
-	return ota_suppressed;
+	k_spinlock_key_t key = k_spin_lock(&ota_suppress_lock);
+	bool suppressed = ota_suppressed;
+	k_spin_unlock(&ota_suppress_lock, key);
+	return suppressed;
+}
+
+static bool connection_ota_suppression_active(int64_t now)
+{
+	k_spinlock_key_t key = k_spin_lock(&ota_suppress_lock);
+	bool expired = ota_suppressed && ota_suppress_start_time > 0
+		&& now - ota_suppress_start_time > OTA_SUPPRESS_TIMEOUT_MS;
+	if (expired) {
+		ota_suppressed = false;
+		ota_suppress_start_time = 0;
+	}
+	bool suppressed = ota_suppressed;
+	k_spin_unlock(&ota_suppress_lock, key);
+	if (expired) {
+		LOG_WRN("OTA suppress timeout, auto-unsuppressing");
+		LOG_INF("OTA suppression DISABLED (normal poll)");
+	}
+	return suppressed;
 }
 
 
+#if CONFIG_CONNECTION_RAW_COLLECTION
 bool connection_raw_collection_startup_done(void)
 {
 	return connection_raw_collection_active() && (k_uptime_get() - raw_collection_start_ms >= 5000);
@@ -1021,6 +1067,7 @@ void connection_queue_raw_sample(const struct raw_imu_sample *sample)
 	connection_signal_wake();
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void connection_queue_raw_mag(const float mag[3])
 {
 	if (!connection_raw_collection_active()) {
@@ -1039,6 +1086,7 @@ void connection_queue_raw_mag(const float mag[3])
 	}
 	k_spin_unlock(&latest_mag_lock, key);
 }
+#endif
 
 void connection_send_raw_metadata(
 	float gyro_range, float accel_range, float gyro_odr, float accel_odr,
@@ -1047,6 +1095,21 @@ void connection_send_raw_metadata(
 	/* The sensor thread publishes one immutable snapshot per session. */
 	k_spinlock_key_t key = k_spin_lock(&raw_request_lock);
 	if (!connection_raw_collection_active() || atomic_get(&raw_snapshot_ready)) {
+		k_spin_unlock(&raw_request_lock, key);
+		return;
+	}
+	uint32_t session = (uint32_t)atomic_get(&raw_collection_session);
+	k_spin_unlock(&raw_request_lock, key);
+
+	/* T-Cal may block on its mutex. Never capture with interrupts disabled;
+	 * a stop/restart while waiting must not publish into the new session. */
+	/* Sensor-owner-only staging keeps the point table off its 2 KiB stack. */
+	static struct raw_cal_snapshot snapshot;
+	connection_capture_calibration_snapshot(&snapshot);
+
+	key = k_spin_lock(&raw_request_lock);
+	if (!connection_raw_collection_active() || atomic_get(&raw_snapshot_ready)
+	    || session != (uint32_t)atomic_get(&raw_collection_session)) {
 		k_spin_unlock(&raw_request_lock, key);
 		return;
 	}
@@ -1062,7 +1125,7 @@ void connection_send_raw_metadata(
 	raw_metadata_buf[23] = mag;
 	memcpy(&raw_metadata_buf[24], &chip_gyro_hz, 4);
 	memcpy(&raw_metadata_buf[28], &fusion_gyro_hz, 4);
-	connection_capture_calibration_snapshot(true);
+	raw_cal_snapshot = snapshot;
 	raw_request_mask = RAW_META_MASK_ALL;
 	raw_request_chunk = 255;
 	atomic_set(&raw_snapshot_ready, 1);
@@ -1183,7 +1246,6 @@ bool connection_process_raw_data(void)
 			if (err != 0) {
 				k_msleep(1);
 			}
-			raw_retx_total++;
 		}
 		return true;
 	}
@@ -1239,6 +1301,7 @@ bool connection_process_raw_data(void)
 		memcpy(&buf[20], &sample.accel[0], 4);
 		memcpy(&buf[24], &sample.accel[1], 4);
 		memcpy(&buf[28], &sample.accel[2], 4);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		uint8_t flags = 0;
 		float mag_snap[3] = {0};
 		bool mag_ok = false;
@@ -1258,6 +1321,7 @@ bool connection_process_raw_data(void)
 			flags |= 0x01;
 		}
 		buf[44] = flags;
+#endif
 		memcpy(&buf[45], &sample.temp_c, sizeof(sample.temp_c));
 
 		/* Only reliable single-target collection retains ARQ history. */
@@ -1276,6 +1340,7 @@ bool connection_process_raw_data(void)
 
 	return false;
 }
+#endif
 
 /* Exact test-mode rate schedule in local monotonic microseconds. TDMA still
  * owns slot admission; this schedule only selects which slot opportunities
@@ -1285,6 +1350,9 @@ static struct {
 	uint64_t next_due_us;
 	uint32_t remainder;
 	uint16_t tps;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	bool mag_turn;
+#endif
 } test_rate_schedule;
 static uint64_t test_wake_delay_us;
 static bool test_wake_delay_valid;
@@ -1296,6 +1364,11 @@ static void test_rate_schedule_sync(uint64_t now_us)
 		memset(&test_rate_schedule, 0, sizeof(test_rate_schedule));
 		return;
 	}
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (test_rate_schedule.tps == 0) {
+		test_rate_schedule.mag_turn = false;
+	}
+#endif
 	if (test_rate_schedule.tps != tps || test_rate_schedule.next_due_us == 0
 		|| test_rate_schedule.next_due_us + 1000000ULL < now_us) {
 		test_rate_schedule.tps = tps;
@@ -1340,55 +1413,6 @@ static uint64_t test_rate_delay_us(uint64_t now_us)
 /* Max sub-packet payload in a composite: ESB_MAX_PAYLOAD_LEN - 3 (header) - 1 (sequence) */
 #define COMPOSITE_MAX_SUB_DATA (ESB_MAX_PAYLOAD_LEN - 4)
 
-/*
- * Build and send a composite packet identified by ESB_COMPOSITE_TYPE
- * containing multiple sub-packets.
- * types[] / lens[] describe the sub-packets to include; n is the count.
- * Each sub-packet is: [type_byte][data...].
- * Format: [ESB_COMPOSITE_TYPE][tracker_id][sub_count][sub0_type][sub0_data...]
- *         [sub1_type][sub1_data...]...[sequence]
- */
-static bool send_composite(const struct composite_builder *builder)
-{
-	uint8_t buf[ESB_MAX_PAYLOAD_LEN];
-	int pos = 0;
-	/* An event is only a tail of real business data, never a replacement pose.
-	 * Reject an empty builder without completing its event token: the event
-	 * remains pending for a later pose (or a normal-mode standalone send). */
-	if (builder->n <= 0 || builder->n > ARRAY_SIZE(builder->types)) {
-		return false;
-	}
-	buf[pos++] = ESB_COMPOSITE_TYPE;
-	buf[pos++] = tracker_id;
-	buf[pos++] = (uint8_t)(builder->n + builder->has_event);
-	for (int i = 0; i < builder->n; i++) {
-		const struct sub_packet_desc *d = sub_packet_get(builder->types[i]);
-		if (!d || pos + 1 + d->data_len + 1 > sizeof(buf)) {
-			return false;
-		}
-		buf[pos++] = builder->types[i];
-		pos += d->fill(&buf[pos]);
-	}
-	if (builder->has_event) {
-		if (pos + 16 + 1 > sizeof(buf)) {
-			return false;
-		}
-		buf[pos++] = TRACKER_EVENT_ESB_TYPE;
-		memcpy(&buf[pos], &builder->event.packet[2], 15);
-		pos += 15;
-	}
-	buf[pos++] = packet_sequence;
-	int err = esb_write(buf, no_ack, pos);
-	if (builder->has_event) {
-		tracker_events_complete(builder->event.token, err == 0, k_uptime_get_32());
-	}
-	if (err != 0) {
-		return false;
-	}
-	packet_sequence++;
-	return true;
-}
-
 static void composite_builder_reset(struct composite_builder *builder)
 {
 	builder->n = 0;
@@ -1428,47 +1452,118 @@ composite_try_add_due(struct composite_builder *builder, uint8_t type, bool want
 	return true;
 }
 
+static uint8_t composite_type_mask(const struct composite_builder *builder)
+{
+	uint8_t types = 0;
+	for (int i = 0; i < builder->n; i++) {
+		types |= (uint8_t)(1u << builder->types[i]);
+	}
+	return types;
+}
+
 /* Apply deferred low-frequency last-sent timestamps once the packet that
  * carries them was actually queued; a failed send must leave them unchanged
  * so the data is retried. */
-static void composite_commit_timestamps(const struct composite_builder *builder)
+static void composite_commit_timestamps(const struct composite_builder *builder, uint8_t accepted)
 {
 	for (int i = 0; i < builder->n; i++) {
-		if (builder->last_times[i]) {
+		if ((accepted & (1u << builder->types[i])) && builder->last_times[i]) {
 			*builder->last_times[i] = builder->stamps[i];
 		}
 	}
 }
 
-static bool send_composite_or_single(struct composite_builder *builder, uint8_t fallback_type)
+static uint8_t send_composite_or_single(struct composite_builder *builder, const sensor_data_capture_t *capture)
 {
-	/* Private event data is never a normal sub-packet or a direct-HID mirror. */
-	if (esb_ready() && builder->n > 0 && builder->used + 16 <= COMPOSITE_MAX_SUB_DATA
+	if (builder->n <= 0 || builder->n > ARRAY_SIZE(builder->types)) {
+		return 0;
+	}
+	int business_len = 0;
+	for (int i = 0; i < builder->n; i++) {
+		const struct sub_packet_desc *d = sub_packet_get(builder->types[i]);
+		if (!d) {
+			return 0;
+		}
+		business_len += 1 + d->data_len;
+	}
+	if (business_len + (builder->has_event ? 16 : 0) > COMPOSITE_MAX_SUB_DATA) {
+		return 0;
+	}
+
+	bool radio_selected = esb_ready();
+	if (!radio_selected && !connection_hid_output_ready()) {
+		return 0;
+	}
+	if (radio_selected && !builder->has_event && business_len + 16 <= COMPOSITE_MAX_SUB_DATA
 		&& !esb_ota_is_active() && !get_status(SYS_STATUS_CONNECTION_ERROR)) {
 		builder->has_event = tracker_events_select(k_uptime_get_32(), tracker_id, &builder->event);
 	}
-	if (builder->n > 1 || builder->has_event) {
-		if (!esb_ready()) {
-#if CONFIG_CONNECTION_OVER_HID
-			/* Radio unavailable: HID is the configured output path;
-			 * its enqueue success is the send success. */
-			return write_hid_composite_as_normal_packets(builder);
-#else
-			return false;
-#endif
-		}
 
-		/* Radio available: only ESB queue success counts, so a failed
-		 * admission cannot advance the schedule or mirror to HID. */
-		if (!send_composite(builder)) {
-			return false;
+	uint8_t buf[ESB_MAX_PAYLOAD_LEN];
+	bool composite = builder->n > 1 || builder->has_event;
+	int pos;
+	if (composite) {
+		pos = 0;
+		buf[pos++] = ESB_COMPOSITE_TYPE;
+		buf[pos++] = tracker_id;
+		buf[pos++] = (uint8_t)(builder->n + builder->has_event);
+		for (int i = 0; i < builder->n; i++) {
+			const struct sub_packet_desc *d = sub_packet_get(builder->types[i]);
+			buf[pos++] = builder->types[i];
+			pos += d->fill(&buf[pos], capture);
 		}
-#if CONFIG_CONNECTION_OVER_HID
-		write_hid_composite_as_normal_packets(builder);
-#endif
-		return true;
+		if (builder->has_event) {
+			buf[pos++] = TRACKER_EVENT_ESB_TYPE;
+			memcpy(&buf[pos], &builder->event.packet[2], 15);
+			pos += 15;
+		}
+	} else {
+		fill_normal_packet(builder->types[0], buf, capture);
+		pos = 16;
 	}
-	return connection_write_packet_type(fallback_type);
+	buf[pos++] = packet_sequence;
+
+	uint8_t accepted = 0;
+	if (radio_selected) {
+		int err = esb_write(buf, no_ack, pos);
+		if (builder->has_event) {
+			tracker_events_complete(builder->event.token, err == 0, k_uptime_get_32());
+		}
+		if (err != 0) {
+			return 0;
+		}
+		packet_sequence++;
+		accepted = composite_type_mask(builder);
+#if CONFIG_CONNECTION_OVER_HID
+		if (connection_hid_output_ready()) {
+			if (composite) {
+				write_hid_composite_as_normal_packets(buf, builder->n);
+			} else {
+				hid_write_packet_n(buf);
+			}
+		}
+#endif
+	} else {
+#if CONFIG_CONNECTION_OVER_HID
+		if (composite) {
+			accepted = write_hid_composite_as_normal_packets(buf, builder->n);
+		} else if (hid_write_packet_n(buf)) {
+			accepted = (uint8_t)(1u << builder->types[0]);
+		}
+#endif
+	}
+
+	uint8_t accepted_streams = 0;
+	for (int i = 0; i < builder->n; i++) {
+		if (accepted & (1u << builder->types[i])) {
+			accepted_streams |= sub_packet_get(builder->types[i])->streams;
+		}
+	}
+	if (accepted_streams) {
+		sensor_data_snapshot_commit(&sensor_data_snapshot, capture, accepted_streams);
+	}
+	composite_commit_timestamps(builder, accepted);
+	return accepted;
 }
 
 static void connection_signal_wake(void)
@@ -1499,6 +1594,19 @@ static bool connection_send_tracker_event(void)
 	return true;
 }
 
+/* A packet refused by ESB admission is rebuilt from the live snapshot and
+ * retried. Retrying a millisecond later is only useful while TDMA can still
+ * admit soon: with receiver time missing or stale every attempt is refused
+ * before the ESB FIFO, and that tight retry turned a receiver outage into
+ * ~800 hopeless writes per second for as long as it lasted. */
+#define SEND_RETRY_MS 1
+#define SEND_RETRY_STALLED_MS 10
+
+static uint32_t connection_send_retry_ms(void)
+{
+	return tdma_admission_stalled() ? SEND_RETRY_STALLED_MS : SEND_RETRY_MS;
+}
+
 static int64_t connection_next_deadline_ms(int64_t now)
 {
 	int64_t deadline = now + 1000; /* bounded fallback */
@@ -1510,8 +1618,12 @@ static int64_t connection_next_deadline_ms(int64_t now)
 		if (guarded_deadline < deadline) {
 			deadline = guarded_deadline;
 		}
-	} else if (esb_ready() && (int32_t)(ping_deadline - (uint32_t)deadline) < 0) {
-		deadline = ping_deadline;
+	} else if (esb_ready()) {
+		/* Lift the modular deadline to the nearest epoch around now. */
+		int64_t p_dl = now + (int32_t)(ping_deadline - (uint32_t)now);
+		if (p_dl < deadline) {
+			deadline = p_dl;
+		}
 	}
 	test_wake_delay_valid = false;
 	if (test_mode_get()) {
@@ -1535,12 +1647,14 @@ static int64_t connection_next_deadline_ms(int64_t now)
 				}
 			}
 		}
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		if (sensor_data_snapshot_m_pending(&sensor_data_snapshot)) {
 			int64_t m_dl = last_mag_time + 100;
 			if (m_dl < deadline) {
 				deadline = m_dl;
 			}
 		}
+#endif
 		if (sensor_ids_set) {
 			int64_t i_dl = last_info_time + 100;
 			if (i_dl < deadline) {
@@ -1580,21 +1694,108 @@ static void connection_idle_wait(int64_t now)
 	(void)k_sem_take(&connection_wake_sem, K_MSEC(wait_ms));
 }
 
-void connection_thread(void)
+static bool connection_service_ping(int64_t now)
+{
+	/* Synchronized operation derives the next PING directly from server
+	 * frame time. The deterministic interval is always <=1 second and the
+	 * following physical slot is reserved by every tracker. Startup and
+	 * receiver-reset recovery retain the immediate unslotted path. */
+	uint32_t effective_ping_interval_ms = get_ping_interval_ms();
+	uint32_t ping_deadline = (uint32_t)atomic_get(&next_ping_deadline_ms);
+	bool force_resync = atomic_cas(&ping_resync_requested, 1, 0);
+	uint32_t ping_window_delay_ms = 0;
+	bool guarded_schedule = !force_resync && tdma_ping_wake_delay_ms(&ping_window_delay_ms);
+	if (guarded_schedule) {
+		ping_deadline = (uint32_t)now + ping_window_delay_ms;
+		ping_aligned_interval_ms = effective_ping_interval_ms;
+		atomic_set(&ping_server_phase_aligned, 1);
+	} else if (!force_resync) {
+		if (ping_aligned_interval_ms != effective_ping_interval_ms) {
+			atomic_set(&ping_server_phase_aligned, 0);
+		}
+		if (!atomic_get(&ping_server_phase_aligned)) {
+			uint32_t phase_delay_ms = ping_server_phase_delay_ms(effective_ping_interval_ms);
+			if (phase_delay_ms > 0) {
+				ping_deadline = (uint32_t)now + phase_delay_ms;
+				atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
+				ping_aligned_interval_ms = effective_ping_interval_ms;
+				atomic_set(&ping_server_phase_aligned, 1);
+			}
+		}
+	}
+
+	bool ping_due = force_resync
+		|| (guarded_schedule ? ping_window_delay_ms == 0
+			: (int32_t)((uint32_t)now - ping_deadline) >= 0);
+	if (ping_due) {
+		uint8_t ping[ESB_PING_LEN] = {0};
+		ping[0] = ESB_PING_TYPE;
+		ping[1] = connection_get_id();
+		ping[7] = esb_get_ping_ack_flag();
+		esb_get_ping_request_data(&ping[8]);
+		int err = esb_write_ping(ping, force_resync);
+		if (err == -EAGAIN) {
+			uint32_t retry_delay_ms = 0;
+			if (tdma_ping_wake_delay_ms(&retry_delay_ms)) {
+				atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
+			}
+			return true;
+		}
+		atomic_inc(&ping_sched_stats.due);
+		atomic_inc(&ping_sched_stats.attempts);
+		ping_stats_attempt((uint32_t)now);
+		if (!guarded_schedule) {
+			ping_deadline = ping_next_periodic_deadline(
+				ping_deadline, (uint32_t)now, effective_ping_interval_ms
+			);
+			atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
+		}
+		if (err == 0) {
+			atomic_inc(&ping_sched_stats.queue_ok);
+		} else {
+			atomic_inc(&ping_sched_stats.queue_fail);
+			atomic_inc(&ping_sched_stats.retry_deferred);
+			atomic_set(&ping_server_phase_aligned, 0);
+			uint32_t retry_delay_ms = PING_QUEUE_RETRY_MS;
+			if (guarded_schedule) {
+				(void)tdma_ping_wake_delay_ms(&retry_delay_ms);
+			}
+			atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
+		}
+		return true;
+	}
+	return false;
+}
+
+static void connection_thread(void)
 {
 	/* Register connection thread with watchdog */
-	watchdog_register_thread(WDT_CHANNEL_CONNECTION, 0);
+	if (watchdog_register_thread(WDT_CHANNEL_CONNECTION, 0) < 0) {
+		LOG_ERR("Connection watchdog registration failed");
+		sys_reboot(SYS_REBOOT_COLD);
+		return;
+	}
 	atomic_set(
 		&next_ping_deadline_ms,
 		(atomic_val_t)(k_uptime_get_32() + ping_phase_ms(PING_INTERVAL_MS))
 	);
 
 	while (1) {
+		/* Recovery must progress even without transport or while PING/search
+		 * paths keep bypassing the OTA polling branch. It may sleep, so sample
+		 * scheduler time only after servicing it. */
+		esb_ota_service();
 		int64_t now = k_uptime_get();
 
 		watchdog_feed(WDT_CHANNEL_CONNECTION);
 		bool radio_ready = esb_ready();
 		bool hid_ready = connection_hid_output_ready();
+		struct led_connection_facts led_facts = {0};
+		esb_led_connection_facts(&led_facts);
+		led_facts.output_ready = sensor_output_ready();
+		if (hid_ready && !radio_ready) led_facts.radio_required = false;
+		led_connection_publish(&led_facts);
+		connection_feedback_maintenance_update();
 
 		/* Adaptive PING interval based on connection health */
 		if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
@@ -1603,94 +1804,42 @@ void connection_thread(void)
 			ping_interval_ms = PING_INTERVAL_MS;
 		}
 
+#if CONFIG_CONNECTION_RAW_COLLECTION
+		/* Collection lifetime is independent of transport admission: channel
+		 * search, PING retries and OTA can all bypass the sending path. */
+		if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
+			if (connection_raw_collection_active()) {
+				if (dc_conn_error_start == 0) {
+					dc_conn_error_start = now;
+				} else if (now - dc_conn_error_start > 60000) {
+					connection_set_data_collection(false);
+					connection_set_data_collection_batch(false, 0);
+					test_mode_set(false);
+					dc_conn_error_start = 0;
+					LOG_WRN("Data collection auto-stopped (connection error for 60s)");
+				}
+			}
+		} else {
+			dc_conn_error_start = 0;
+		}
+#endif
+
 		if (!radio_ready && !hid_ready) {
 			k_msleep(100);
 			continue;
 		}
 
 		esb_process_ota_rx_queue();
+		if (esb_channel_search_poll(connection_get_ota_suppressed())) {
+			k_msleep(5);
+			continue;
+		}
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
 		radio_capture_process();
 #endif
 
 		if (radio_ready) {
-			/* Synchronized operation derives the next PING directly from server
-			 * frame time. The deterministic interval is always <=1 second and the
-			 * following physical slot is reserved by every tracker. Startup and
-			 * receiver-reset recovery retain the immediate unslotted path. */
-			uint32_t effective_ping_interval_ms = get_ping_interval_ms();
-			uint32_t ping_deadline = (uint32_t)atomic_get(&next_ping_deadline_ms);
-			bool force_resync = atomic_cas(&ping_resync_requested, 1, 0);
-			uint32_t ping_window_delay_ms = 0;
-			bool guarded_schedule = !force_resync && tdma_ping_wake_delay_ms(&ping_window_delay_ms);
-			if (guarded_schedule) {
-				ping_deadline = (uint32_t)now + ping_window_delay_ms;
-				ping_aligned_interval_ms = effective_ping_interval_ms;
-				atomic_set(&ping_server_phase_aligned, 1);
-			} else if (!force_resync) {
-				if (ping_aligned_interval_ms != effective_ping_interval_ms) {
-					atomic_set(&ping_server_phase_aligned, 0);
-				}
-				if (!atomic_get(&ping_server_phase_aligned)) {
-					uint32_t phase_delay_ms = ping_server_phase_delay_ms(effective_ping_interval_ms);
-					if (phase_delay_ms > 0) {
-						ping_deadline = (uint32_t)now + phase_delay_ms;
-						atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
-						ping_aligned_interval_ms = effective_ping_interval_ms;
-						atomic_set(&ping_server_phase_aligned, 1);
-					}
-				}
-			}
-
-			bool ping_due = force_resync
-				|| (guarded_schedule ? ping_window_delay_ms == 0
-					: (int32_t)((uint32_t)now - ping_deadline) >= 0);
-			if (ping_due) {
-				uint8_t ping[ESB_PING_LEN] = {0};
-				ping[0] = ESB_PING_TYPE;
-				ping[1] = connection_get_id();
-				uint8_t ping_ack_flag = esb_get_ping_ack_flag();
-				ping[7] = ping_ack_flag;
-				if (ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON) {
-					uint16_t tps = test_mode_get_target_tps();
-					ping[8] = (tps >> 8) & 0xFF;
-					ping[9] = tps & 0xFF;
-				} else if (ping_ack_flag == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
-					ping[8] = (uint8_t)connection_get_data_collection_batch_rate();
-				} else if (ping_ack_flag == ESB_PONG_FLAG_DATA_COLLECT_METADATA) {
-					uint8_t request[4];
-					esb_get_ping_request_data(request);
-					memcpy(&ping[8], request, sizeof(request));
-				}
-				int err = esb_write_ping(ping, force_resync);
-				if (err == -EAGAIN) {
-					uint32_t retry_delay_ms = 0;
-					if (tdma_ping_wake_delay_ms(&retry_delay_ms)) {
-						atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
-					}
-					continue;
-				}
-				atomic_inc(&ping_sched_stats.due);
-				atomic_inc(&ping_sched_stats.attempts);
-				ping_stats_attempt((uint32_t)now);
-				if (!guarded_schedule) {
-					ping_deadline = ping_next_periodic_deadline(
-						ping_deadline, (uint32_t)now, effective_ping_interval_ms
-					);
-					atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
-				}
-				if (err == 0) {
-					atomic_inc(&ping_sched_stats.queue_ok);
-				} else {
-					atomic_inc(&ping_sched_stats.queue_fail);
-					atomic_inc(&ping_sched_stats.retry_deferred);
-					atomic_set(&ping_server_phase_aligned, 0);
-					uint32_t retry_delay_ms = PING_QUEUE_RETRY_MS;
-					if (guarded_schedule) {
-						(void)tdma_ping_wake_delay_ms(&retry_delay_ms);
-					}
-					atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
-				}
+			if (connection_service_ping(now)) {
 				continue;
 			}
 
@@ -1700,7 +1849,6 @@ void connection_thread(void)
 			 * with OTA data in the ACK payload.
 			 */
 			if (esb_ota_is_active()) {
-				esb_ota_check_timeout();
 				esb_ota_periodic_status();
 				k_usleep(1500);
 				continue;
@@ -1710,34 +1858,17 @@ void connection_thread(void)
 			 * OTA suppression: when another tracker is being updated,
 			 * this tracker reduces its poll rate to free radio bandwidth.
 			 */
-			if (ota_suppressed) {
-				/* Safety timeout: auto-unsuppress after timeout */
-				if (ota_suppress_start_time > 0 && (now - ota_suppress_start_time) > OTA_SUPPRESS_TIMEOUT_MS) {
-					LOG_WRN("OTA suppress timeout, auto-unsuppressing");
-					connection_set_ota_suppressed(false);
-				} else {
-					k_msleep(100); /* ~10 Hz poll rate */
-				}
+			if (connection_ota_suppression_active(now)) {
+				k_msleep(100); /* ~10 Hz poll rate */
 			}
 
-			/* Connection-loss shutdown is independent of metadata repair. */
+			/* Disconnected radios must not send collection or sensor data. */
 			if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
-				if (connection_raw_collection_active()) {
-					if (dc_conn_error_start == 0) {
-						dc_conn_error_start = now;
-					} else if (now - dc_conn_error_start > 60000) {
-						connection_set_data_collection(false);
-						connection_set_data_collection_batch(false, 0);
-						test_mode_set(false);
-						dc_conn_error_start = 0;
-						LOG_WRN("Data collection auto-stopped (connection error for 60s)");
-					}
-				}
 				k_msleep(100);
 				continue;
 			}
-			dc_conn_error_start = 0;
 
+#if CONFIG_CONNECTION_RAW_COLLECTION
 			/* Raw streams yield one admission to a due event; test mode may
 			 * only carry events on its scheduled real pose packet. */
 			if (connection_raw_collection_active() && connection_send_tracker_event()) {
@@ -1747,8 +1878,10 @@ void connection_thread(void)
 			if (connection_process_raw_data()) {
 				continue;
 			}
+#endif
 		} // end of radio_ready block
 
+#if CONFIG_CONNECTION_RAW_COLLECTION
 		/* During data collection, throttle fusion data
 		 * to leave radio bandwidth for raw data. */
 		if (radio_ready && connection_raw_collection_active()) {
@@ -1759,6 +1892,7 @@ void connection_thread(void)
 			}
 			last_fusion_dc_time = now;
 		}
+#endif
 
 		/* TDMA is the sole frame scheduler. In normal mode a fresh snapshot
 		 * enters admission immediately. In test mode the configured interval
@@ -1775,8 +1909,10 @@ void connection_thread(void)
 		bool quat_ready = in_test_mode ? test_send_due : pending;
 		/* In test mode all low-frequency data rides the next target-rate
 		 * packet. Standalone sends would violate the configured ceiling. */
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 		bool mag_due = !in_test_mode && sensor_data_snapshot_m_pending(&sensor_data_snapshot)
 			&& (now - last_mag_time >= 100);
+#endif
 		bool info_due = !in_test_mode && sensor_ids_set && (now - last_info_time >= 100);
 		bool status_due = !in_test_mode && (now - last_status_time >= 1000);
 		bool runtime_due = !in_test_mode && (now - last_runtime_time >= 1000);
@@ -1785,70 +1921,75 @@ void connection_thread(void)
 		bool info_soon = sensor_ids_set && (now - last_info_time > 100 - COMPOSITE_LOOKAHEAD_MS);
 		bool status_soon = (now - last_status_time > 1000 - COMPOSITE_LOOKAHEAD_MS);
 		bool runtime_soon = (now - last_runtime_time > 1000 - COMPOSITE_LOOKAHEAD_MS);
-		bool mag_soon = sensor_data_snapshot_m_pending(&sensor_data_snapshot)
-			&& (now - last_mag_time > 100 - COMPOSITE_LOOKAHEAD_MS);
-		bool status_wanted = status_due || status_soon;
-		bool runtime_wanted = runtime_due || runtime_soon;
-		bool info_wanted = info_due || info_soon;
-		bool mag_wanted = mag_due || mag_soon;
-
-		if (quat_ready) {
+		if (quat_ready || info_due || status_due || runtime_due
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		    || mag_due
+#endif
+		) {
+			sensor_data_capture_t capture;
+			sensor_data_snapshot_capture(&sensor_data_snapshot, &capture);
+			quat_ready = in_test_mode ? test_send_due : (capture.pending & SENSOR_STREAM_QA) != 0;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+			mag_due = !in_test_mode && (capture.pending & SENSOR_STREAM_M)
+				&& (now - last_mag_time >= 100);
+			bool mag_soon = (capture.pending & SENSOR_STREAM_M)
+				&& (now - last_mag_time > 100 - COMPOSITE_LOOKAHEAD_MS);
+#endif
+			bool status_wanted = status_due || status_soon;
+			bool runtime_wanted = runtime_due || runtime_soon;
+			bool info_wanted = info_due || info_soon;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+			bool mag_wanted = mag_due || mag_soon;
+			bool pose_conflict = in_test_mode && (capture.pending & SENSOR_STREAM_QA) && mag_wanted;
+#endif
 			struct composite_builder builder;
-			uint8_t fallback_type = SUB_PACKET_QUAT_ACCEL;
 			composite_builder_reset(&builder);
 
-			/* Primary: quat sub-packet */
-			if (mag_wanted) {
-				/* mag includes full quat, use type 4 instead of separate quat+mag */
-				composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, true, &last_mag_time, now);
-				fallback_type = SUB_PACKET_QUAT_MAG;
-			} else if (!connection_sensor_get_precise_quat() && info_wanted) {
-				/* compact quat (type 2) contains batt/temp but NOT imu_id/mag_id.
-				 * Don't update last_info_time here so that a real type 0 info
-				 * sub-packet is still piggybacked to keep IMU model visible. */
-				composite_try_add(&builder, SUB_PACKET_COMPACT_QUAT);
-				fallback_type = SUB_PACKET_COMPACT_QUAT;
-			} else {
-				composite_try_add(&builder, SUB_PACKET_QUAT_ACCEL);
-			}
-
-			/* Piggyback low-freq sub-packets if they fit */
-			composite_try_add_due(&builder, SUB_PACKET_STATUS, status_wanted, &last_status_time, now);
-			composite_try_add_due(&builder, SUB_PACKET_RUNTIME, runtime_wanted, &last_runtime_time, now);
-			composite_try_add_due(&builder, SUB_PACKET_INFO, info_wanted, &last_info_time, now);
-
-			if (send_composite_or_single(&builder, fallback_type)) {
-				/* Only a successfully queued packet consumes the test-rate
-				 * slot; missed ESB admission is retried without advancing
-				 * the schedule. */
-				if (in_test_mode) {
-					test_rate_advance(k_ticks_to_us_near64(k_uptime_ticks()));
+			if (quat_ready) {
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+				bool mag_primary = in_test_mode && mag_wanted
+					&& (!(capture.pending & SENSOR_STREAM_QA) || test_rate_schedule.mag_turn);
+				if (mag_primary) {
+					composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, true, &last_mag_time, now);
+				} else
+#endif
+				if (!capture.precise && info_wanted) {
+					/* Compact pose omits the sensor IDs, so info remains independently due. */
+					composite_try_add(&builder, SUB_PACKET_COMPACT_QUAT);
+				} else {
+					composite_try_add(&builder, SUB_PACKET_QUAT_ACCEL);
 				}
-				composite_commit_timestamps(&builder);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+				if (!in_test_mode) {
+					composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, mag_wanted, &last_mag_time, now);
+				}
+#endif
+				composite_try_add_due(&builder, SUB_PACKET_STATUS, status_wanted, &last_status_time, now);
+				composite_try_add_due(&builder, SUB_PACKET_RUNTIME, runtime_wanted, &last_runtime_time, now);
+				composite_try_add_due(&builder, SUB_PACKET_INFO, info_wanted, &last_info_time, now);
 			} else {
-				k_msleep(1);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+				if (mag_due) {
+					composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, true, &last_mag_time, now);
+				} else
+#endif
+				if (info_due) {
+					composite_try_add_due(&builder, SUB_PACKET_INFO, true, &last_info_time, now);
+				}
+				composite_try_add_due(&builder, SUB_PACKET_STATUS, status_wanted, &last_status_time, now);
+				composite_try_add_due(&builder, SUB_PACKET_RUNTIME, runtime_wanted, &last_runtime_time, now);
 			}
-			continue;
-		}
 
-		/* No quat ready: all low-frequency packets may carry an event tail. */
-		if (mag_due || info_due || status_due || runtime_due) {
-			struct composite_builder builder;
-			composite_builder_reset(&builder);
-			uint8_t primary = mag_due ? SUB_PACKET_QUAT_MAG
-				: info_due ? SUB_PACKET_INFO
-				: status_due ? SUB_PACKET_STATUS : SUB_PACKET_RUNTIME;
-			if (mag_due) {
-				composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, true, &last_mag_time, now);
-			} else if (info_due) {
-				composite_try_add_due(&builder, SUB_PACKET_INFO, true, &last_info_time, now);
+			uint8_t primary = builder.types[0];
+			uint8_t accepted = send_composite_or_single(&builder, &capture);
+			if (in_test_mode && (accepted & (1u << primary))) {
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+				test_rate_schedule.mag_turn = pose_conflict && primary != SUB_PACKET_QUAT_MAG;
+#endif
+				test_rate_advance(k_ticks_to_us_near64(k_uptime_ticks()));
 			}
-			composite_try_add_due(&builder, SUB_PACKET_STATUS, status_wanted, &last_status_time, now);
-			composite_try_add_due(&builder, SUB_PACKET_RUNTIME, runtime_wanted, &last_runtime_time, now);
-			if (send_composite_or_single(&builder, primary)) {
-				composite_commit_timestamps(&builder);
-			} else {
-				k_msleep(1);
+			if (accepted != composite_type_mask(&builder)) {
+				k_msleep(connection_send_retry_ms());
 			}
 			continue;
 		}

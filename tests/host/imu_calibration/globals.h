@@ -5,7 +5,6 @@
 #include <stdint.h>
 
 struct host_retained {
-	float accelBias[3];
 	float gyroBias[3];
 	float accBAinv[4][3];
 	struct {
@@ -17,7 +16,7 @@ struct host_retained {
 	uint64_t build_timestamp;
 };
 
-extern struct host_retained *retained;
+extern struct host_retained *const retained;
 void retained_update(void);
 void host_log_error(const char *format, ...);
 void host_log_warning(const char *format, ...);

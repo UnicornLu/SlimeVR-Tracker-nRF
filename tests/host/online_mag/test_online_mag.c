@@ -5,11 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include "globals.h"
-#include "../../../src/sensor/calibration/online_mag.c"
+#include "sensor/calibration/online_mag.c"
 
 static struct retained_fixture storage;
-struct retained_fixture *retained = &storage;
+struct retained_fixture *const retained = &storage;
 float magBAinv[4][3];
+#ifdef REAL_FIT
+/* mag_fit.c is linked here without cal_mag.c, which owns the production copy. */
+union mag_cal_workspace mag_cal_workspace;
+#endif
 uint8_t magneto_progress;
 #ifdef REAL_FIT
 #define FIT_HAS_STARTED true
@@ -65,7 +69,7 @@ void cal_event_end(uint16_t op, uint8_t outcome, uint8_t phase, uint8_t reason)
 }
 void tracker_events_notify(void)
 {
-	assert(!online_lock.held && !transaction);
+	assert(!online_lock.held); /* A synchronous setter may own the storage barrier. */
 }
 
 void fixture_log(const char *format, ...)
@@ -106,31 +110,94 @@ void watchdog_feed(int channel)
 }
 void sys_warm_transaction_begin(void)
 {
-	assert(!online_lock.held && !transaction);
-	transaction = 1;
+	assert(!online_lock.held);
+	++transaction; /* Retained helpers share the caller's recursive barrier. */
 }
 void sys_warm_transaction_end(bool changed)
 {
 	(void)changed;
 	assert(transaction);
-	transaction = 0;
+	--transaction;
 }
-void sys_warm_transaction_mark(int id, void *p, size_t size)
+void sys_warm_transaction_mark(uint16_t id, const void *p, size_t size)
 {
 	(void)p;
 	(void)size;
 	assert(transaction && id == MAIN_MAG_BIAS_ID);
 	++dirty_marks;
 }
-void sys_write(int id, void *dst, const void *src, size_t size)
+/* Semantic LED leaves: the real online owner submits LED facts; only
+ * submission is observed here, never rendering. */
+static unsigned led_results[LED_SEMANTIC_COUNT];
+static unsigned led_requests[LED_SEMANTIC_COUNT];
+static uint32_t led_identity;
+
+uint32_t led_request_id(void) { return ++led_identity; }
+uint32_t led_event_id(void) { return ++led_identity; }
+struct led_token led_begin(enum led_owner owner, uint32_t request_id)
+{
+	return (struct led_token){ .owner = owner, .session = ++led_identity, .request_id = request_id };
+}
+enum led_admission led_state(struct led_token token, uint32_t revision, enum led_semantic semantic)
+{
+	(void)token;
+	(void)revision;
+	led_results[semantic] += 0;
+	return LED_ADMITTED;
+}
+enum led_admission led_result(struct led_token token, uint32_t event_id, enum led_semantic semantic)
+{
+	(void)event_id;
+	if (token.session) {
+		led_results[semantic]++;
+	}
+	return LED_ADMITTED;
+}
+enum led_admission led_request_event(enum led_owner owner, uint32_t request_id, uint32_t event_id,
+				     enum led_semantic semantic)
+{
+	(void)owner;
+	(void)request_id;
+	(void)event_id;
+	led_requests[semantic]++;
+	return LED_ADMITTED;
+}
+void led_identify(void) {}
+void led_connection_publish(const struct led_connection_facts *facts) { (void)facts; }
+void led_power_publish(enum led_power_state state, bool low) { (void)state; (void)low; }
+void led_fault_publish(enum led_owner owner, enum led_fault_kind fault, uint32_t protection_id)
+{
+	(void)owner;
+	(void)fault;
+	(void)protection_id;
+}
+void led_maintenance_publish(enum led_owner owner, bool active) { (void)owner; (void)active; }
+void led_operation_publish(enum led_owner owner, bool ota_active, bool heated_active)
+{
+	(void)owner;
+	(void)ota_active;
+	(void)heated_active;
+}
+void led_quiesce(void) {}
+void led_shutdown(void) {}
+
+static int storage_write_error;
+static uint8_t durable_online_mode;
+int sys_write(uint16_t id, void *dst, const void *src, size_t size)
 {
 	(void)id;
 	++storage_writes;
 	memcpy(dst, src, size);
+	if (!storage_write_error && id == MAG_ONLINE_CALIBRATION_ID) {
+		assert(size == sizeof(durable_online_mode));
+		memcpy(&durable_online_mode, src, size);
+	}
+	return storage_write_error;
 }
 void sensor_refresh_sensor_ids(void)
 {
 }
+void sensor_calibration_invalidate_kind(int kind) { (void)kind; }
 bool sensor_fusion_get_mag_ref(float *norm, float *dip)
 {
 	assert(!online_lock.held);
@@ -144,12 +211,16 @@ void fixture_reset(uint32_t now, int trusted)
 {
 	memset(&online, 0, sizeof(online));
 	memset(&online_lock, 0, sizeof(online_lock));
+	online_config_storage_error = 0; /* Fresh fixture starts from known durable config. */
+	storage_write_error = 0;
 	sensor_calibration_set_online_mag_debug(false); /* Simulate a fresh boot. */
 	memset(pool, 0, sizeof(pool));
 	memset(counts, 0, sizeof(counts));
 	memset(heads, 0, sizeof(heads));
 	memset(directions, 0, sizeof(directions));
 	memset(&storage, 0, sizeof(storage));
+	storage.mag_online_calibration_mode = MAG_ONLINE_CALIBRATION_ENABLED;
+	durable_online_mode = MAG_ONLINE_CALIBRATION_ENABLED;
 	clock_ms = now;
 	dirty_marks = transaction = feeds = solver_calls = 0;
 	log_count = storage_writes = 0;
@@ -168,7 +239,7 @@ void fixture_reset(uint32_t now, int trusted)
 		initial[0][0] = .02f;
 	}
 	memcpy(storage.magBAinv, initial, sizeof(initial));
-	magneto_online_replace_BAinv_and_reset(initial, 0);
+	magneto_online_replace_BAinv_and_reset(initial, 0, (struct led_token){0});
 	magneto_online_runtime_configure(true);
 	last_raw[0] = .5f;
 	last_raw[1] = last_raw[2] = 0;
@@ -176,6 +247,8 @@ void fixture_reset(uint32_t now, int trusted)
 	last_up[1] = .8f;
 	last_up[2] = 0;
 	last_valid = true;
+	memset(led_results, 0, sizeof(led_results));
+	memset(led_requests, 0, sizeof(led_requests));
 }
 
 void fixture_feed(const float raw[3], const float up[3], int valid, uint32_t dt)
@@ -201,11 +274,11 @@ void fixture_reference(float norm, float dip)
 void fixture_model(const float value[12])
 {
 	memcpy(storage.magBAinv, value, sizeof(storage.magBAinv));
-	magneto_online_replace_BAinv_and_reset((const float (*)[3])value, 0);
+	magneto_online_replace_BAinv_and_reset((const float (*)[3])value, 0, (struct led_token){0});
 }
 void fixture_clear(void)
 {
-	sensor_calibration_clear_mag(NULL, true);
+	assert(sensor_calibration_clear_mag(NULL, true, false) == 0);
 }
 int fixture_outcome(void)
 {
@@ -237,7 +310,7 @@ void fixture_restore_identity(int sensor_started)
 	memcpy(storage.magBAinv, identity, sizeof(identity));
 	storage.onlineMagState.update_count = 1;
 	storage.onlineMagState.last_buf_avg_norm = .5f;
-	magneto_online_replace_BAinv_and_reset(storage.magBAinv, 0);
+	magneto_online_replace_BAinv_and_reset(storage.magBAinv, 0, (struct led_token){0});
 	magneto_online_runtime_configure(true);
 	magneto_online_runtime_load_retained();
 }
@@ -259,7 +332,7 @@ void k_msleep(unsigned ms)
 			sensor_calibration_online_mag_prepare_power_down();
 		}
 		if (action == 4) {
-			magneto_online_replace_BAinv_and_reset(perfect, 0);
+			magneto_online_replace_BAinv_and_reset(perfect, 0, (struct led_token){0});
 		}
 	}
 	if (automatic_sensor) {
@@ -316,6 +389,10 @@ unsigned fixture_pool_newer_than(uint32_t when)
 uint32_t fixture_now(void)
 {
 	return clock_ms;
+}
+unsigned fixture_operations(void)
+{
+	return next_operation;
 }
 float fixture_old_rms(void)
 {
@@ -424,6 +501,95 @@ static void trial(void)
 	assert(fixture_phase() == PROBATION);
 	assert(!dirty_marks && !memcmp(storage.magBAinv, previous, sizeof(previous)));
 }
+static void stationary_noise(unsigned count, const float center[3])
+{
+	const float up[3] = {0, 0, 1};
+	for (unsigned i = 0; i < count; ++i) {
+		float raw[3];
+		for (unsigned j = 0; j < 3; ++j) {
+			raw[j] = center[j] + .0001f * (float)((int)((i * (7 + 2 * j)) % 11) - 5);
+		}
+		fixture_feed(raw, up, 0, 40);
+		if (i % 25 == 0) {
+			fixture_check();
+		}
+	}
+}
+
+static void test_stationary_novelty(void)
+{
+	const float rest[3] = {.08f, -.04f, .03f};
+	fixture_reset(1000, 0);
+	stationary_noise(2200, rest); /* Empty pool recentres onto sensor noise. */
+	assert(!next_operation && !solver_calls && !dirty_marks);
+	assert(online.admitted_since_fit == 1);
+
+	samples(900, false, true);
+	fixture_check();
+	assert(next_operation == 1 && fixture_phase() == VALIDATION_READY);
+	/* Near the training center, raw noise becomes large angular excursions.
+	 * Invalid radial holdout rejects this candidate, retaining the raw pool. */
+	stationary_noise(2200, rest);
+	assert(fixture_phase() == TRAINING && next_operation == 1 && solver_calls == 1);
+	assert(!dirty_marks && online.admitted_since_fit < 32);
+	assert(!memcmp(magBAinv, storage.magBAinv, sizeof(magBAinv)));
+	samples(900, false, true);
+	fixture_check();
+	assert(next_operation == 2 && solver_calls == 2 && fixture_phase() == VALIDATION_READY);
+
+	/* Explicit reset discards admission history, unlike an internal outcome. */
+	magneto_online_reset();
+	fixture_feed(rest, last_up, 0, 40);
+	assert(dot3(online.last_dir, online.last_dir) == 0);
+	fixture_feed(rest, last_up, 0, ONLINE_SUPPRESS_MS);
+	assert(online.admitted_since_fit == 1);
+
+	fixture_reset(1000, 0);
+	const float up[3] = {0, 0, 1};
+	float raw[3] = {1, 0, 0};
+	fixture_feed(raw, up, 0, 40); /* Service explicit reset. */
+	fixture_feed(raw, up, 0, ONLINE_SUPPRESS_MS);
+	assert(online.admitted_since_fit == 1);
+	/* Natural summary puts the center on the admitted point. Direction now
+	 * flips, but sub-threshold steps must accumulate from the admission,
+	 * not from the last observed (rejected) vector. */
+	raw[0] = .981f;
+	fixture_feed(raw, up, 0, 1000);
+	raw[0] = .9801f;
+	fixture_feed(raw, up, 0, 40);
+	assert(online.admitted_since_fit == 1);
+	raw[0] = .979f;
+	fixture_feed(raw, up, 0, 40);
+	assert(online.admitted_since_fit == 2);
+}
+
+static void test_partial_radial_metrics(void)
+{
+	fixture_reset(1000, 0);
+	for (unsigned phase = VALIDATING; phase <= PROBATION; ++phase) {
+		online.phase = phase;
+		/* Ten cells, two complete opposite-axis pairs; reliable but narrow
+		 * gravity evidence must not turn into a qualified reference dip. */
+		memset(directions, 0, sizeof(directions));
+		for (unsigned i = 0; i < 10; ++i) {
+			directions[i].count = directions[i].dip_count = 12;
+			directions[i].norm_sum = 6;
+		}
+		/* First eight are +/-X; indices 8 and 10 provide +/-Y. */
+		directions[10] = directions[9];
+		memset(&directions[9], 0, sizeof(directions[9]));
+		struct evidence e;
+		assert(metrics_pass(false, false, &e));
+		assert(e.diagnostics.radial_cells == 10 && !e.dip_known);
+		/* Four poles alone are unsafe: +/-X, +Y, +Z has only one pair. */
+		directions[16] = directions[10];
+		memset(&directions[10], 0, sizeof(directions[10]));
+		assert(!metrics_pass(false, false, &e));
+		assert(__builtin_popcount(e.diagnostics.radial_poles) == 4);
+		assert(e.diagnostics.rejection == ONLINE_MAG_REJECT_COVERAGE);
+	}
+}
+
 static void test_debug_logging(void)
 {
 	fixture_reset(1000, 0);
@@ -538,6 +704,35 @@ static void test_repeated_enable_preserves_trial(void)
 	assert(dirty_marks == 1 && fixture_updates() == 1);
 	assert(!memcmp(storage.magBAinv, active, sizeof(active)));
 }
+static void test_manual_start_rolls_back_only_trial(void)
+{
+	fixture_reset(1000, 1);
+	trial();
+	float confirmed[4][3], active[4][3];
+	memcpy(confirmed, storage.magBAinv, sizeof(confirmed));
+	magneto_online_snapshot_BAinv(active);
+	assert(memcmp(active, confirmed, sizeof(active)) != 0);
+	online.updates = storage.onlineMagState.update_count = 7;
+	storage.onlineMagState.last_buf_avg_norm = .52f;
+	sys_warm_transaction_begin();
+	magneto_online_reset();
+	sys_warm_transaction_end(false);
+	assert(!memcmp(storage.magBAinv, confirmed, sizeof(confirmed)));
+	assert(storage.onlineMagState.update_count == 7);
+	assert(storage.onlineMagState.last_buf_avg_norm == .52f);
+	magneto_online_apply_pending();
+	assert(!memcmp(magBAinv, confirmed, sizeof(confirmed)));
+	assert(!memcmp(storage.magBAinv, confirmed, sizeof(confirmed)));
+	assert(online.updates == 7 && storage.onlineMagState.update_count == 7);
+	assert(storage.onlineMagState.last_buf_avg_norm == .52f);
+	assert(!dirty_marks && !storage_writes);
+	assert(last_end.outcome == CAL_OUTCOME_CANCELLED);
+	unsigned completed = ended_events;
+	magneto_online_apply_pending();
+	assert(ended_events == completed);
+	samples(1, false, true);
+	assert(!memcmp(magBAinv, confirmed, sizeof(confirmed)) && ended_events == completed);
+}
 static void test_rejection_and_rollback(void)
 {
 	fixture_reset(1000, 1);
@@ -560,7 +755,8 @@ static void test_rejection_and_rollback(void)
 	fixture_reset(1000, 0);
 	train();
 	samples(900, true, true);
-	assert(fixture_phase() == VALIDATING && !dirty_marks); /* hemisphere lacks a pole */
+	assert(fixture_phase() == CONFIRMATION_READY && !dirty_marks);
+	assert(fixture_check() && dirty_marks == 1 && !online.dip_known);
 	fixture_reset(1000, 0);
 	train();
 	fixture_feed(bad, up, 1, 40);
@@ -580,7 +776,7 @@ static void test_rejection_and_rollback(void)
 	float manual[4][3];
 	memcpy(manual, perfect, sizeof(manual));
 	manual[0][0] = .06f;
-	magneto_online_replace_BAinv_and_reset(manual, 0);
+	magneto_online_replace_BAinv_and_reset(manual, 0, (struct led_token){0});
 	assert(ended_events == 0);
 	samples(1, false, true);
 	assert(!memcmp(magBAinv, manual, sizeof(manual)) && !dirty_marks);
@@ -592,7 +788,7 @@ static void test_rejection_and_rollback(void)
 	fixture_reset(1000, 1);
 	trial();
 	uint16_t old_operation = online.operation;
-	magneto_online_replace_BAinv_and_reset(manual, 100);
+	magneto_online_replace_BAinv_and_reset(manual, 100, (struct led_token){0});
 	assert(ended_events == 0);
 	samples(1, false, true);
 	assert(ended_events == 2);
@@ -603,8 +799,8 @@ static void test_rejection_and_rollback(void)
 	/* Overwriting an unapplied manual result cancels only that result. */
 	fixture_reset(1000, 1);
 	samples(1, false, true);
-	magneto_online_replace_BAinv_and_reset(perfect, 100);
-	magneto_online_replace_BAinv_and_reset(manual, 101);
+	magneto_online_replace_BAinv_and_reset(perfect, 100, (struct led_token){0});
+	magneto_online_replace_BAinv_and_reset(manual, 101, (struct led_token){0});
 	assert(ended_events == 1 && last_end.operation == 100 && last_end.outcome == CAL_OUTCOME_CANCELLED);
 	samples(1, false, true);
 	assert(ended_events == 2 && last_end.operation == 101 && last_end.outcome == CAL_OUTCOME_SUCCESS);
@@ -630,15 +826,102 @@ static void test_ttl_wrap(void)
 	samples(1, false, true);
 	assert(fixture_count() == 0); /* stale cache refreshed before the one new insert */
 }
+/* Re-confirming a RAM-applied failure must not fabricate durable success,
+ * even if the storage leaf has recovered since the failed attempt. */
+static void test_config_persist_failure_cache(void)
+{
+	fixture_reset(1000, 0);
+	assert(sensor_calibration_get_online_mag_enabled());
+	assert(durable_online_mode == MAG_ONLINE_CALIBRATION_ENABLED);
+	storage_write_error = -EIO;
+	assert(sensor_calibration_set_online_mag_enabled(false) == -EIO);
+	assert(!sensor_calibration_get_online_mag_enabled());
+	assert(storage.mag_online_calibration_mode == MAG_ONLINE_CALIBRATION_DISABLED);
+	assert(durable_online_mode == MAG_ONLINE_CALIBRATION_ENABLED);
+	assert(storage_writes == 1 && !transaction);
+	assert(led_requests[LED_APPLIED_NOT_SAVED] == 1 && led_requests[LED_SUCCESS] == 0);
+	storage_write_error = 0;
+	assert(sensor_calibration_set_online_mag_enabled(false) == -EIO);
+	assert(storage_writes == 1 && !transaction);
+	assert(!sensor_calibration_get_online_mag_enabled());
+	assert(storage.mag_online_calibration_mode == MAG_ONLINE_CALIBRATION_DISABLED);
+	assert(durable_online_mode == MAG_ONLINE_CALIBRATION_ENABLED);
+	assert(led_requests[LED_APPLIED_NOT_SAVED] == 2 && led_requests[LED_SUCCESS] == 0);
+	assert(sensor_calibration_set_online_mag_enabled(true) == 0);
+	assert(storage_writes == 2 && !transaction);
+	assert(sensor_calibration_get_online_mag_enabled());
+	assert(storage.mag_online_calibration_mode == MAG_ONLINE_CALIBRATION_ENABLED);
+	assert(durable_online_mode == MAG_ONLINE_CALIBRATION_ENABLED);
+	assert(led_requests[LED_APPLIED_NOT_SAVED] == 2 && led_requests[LED_SUCCESS] == 1);
+	/* A same-value durable receipt requires no write and remains successful. */
+	storage_write_error = -ENOSPC;
+	assert(sensor_calibration_set_online_mag_enabled(true) == 0);
+	assert(storage_writes == 2 && !transaction);
+	assert(durable_online_mode == MAG_ONLINE_CALIBRATION_ENABLED);
+	assert(led_requests[LED_APPLIED_NOT_SAVED] == 2 && led_requests[LED_SUCCESS] == 2);
+	assert(led_requests[LED_PARTIAL] == 0 && led_results[LED_SUCCESS] == 0);
+}
+
+static void test_disabled_mag_clear_waits_for_real_frame_application(void)
+{
+	fixture_reset(1000, 1);
+	samples(1, false, true);
+	magneto_online_runtime_configure(false);
+	float before[4][3];
+	magneto_online_snapshot_BAinv(before);
+	assert(sensor_calibration_clear_mag(NULL, true, true) == 0);
+	assert(!memcmp(before, magBAinv, sizeof(before)));
+	assert(led_results[LED_SUCCESS] == 0);
+	assert(online.replacement_feedback.session && online.replacement_stored);
+	magneto_online_apply_pending(); /* Disabled-mag frame, no magnetic sample. */
+	const float cleared[4][3] = {0};
+	assert(!memcmp(magBAinv, cleared, sizeof(cleared)));
+	assert(led_results[LED_SUCCESS] == 1);
+	assert(!online.replacement_feedback.session);
+	magneto_online_apply_pending();
+	assert(led_results[LED_SUCCESS] == 1);
+}
+
+static void test_reset_all_cancels_pending_mag_without_changing_live_matrix(void)
+{
+	fixture_reset(1000, 1);
+	samples(1, false, true);
+	float before[4][3], manual[4][3];
+	magneto_online_snapshot_BAinv(before);
+	memcpy(manual, perfect, sizeof(manual));
+	manual[0][0] = .06f;
+	struct led_token token = led_begin(LED_OWNER_MAG, led_request_id());
+	magneto_online_replace_BAinv_and_reset(manual, 100, token);
+	magneto_online_feedback_storage(token, 0);
+	assert(led_results[LED_SUCCESS] == 0);
+	sys_warm_transaction_begin();
+	sensor_calibration_online_mag_cancel_pending();
+	memset(storage.magBAinv, 0, sizeof(storage.magBAinv));
+	sys_warm_transaction_end(false);
+	magneto_online_apply_pending();
+	magneto_online_feedback_storage(token, 0); /* Old receipt cannot revive it. */
+	const float cleared[4][3] = {0};
+	assert(!memcmp(before, magBAinv, sizeof(before)));
+	assert(!memcmp(storage.magBAinv, cleared, sizeof(cleared)));
+	assert(led_results[LED_CANCELLED] == 1 && led_results[LED_SUCCESS] == 0);
+	assert(!online.replace_pending && !online.replacement_feedback.session);
+}
+
 int main(void)
 {
 	assert(!sensor_calibration_get_online_mag_debug()); /* Static boot default. */
 	test_debug_logging();
+	test_stationary_novelty();
+	test_partial_radial_metrics();
 	test_window_minimums();
 	test_cancel_frozen();
 	test_holdout_and_confirmation();
 	test_repeated_enable_preserves_trial();
+	test_manual_start_rolls_back_only_trial();
 	test_rejection_and_rollback();
+	test_config_persist_failure_cache();
+	test_disabled_mag_clear_waits_for_real_frame_application();
+	test_reset_all_cancels_pending_mag_without_changing_live_matrix();
 	test_ttl_wrap();
 	puts("online_mag lifecycle: freeze/cancel, independent holdout, confirmation, rollback, TTL passed");
 	return 0;

@@ -13,6 +13,7 @@ enum battery_cache_valid {
 	BATTERY_CACHE_REMAINING_TIME_ESTIMATE = 8,
 	BATTERY_CACHE_CYCLES = 16,
 	BATTERY_CACHE_CALIBRATION_COVERAGE = 32,
+	BATTERY_CACHE_CALIBRATED_PPTT = 64,
 };
 
 static uint8_t valid_cache_mask = 0; // track when data should be recalculated
@@ -201,7 +202,7 @@ static void reset_tracker(int16_t pptt)
 		LOG_DBG("Reset battery tracker");
 }
 
-static void update_interval(int16_t pptt)
+static bool update_interval(int16_t pptt)
 {
 	update_runtime(); // update battery_runtime_sum before saving
 
@@ -220,7 +221,7 @@ static void update_interval(int16_t pptt)
 	if (runtime < CONFIG_SYS_CLOCK_TICKS_PER_SEC * 60 * 5)
 	{
 		LOG_ERR("Interval %u: %llu us is too short (min 5 min active time)", interval_id, k_ticks_to_us_floor64(runtime));
-		return;
+		return false;
 	}
 
 	struct battery_tracker_interval interval = {0};
@@ -233,11 +234,17 @@ static void update_interval(int16_t pptt)
 		interval.runtime_min = runtime;
 	if (runtime > interval.runtime_max)
 		interval.runtime_max = runtime;
-	sys_write(BATT_STATS_INTERVAL_0 + interval_id, NULL, &interval, sizeof(interval));
+	int err = sys_write(BATT_STATS_INTERVAL_0 + interval_id, NULL, &interval, sizeof(interval));
+	if (err)
+	{
+		LOG_ERR("Interval %u not saved: %d", interval_id, err);
+		return false;
+	}
 	valid_cache_mask = 0; // invalidate all
 	LOG_INF("Interval %u saved: %u cycles, %llu us total (current: %llu us, min: %llu us, max: %llu us)",
 		interval_id, interval.cycles, k_ticks_to_us_floor64(interval.runtime),
 		k_ticks_to_us_floor64(runtime), k_ticks_to_us_floor64(interval.runtime_min), k_ticks_to_us_floor64(interval.runtime_max));
+	return true;
 }
 
 static void update_tracker(int16_t pptt)
@@ -253,7 +260,8 @@ static void update_tracker(int16_t pptt)
 			if (pptt <= retained->max_battery_pptt - 800) // valid interval
 			{
 				LOG_INF("Update interval: %.2f%%", (double)pptt / 100.0);
-				update_interval(pptt);
+				if (!update_interval(pptt))
+					return; // Keep the checkpoint so a later sample can retry.
 			}
 			retained->battery_runtime_saved = retained->battery_runtime_sum;
 			retained->battery_pptt_saved -= 500;
@@ -314,7 +322,10 @@ bool sys_migrate_battery_curve(void)
 
 static void update_curve(void)
 {
-	uint64_t* intervals = (uint64_t*)k_malloc(sizeof(uint64_t) * 19);
+	// Only the power thread reaches this function (including shutdown paths).
+	// Keep its bounded scratch off the 1024-byte power stack.
+	static uint64_t intervals[19];
+	static int16_t curve[18];
 	uint64_t curve_runtime = 0;
 
 	int32_t first_valid = -1;
@@ -349,12 +360,10 @@ static void update_curve(void)
 	if (valid_intervals < 2 || first_valid < 0) // not enough data
 	{
 		LOG_WRN("Not enough data to calculate discharge curve");
-		k_free(intervals);
 		return;
 	}
 
-	int16_t* curve = (int16_t*)k_malloc(sizeof(int16_t) * 18);
-	memset(curve, 0, sizeof(int16_t) * 18);
+	memset(curve, 0, sizeof(curve));
 
 	int32_t lo_cal = (first_valid > 0) ? default_battery_pptt_curve[first_valid - 1] : 0;
 	int32_t hi_cal = (last_valid < 17) ? default_battery_pptt_curve[last_valid] : 10000;
@@ -363,8 +372,6 @@ static void update_curve(void)
 	if (cal_span <= 0)
 	{
 		LOG_ERR("Invalid discharge curve span");
-		k_free(intervals);
-		k_free(curve);
 		return;
 	}
 
@@ -381,11 +388,10 @@ static void update_curve(void)
 		LOG_DBG("Map %5.2f%% -> %5.2f%%, %llu us", (i + 1) * 5.0, (double)curve[i] / 100.0, k_ticks_to_us_floor64(intervals[i]));
 #endif
 	}
-	k_free(intervals);
 
-	sys_write(BATT_STATS_CURVE_ID, retained->battery_pptt_curve, curve, sizeof(int16_t) * 18);
-	k_free(curve);
-	valid_cache_mask &= (uint8_t)~BATTERY_CACHE_REMAINING_TIME_ESTIMATE; // invalidate remaining runtime (curve changed)
+	sys_write(BATT_STATS_CURVE_ID, retained->battery_pptt_curve, curve, sizeof(curve));
+	// sys_write updates the retained curve even if flash persistence fails.
+	valid_cache_mask &= (uint8_t)~(BATTERY_CACHE_REMAINING_TIME_ESTIMATE | BATTERY_CACHE_CALIBRATED_PPTT);
 }
 
 static int16_t apply_curve(int16_t pptt)
@@ -533,10 +539,11 @@ int16_t sys_get_calibrated_battery_pptt(int16_t pptt)
 	if (!battery_pptt_is_valid(pptt))
 		return -1;
 
-	if (pptt == last_pptt)
+	if ((valid_cache_mask & BATTERY_CACHE_CALIBRATED_PPTT) && pptt == last_pptt)
 		return last_calibrated_battery_pptt;
 	last_pptt = pptt;
 	last_calibrated_battery_pptt = apply_curve(pptt);
+	valid_cache_mask |= BATTERY_CACHE_CALIBRATED_PPTT;
 	return last_calibrated_battery_pptt;
 }
 
@@ -732,37 +739,38 @@ uint64_t sys_get_last_cycle_runtime(void)
 {
 	struct battery_tracker tracker = {0};
 	sys_read(BATT_STATS_LAST_RUN_ID, &tracker, sizeof(tracker));
-	if (tracker.last_battery_runtime < 0)
-		return 0;
 	return tracker.last_battery_runtime;
 }
 
-void sys_reset_battery_tracker(void)
+int sys_reset_battery_tracker(void)
 {
 	static bool reset_confirm = false;
 	if (!reset_confirm)
 	{
 		printk("Resetting battery tracker will clear all battery calibration data. Are you sure?\n");
 		reset_confirm = true;
-		return;
+		led_request_event(LED_OWNER_POWER, led_request_id(), led_event_id(), LED_INPUT_ACK);
+		return 1;
 	}
 	printk("Resetting battery tracker\n");
 
 	reset_tracker(-1);
 	struct battery_tracker tracker = {0};
-	sys_write(BATT_STATS_LAST_RUN_ID, NULL, &tracker, sizeof(tracker));
+	int result = sys_write(BATT_STATS_LAST_RUN_ID, NULL, &tracker, sizeof(tracker));
 	for (uint8_t i = 0; i < 19; i++)
 	{
 		struct battery_tracker_interval interval = {0};
-		sys_write(BATT_STATS_INTERVAL_0 + i, NULL, &interval, sizeof(interval));
+		int err = sys_write(BATT_STATS_INTERVAL_0 + i, NULL, &interval, sizeof(interval));
+		if (err && !result) result = err;
 	}
-	int16_t* curve = (int16_t*)k_malloc(sizeof(int16_t) * 18);
-	memset(curve, 0, sizeof(int16_t) * 18);
-	sys_write(BATT_STATS_CURVE_ID, retained->battery_pptt_curve, curve, sizeof(int16_t) * 18); // updates retained
-	k_free(curve);
+	int16_t curve[18] = {0};
+	int curve_err = sys_write(BATT_STATS_CURVE_ID, retained->battery_pptt_curve, curve, sizeof(curve));
+	if (curve_err && !result) result = curve_err;
 	valid_cache_mask = 0; // invalidate all
 	reset_confirm = false;
 	LOG_INF("Battery tracker reset");
+	led_request_event(LED_OWNER_POWER, led_request_id(), led_event_id(), result ? LED_PARTIAL : LED_SUCCESS);
+	return result;
 }
 
 void sys_print_battery_tracker_debug(void)

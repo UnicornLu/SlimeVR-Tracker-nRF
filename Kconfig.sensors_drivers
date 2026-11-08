@@ -15,11 +15,6 @@ config SENSOR_MAG_DRIVERS_MINIMAL
 
 menu "IMU drivers"
 
-config SENSOR_DRV_BMI270
-	bool "BMI270"
-	default y if !SENSOR_IMU_DRIVERS_MINIMAL
-	default n
-
 config SENSOR_DRV_ICM42688
 	bool "ICM42688"
 	default y if !SENSOR_IMU_DRIVERS_MINIMAL
@@ -122,6 +117,15 @@ config SENSOR_DRV_QMC5883L
 	bool "QMC5883L"
 	default y if !SENSOR_MAG_DRIVERS_MINIMAL
 	default n
+
+config SENSOR_DRV_QMC5883P
+	bool "QMC5883P"
+	default y if !SENSOR_MAG_DRIVERS_MINIMAL
+	default n
+	help
+	  QMC5883P (QST-PD-B002-22 Rev E): automotive-grade line, new-style QST
+	  register interface (akin to QMC6309, NOT register-compatible with
+	  QMC5883L). I2C 0x2C, CHIPID 0x80 @ 0x00, 2/8/12/30G ranges, no temp.
 
 config SENSOR_DRV_QMC6309
 	bool "QMC6309"

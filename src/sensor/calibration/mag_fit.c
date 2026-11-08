@@ -6,7 +6,6 @@
 #include <math.h>
 #include <string.h>
 
-union mag_cal_workspace mag_cal_workspace;
 #define W (mag_cal_workspace.fit)
 #define HUBER 0.06f
 
@@ -245,7 +244,7 @@ static int directions(unsigned slots, mag_fit_read_fn read, mag_fit_poll_fn poll
 		}
 		count++;
 	}
-	return count >= 48 && occupied >= 12 ? 0 : -EDOM;
+	return count >= 48 && occupied >= 10 ? 0 : -EDOM;
 }
 static bool solve(void)
 {

@@ -29,50 +29,69 @@ const char *sensor_get_sensor_imu_name(void);
 const char *sensor_get_sensor_mag_name(void);
 const char *sensor_get_sensor_fusion_name(void);
 bool sensor_is_initialized(void);
+/* True only after a valid current fusion frame, not merely driver discovery. */
+bool sensor_output_ready(void);
+/* Driver acquisition owner: report an explicitly lost/unknown gyro interval
+ * (overrun or destructive FIFO flush), not empty/other-channel/invalid markers.
+ * Active raw calibration consumers must reject the interrupted stream. */
+void sensor_gyro_report_discontinuity(void);
 
-int sensor_get_sensor_temperature(float *);
+/* Suspended sensors may be queried when already initialized, but not rescanned. */
+int sensor_request_scan(bool force, bool user_feedback);
 
-int sensor_request_scan(bool force);
-
-void sensor_scan_read(void);
-void sensor_scan_write(void);
-void sensor_scan_clear(void);
-
-void sensor_retained_read(void);
 void sensor_retained_write(void);
 void sensor_record_wom_sleep(void);
 
-void sensor_shutdown(void);
-uint8_t sensor_setup_WOM(void);
+int sensor_shutdown(void);
+/* Return GPIO pull/sense configuration, or a negative lifecycle error. */
+int sensor_setup_WOM(void);
 
-void sensor_set_mag_enabled(bool enabled);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+int sensor_set_mag_enabled(bool enabled);
+#endif
 bool sensor_get_mag_enabled(void);
 bool sensor_get_mag_available(void);
 bool sensor_get_mag_calibrated(void);
 void sensor_refresh_sensor_ids(void);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_mag_ref_reset(void);
+#endif
 
 /* Fusion policy accessors (backend-agnostic; prefer over vqf_* / eqf_*). */
-bool sensor_fusion_get_rest_detected(void);
-bool sensor_fusion_get_relative_rest_deviations(float out[2]);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 bool sensor_fusion_get_mag_dist_detected(void);
 /* Thread-safe requests, applied only by sensor before the next magnetic feed. */
 void sensor_fusion_reset_mag_ref(void);
 void sensor_fusion_set_mag_ref(float norm, float dip);
 bool sensor_fusion_get_mag_ref(float *norm, float *dip);
+#endif
 
 /* Nonblocking requests consumed by the sensor at the next frame boundary. */
-void sensor_request_fusion_reset(void);
-void sensor_request_fusion_bias_reset(void);
+int sensor_request_fusion_reset(bool user_feedback);
 
 void wait_for_threads(void);
-void main_imu_suspend(void);
+/* Failure means the caller must not reconfigure hardware or stop clocks.
+ * A successful suspension is owned by the caller until resume; shutdown
+ * transfers the still-suspended subsystem to the power thread. */
+int main_imu_suspend(void);
+bool main_imu_is_suspended(void);
 void main_imu_resume(void);
-void main_imu_wakeup(void);
-void main_imu_restart(void);
+int main_imu_restart(void);
 
 #if CONFIG_SENSOR_USE_TCAL
 float sensor_get_current_imu_temperature(void);
+#endif
+
+#if CONFIG_SENSOR_TCAL_HEATED
+struct sensor_temperature_observation {
+	float raw_c;
+	float filtered_c;
+	int64_t sampled_at_ms;
+	uint32_t sequence;
+};
+/* Snapshot only: does not refresh the sample timestamp or heater lease. */
+int sensor_get_imu_temperature_observation(
+	struct sensor_temperature_observation *out, int64_t max_age_ms);
 #endif
 
 // Get actual sensor ODR (Output Data Rate) in Hz
@@ -83,26 +102,30 @@ float sensor_get_mag_feed_hz(void); /* measured fusion feed Hz; 0.0f => n/a */
 float sensor_get_fusion_rate(void); /* effective gyro feed into fusion */
 
 /* Batch raw collection: fractional-rate emission, 0 = accelerometer ODR. */
+#if CONFIG_CONNECTION_RAW_COLLECTION
 void sensor_set_batch_collect(bool active, float emit_hz);
+#endif
 float sensor_get_processing_work_time_ms(void); /* processing-work EMA, not full loop period */
 
 #include "diagnostics.h"
 
 typedef struct sensor_fusion {
 	void (*init)(float, float, float); // gyro_time, accel_time, mag_time
-	void (*load)(const void *);
+	/* Load with the current effective sensor periods, even on first boot. */
+	void (*load)(const void *, float, float, float);
 	void (*save)(void *);
 
 	void (*update_gyro)(float *, float);  // deg/s
 	void (*update_accel)(float *, float); // g
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	void (*update_mag)(float *, float);   // any unit (usually gauss)
+#endif
 	void (*update)(float *, float *, float *, float);
 
 	void (*get_gyro_bias)(float *);
 	void (*set_gyro_bias)(float *);
-
-	void (*update_gyro_sanity)(float *, float *);
-	int (*get_gyro_sanity)(void);
+	/* Input coordinate change (new input = old + delta), not a measurement. */
+	void (*rebase_gyro_bias)(const float delta_dps[3]);
 
 	void (*get_lin_a)(float *);
 	void (*get_quat)(float *);
@@ -115,11 +138,12 @@ typedef struct sensor_fusion {
 	 * the sensor owner, or an exclusive lifecycle owner after the sensor
 	 * thread is confirmed stopped/suspended (not merely requested to stop). */
 	bool (*take_rest_observation)(bool *out);
-	void (*get_relative_rest_deviations)(float out[2]); /* [gyr, acc] vs thresholds */
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	bool (*get_mag_dist_detected)(void);
 	/* Sensor-thread only: replace magnetic domain, preserving attitude/bias. */
 	void (*rebase_mag)(float norm, float dip);
 	void (*get_mag_ref)(float *norm, float *dip);
+#endif
 } sensor_fusion_t;
 
 /* How the MCU reaches an auxiliary sensor through the selected IMU.
@@ -203,6 +227,9 @@ typedef struct sensor_mag {
 	void (*mag_process)(uint8_t *raw_mag, float mag[3]);
 	uint8_t ext_min_burst; // minimum external-interface read transaction length
 	uint8_t ext_burst;     // preferred full burst length
+	/* Opt in to consuming an available cached frame before its ODR deadline.
+	 * mag_read must still enforce the driver's freshness admission policy. */
+	bool cached_poll_safe;
 } sensor_mag_t;
 
 #endif

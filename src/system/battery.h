@@ -26,6 +26,9 @@ int battery_measure_enable(bool enable);
 int battery_sample(void);
 
 int battery_charger_state(bool *plugged, bool *charging, bool *charged);
+/* Qualified power facts: successful complete owner sample within 1500 ms and
+ * both charger fields read successfully; no new fetch or partial output writes. */
+int battery_charger_snapshot(bool *plugged, bool *charging, bool *charged);
 
 /** A point in a battery discharge curve sequence.
  *
@@ -54,8 +57,6 @@ struct battery_level_point {
  */
 unsigned int
 battery_level_pptt(unsigned int batt_mV, const struct battery_level_point* curve);
-
-int read_batt(void);
 
 int read_batt_mV(int* out);
 

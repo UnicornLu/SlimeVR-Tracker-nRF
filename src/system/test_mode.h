@@ -20,6 +20,7 @@
 
 bool test_mode_get(void);
 void test_mode_set(bool enable);
+void test_mode_user_set(bool enable); /* Explicit applied user result. */
 
 /* Target test packet rate in packets per second. Test mode treats this as
  * both floor and ceiling; target is clamped to TDMA frame capacity. tps == 0

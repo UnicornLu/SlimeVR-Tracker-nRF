@@ -183,12 +183,9 @@ int esb_ota_flash_request_mcuboot_upgrade(void)
 }
 
 /*
- * RAM-resident flash copier: copies image from staging area to final location.
- * This function is copied to RAM before execution because it erases the flash
- * pages containing the running firmware (including itself).
- *
+ * RAM-resident flash copier, linked and initialized by Zephyr exactly like
+ * ota_ram_engine. No runtime code copying or guessed function extent.
  * Must be self-contained — no calls to external functions.
- * Parameters passed via a struct to keep the interface simple.
  */
 struct flash_copy_params {
 	uint32_t src_addr;      /* Staging area start (flash offset) */
@@ -201,7 +198,7 @@ struct flash_copy_params {
 };
 
 #if defined(CONFIG_SOC_NRF52840)
-__attribute__((noinline))
+__ramfunc __attribute__((noinline))
 static void ota_flash_copy_from_ram(const struct flash_copy_params *p)
 {
 	uint32_t pages = (p->size + p->page_size - 1) / p->page_size;
@@ -311,13 +308,6 @@ void esb_ota_flash_copy_and_reset(uint32_t staging_base, uint32_t target_base,
 		image_size, staging_base, target_base);
 	k_msleep(500); /* Flush logs */
 
-	/* Copy the flash copier function to RAM */
-	static uint8_t __aligned(4) ram_func_buf[768]; /* Generous size for the copier + settings write */
-	uintptr_t func_addr = (uintptr_t)ota_flash_copy_from_ram;
-	/* Thumb functions have bit 0 set; clear it for copy, set it for call */
-	uintptr_t func_start = func_addr & ~1U;
-	memcpy(ram_func_buf, (void *)func_start, sizeof(ram_func_buf));
-
 	/* Prepare params */
 	static struct flash_copy_params params;
 	params.src_addr = staging_base;
@@ -338,10 +328,6 @@ void esb_ota_flash_copy_and_reset(uint32_t staging_base, uint32_t target_base,
 		params.settings_words = 0;
 	}
 
-	/* Call the RAM copy with IRQs disabled */
-	typedef void (*flash_copy_fn)(const struct flash_copy_params *);
-	flash_copy_fn ram_copy = (flash_copy_fn)((uintptr_t)ram_func_buf | 1U); /* Thumb bit */
-
 	__disable_irq();
 
 	/* Disable MPU so we can execute code from RAM (SRAM is XN by default with Zephyr's MPU config) */
@@ -349,7 +335,7 @@ void esb_ota_flash_copy_and_reset(uint32_t staging_base, uint32_t target_base,
 	__DSB();
 	__ISB();
 
-	ram_copy(&params);
+	ota_flash_copy_from_ram(&params);
 	/* Never reached */
 #else
 	ARG_UNUSED(staging_base);
@@ -386,7 +372,8 @@ int esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scratch,
  * Compute the Nordic SDK CRC-16 used by the Adafruit bootloader
  * for application validation (bank_0_crc field).
  */
-uint16_t esb_ota_flash_compute_crc16_nordic(uint32_t addr, uint32_t size, uint8_t *scratch)
+int esb_ota_flash_compute_crc16_nordic(uint32_t addr, uint32_t size, uint8_t *scratch,
+				     uint16_t *result)
 {
 	uint16_t crc = 0xFFFF;
 	uint32_t remaining = size;
@@ -397,8 +384,7 @@ uint16_t esb_ota_flash_compute_crc16_nordic(uint32_t addr, uint32_t size, uint8_
 		int err = flash_read(flash_dev, offset, scratch, chunk);
 		if (err) {
 			LOG_ERR("OTA: Flash read failed at 0x%05X (err %d)", offset, err);
-			/* 0 means "skip CRC" in Adafruit BL — never return it on I/O fail. */
-			return 0xFFFF;
+			return err;
 		}
 
 		for (size_t i = 0; i < chunk; i++) {
@@ -413,7 +399,8 @@ uint16_t esb_ota_flash_compute_crc16_nordic(uint32_t addr, uint32_t size, uint8_
 		remaining -= chunk;
 	}
 
-	return crc;
+	*result = crc;
+	return 0;
 }
 
 int esb_ota_flash_prepare_bootloader_settings(uint32_t staging_base, uint32_t image_size,
@@ -435,13 +422,14 @@ int esb_ota_flash_prepare_bootloader_settings(uint32_t staging_base, uint32_t im
 		.sd_image_start = 0,
 	};
 
-	settings.bank_0_crc = esb_ota_flash_compute_crc16_nordic(staging_base, image_size,
-								scratch);
-	if (settings.bank_0_crc == 0xFFFF) {
+	uint16_t crc;
+	int err = esb_ota_flash_compute_crc16_nordic(staging_base, image_size, scratch, &crc);
+	if (err) {
 		LOG_ERR("OTA: CRC-16 read failed, refusing activate");
 		bl_settings_prepared = false;
-		return -EIO;
+		return err;
 	}
+	settings.bank_0_crc = crc;
 	if (settings.bank_0_crc == 0) {
 		/* Legitimate zero is rare; still refuse skip-check activate. */
 		LOG_ERR("OTA: CRC-16 is 0; refusing activate (bootloader would skip check)");

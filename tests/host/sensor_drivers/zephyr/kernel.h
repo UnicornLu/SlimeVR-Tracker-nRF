@@ -5,9 +5,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
-#define MHZ(value) ((value) * 1000000U)
-#define ARG_UNUSED(value) ((void)(value))
+#include "../../harness/include/driver_util.h"
+#define BIT(n) (1UL << (n))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* Host SPI model has no devicetree-selected bitbang controller. */
 #define DT_NODE_HAS_COMPAT(node_id, compat) 0

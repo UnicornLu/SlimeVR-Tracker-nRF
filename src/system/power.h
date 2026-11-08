@@ -2,33 +2,68 @@
 #define SLIMENRF_SYSTEM_POWER
 
 #include <stdbool.h>
+#include <stdint.h>
 
-void sys_interface_suspend(void);
-void sys_interface_resume(void);
+/* Return the first bus PM error; already-in-state is successful. */
+int sys_interface_suspend(void);
+int sys_interface_resume(void);
 
-/* Queue a transition for the power thread; never shuts hardware down inline.
- * The first accepted request retains ownership while executing or awaiting
- * retry. Returns 0 if accepted (including an identical outstanding request),
- * or -EBUSY if a different transition already owns the slot.
- */
-int sys_request_WOM(bool force);
+/* Sensor-owned reversible WOM plan. Refresh while continuously eligible and
+ * cancel on interruption. Deadline is the original absolute idle deadline;
+ * physical sleep never precedes an announced plan by less than five seconds.
+ * Ordinary OFF/REBOOT and OTA supersede reversible WOM. Returns 0 when accepted
+ * or idempotent before the physical gate, -EBUSY for another owner or an
+ * irreversible transition, and -ENOTSUP without an IMU wake interrupt.
+ * normal_timeout tags only the configurable first/normal activity policy:
+ * both low-activity wake branches and the IMU ramp pass false. */
+int sys_plan_WOM(bool force, int64_t deadline, bool normal_timeout);
+void sys_cancel_WOM(void);
+
+/* Direct nonblocking entry: skip idle eligibility, not safety vetoes. Requires
+ * CONFIG_USE_IMU_WAKE_UP and an IMU interrupt. Repeats preserve the >=5 s lead.
+ * Returns 0 for acceptance (not completed sleep), -EBUSY or -ENOTSUP. */
+int sys_request_WOM_now(void);
+/* Automatic sensor policy must not withdraw or replace a direct request.
+ * Explicit lifecycle cancellation, OFF/REBOOT and OTA remain authoritative. */
+bool sys_WOM_manual_pending(void);
+
+/* Serialize a sensor policy snapshot with setting publication and the physical
+ * gate. Recursive: sensor policy may call the ordinary plan/cancel helpers. */
+void sys_power_policy_lock(void);
+void sys_power_policy_unlock(void);
+/* Success retains the policy lock until end; failure leaves it unlocked. */
+int sys_wom_timeout_change_begin(void);
+void sys_wom_timeout_change_end(bool changed);
+
+/* Queue an ordinary transition; never shuts hardware down inline. Returns 0
+ * for acceptance/idempotence before the physical gate, or -EBUSY for another
+ * owner or an in-flight irreversible physical transition. */
 int sys_request_system_off(void);
 int sys_request_system_reboot(void);
+int sys_user_reboot(void); /* Explicit nonbutton outcome; no reversible animation wait. */
+bool sys_exit_feedback_allowed(bool reboot); /* Read-only UI eligibility; never business admission. */
 
 /* OTA-only two-phase reboot handoff. Reserve BEFORE preparing bootloader state;
  * -EBUSY means another reservation or irreversible physical shutdown has begun.
  * A successful reservation blocks physical transitions without blocking the
  * caller. The caller whose reservation succeeds must resolve it: true commits
- * the reboot, false cancels and preserves the ordinary pending request.
+ * the reboot, false cancels and preserves ordinary OFF/REBOOT requests.
  *
  * Narrow first-winner exception: committed OTA activation/recovery supersedes
  * deferred OFF/WOM work, including a claimed request still in reversible checks.
- * It never preempts physical shutdown. Ordinary producers remain first-winner.
+ * It never preempts physical shutdown. A reservation cancels reversible WOM.
  */
 int sys_ota_reboot_reserve(void);
 void sys_ota_reboot_resolve(bool prepared);
 
 bool vin_read(void);
 bool vbus_read(void);
+
+#if CONFIG_SENSOR_TCAL_HEATED
+/* Physical inputs only; never inferred from battery voltage/debounced status. */
+bool heater_external_power_present(void);
+/* Lock-free admission check: false once a physical power transition starts. */
+bool heater_power_ready(void);
+#endif
 
 #endif

@@ -34,8 +34,8 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 #define SLIME_DRV1(cfg) IS_ENABLED(cfg)
 
 #define SENSOR_IMU_DRV_COUNT                                                                                           \
-	(SLIME_DRV1(CONFIG_SENSOR_DRV_BMI270) + SLIME_DRV1(CONFIG_SENSOR_DRV_ICM42688)                                     \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICM42686) + SLIME_DRV1(CONFIG_SENSOR_DRV_ICM45686)                                 \
+	(SLIME_DRV1(CONFIG_SENSOR_DRV_ICM42688) + SLIME_DRV1(CONFIG_SENSOR_DRV_ICM42686)                                   \
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICM45686)                                                                         \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_LSM6DSM) + SLIME_DRV1(CONFIG_SENSOR_DRV_LSM6DSO)                                   \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_LSM6DSV))
 
@@ -46,7 +46,7 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_LIS3MDL) + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5603NJ)                                 \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_MMC5983MA)                                                                         \
 	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883L) + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC6309)                                  \
-	 + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX))
+	 + SLIME_DRV1(CONFIG_SENSOR_DRV_QMC5883P) + SLIME_DRV1(CONFIG_SENSOR_DRV_ICT153XX))
 
 // Unimplemented WHO_AM_I rows (chips that map to sensor_*_none) are kept in full
 // builds for probe-behavior parity, and dropped when that axis opts into MINIMAL.
@@ -56,8 +56,8 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 // A packed address group is emitted only if at least one of its WHO_AM_I rows
 // survives gating. *_addr_count must equal the number of emitted groups.
 #define SLIME_IMU_GROUP_A                                                                                              \
-	(IS_ENABLED(CONFIG_SENSOR_DRV_BMI270) || IS_ENABLED(CONFIG_SENSOR_DRV_ICM45686)                                    \
-	 || IS_ENABLED(CONFIG_SENSOR_DRV_ICM42686) || IS_ENABLED(CONFIG_SENSOR_DRV_ICM42688) || SLIME_IMU_KEEP_UNIMPL)
+	(IS_ENABLED(CONFIG_SENSOR_DRV_ICM45686) || IS_ENABLED(CONFIG_SENSOR_DRV_ICM42686)                                   \
+	 || IS_ENABLED(CONFIG_SENSOR_DRV_ICM42688) || SLIME_IMU_KEEP_UNIMPL)
 #define SLIME_IMU_GROUP_B                                                                                              \
 	(IS_ENABLED(CONFIG_SENSOR_DRV_LSM6DSM) || IS_ENABLED(CONFIG_SENSOR_DRV_LSM6DSO)                                    \
 	 || IS_ENABLED(CONFIG_SENSOR_DRV_LSM6DSV) || SLIME_IMU_KEEP_UNIMPL)
@@ -81,6 +81,7 @@ LOG_MODULE_DECLARE(sensor_scan, LOG_LEVEL_INF);
 	(SLIME_MAG_KEEP_UNIMPL || IS_ENABLED(CONFIG_SENSOR_DRV_MMC5603NJ) || IS_ENABLED(CONFIG_SENSOR_DRV_MMC5983MA))
 #define SLIME_MAG_G9 (SLIME_MAG_KEEP_UNIMPL)
 #define SLIME_MAG_G10 (IS_ENABLED(CONFIG_SENSOR_DRV_QMC6309))
+#define SLIME_MAG_G11 (IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P))
 
 const char *dev_imu_names[SENSOR_DEV_IMU_COUNT]
 	= {"BMI160",
@@ -104,11 +105,7 @@ const char *dev_imu_names[SENSOR_DEV_IMU_COUNT]
 	   "LSM6DSV16B/ISM330BX"};
 const sensor_imu_t *sensor_imus[SENSOR_DEV_IMU_COUNT] = {
 	&sensor_imu_none, // will not implement, too low quality
-#if IS_ENABLED(CONFIG_SENSOR_DRV_BMI270)
-	&sensor_imu_bmi270,
-#else
-	&sensor_imu_none,
-#endif
+	&sensor_imu_none, // BMI270: reserved historical ID, no driver
 	&sensor_imu_none,
 	&sensor_imu_none, // cardinal sin
 	&sensor_imu_none, // cardinal sin
@@ -203,13 +200,10 @@ static const uint8_t i2c_dev_imu_reg[] = {
 static const uint8_t i2c_dev_imu_id[] = {
 #if SLIME_IMU_GROUP_A
 	// reg 0x00
-	(SLIME_IMU_KEEP_UNIMPL * 3 + IS_ENABLED(CONFIG_SENSOR_DRV_BMI270)),
+	(SLIME_IMU_KEEP_UNIMPL * 3),
 #if SLIME_IMU_KEEP_UNIMPL
 	0xEA,
 	0xD1, // ICM20948, BMI160
-#endif
-#if IS_ENABLED(CONFIG_SENSOR_DRV_BMI270)
-	0x24, // BMI270
 #endif
 #if SLIME_IMU_KEEP_UNIMPL
 	0x43, // BMI323
@@ -265,9 +259,6 @@ static const int i2c_dev_imu[] = {
 #if SLIME_IMU_KEEP_UNIMPL
 	IMU_ICM20948, IMU_BMI160,
 #endif
-#if IS_ENABLED(CONFIG_SENSOR_DRV_BMI270)
-	IMU_BMI270,
-#endif
 #if SLIME_IMU_KEEP_UNIMPL
 	IMU_BMI323,
 #endif
@@ -306,11 +297,12 @@ static const int i2c_dev_imu[] = {
 #endif // SLIME_IMU_GROUP_B
 };
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 const char *dev_mag_names[SENSOR_DEV_MAG_COUNT]
 	= {"HMC5883L",  "QMC5883L",        "QMC6309", "QMC6310",    "AK8963",    "AK09916",
 	   "AK09940",   "BMM150",          "BMM350",  "IST8306",    "IST8308",   "IST8320",
 	   "IST8321",   "IIS2MDC/LIS2MDL", "LIS3MDL", "MMC34160PJ", "MMC3630KJ", "MMC5603NJ/MMC5633NJL",
-	   "MMC5616WA", "MMC5983MA", "ICT-15312/ICT-15318"};
+	   "MMC5616WA", "MMC5983MA", "ICT-15312/ICT-15318", "QMC5883P"};
 const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 	&sensor_mag_none, // HMC5883 will not implement, too low quality
 #if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883L)
@@ -381,6 +373,11 @@ const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 #else
 	&sensor_mag_none,
 #endif
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+	&sensor_mag_qmc5883p
+#else
+	&sensor_mag_none
+#endif
 };
 // When no mag driver is enabled every SLIME_MAG_Gx gates to 0, which would
 // leave these initializers empty and trip -Werror. Guard the whole table and
@@ -388,7 +385,7 @@ const sensor_mag_t *sensor_mags[SENSOR_DEV_MAG_COUNT] = {
 #if SENSOR_MAG_DRV_COUNT > 0
 static const int i2c_dev_mag_addr_count = SLIME_MAG_G0 + SLIME_MAG_G1 + SLIME_MAG_G2 + SLIME_MAG_G3 + SLIME_MAG_G4
 										+ SLIME_MAG_G5 + SLIME_MAG_G6 + SLIME_MAG_G7 + SLIME_MAG_G8 + SLIME_MAG_G9
-										+ SLIME_MAG_G10;
+										+ SLIME_MAG_G10 + SLIME_MAG_G11;
 static const uint8_t i2c_dev_mag_addr[] = {
 #if SLIME_MAG_G0
 	1, 0x0C,
@@ -422,6 +419,9 @@ static const uint8_t i2c_dev_mag_addr[] = {
 #endif
 #if SLIME_MAG_G10
 	1, 0x7C,
+#endif
+#if SLIME_MAG_G11
+	1, 0x2C,
 #endif
 };
 static const uint8_t i2c_dev_mag_reg[] = {
@@ -464,6 +464,9 @@ static const uint8_t i2c_dev_mag_reg[] = {
 #endif
 #if SLIME_MAG_G10
 	1,    0x00,
+#endif
+#if SLIME_MAG_G11
+	1,    0x00, // QMC5883P chip ID
 #endif
 };
 static const uint8_t i2c_dev_mag_id[] = {
@@ -618,6 +621,13 @@ static const uint8_t i2c_dev_mag_id[] = {
 	0x90, // QMC6309
 #endif
 #endif // SLIME_MAG_G10
+#if SLIME_MAG_G11
+	// 0x2C reg 0x00
+	(IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)),
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+	0x80, // QMC5883P
+#endif
+#endif // SLIME_MAG_G11
 };
 static const int i2c_dev_mag[] = {
 #if SLIME_MAG_G0
@@ -726,8 +736,14 @@ static const int i2c_dev_mag[] = {
 	MAG_QMC6309,
 #endif
 #endif // SLIME_MAG_G10
+#if SLIME_MAG_G11
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC5883P)
+	MAG_QMC5883P,
+#endif
+#endif // SLIME_MAG_G11
 };
 #endif // SENSOR_MAG_DRV_COUNT > 0
+#endif
 
 int sensor_scan_imu(struct i2c_dt_spec *i2c_dev, uint8_t *i2c_dev_reg)
 {
@@ -748,6 +764,7 @@ int sensor_scan_imu(struct i2c_dt_spec *i2c_dev, uint8_t *i2c_dev_reg)
 	);
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 int sensor_scan_mag(struct i2c_dt_spec *i2c_dev, uint8_t *i2c_dev_reg)
 {
 #if SENSOR_MAG_DRV_COUNT == 0
@@ -769,6 +786,7 @@ int sensor_scan_mag(struct i2c_dt_spec *i2c_dev, uint8_t *i2c_dev_reg)
 	);
 #endif
 }
+#endif
 
 int sensor_scan_imu_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg)
 {
@@ -778,6 +796,7 @@ int sensor_scan_imu_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg)
 	return sensor_scan_spi(bus, spi_dev_reg, i2c_dev_imu_addr_count, i2c_dev_imu_reg, i2c_dev_imu_id, i2c_dev_imu);
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 int sensor_scan_mag_spi(struct spi_dt_spec *bus, uint8_t *spi_dev_reg)
 {
 #if SENSOR_MAG_DRV_COUNT == 0
@@ -815,3 +834,4 @@ int sensor_scan_mag_ext(const sensor_ext_ssi_t *ext_ssi, uint16_t *ext_dev_addr,
 	);
 #endif
 }
+#endif

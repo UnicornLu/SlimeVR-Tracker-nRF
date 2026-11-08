@@ -23,6 +23,7 @@
 #include "globals.h"
 #include "sensor/sensor.h"
 #include "system/watchdog.h"
+#include "util.h"
 
 #include <math.h>
 #include <string.h>
@@ -36,39 +37,34 @@
 
 LOG_MODULE_REGISTER(cal_bias_collect, LOG_LEVEL_INF);
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-int isAccRest(float *acc, float *pre_acc, float threshold, int *t, int restdelta)
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+bool isAccRest(const struct sensor_accel_observation *observation, uint32_t now_ms,
+	uint32_t max_gap_ms, float threshold, struct accel_rest_state *state)
 {
-	float delta[3];
-	delta[0] = acc[0] - pre_acc[0];
-	delta[1] = acc[1] - pre_acc[1];
-	delta[2] = acc[2] - pre_acc[2];
-
-#if CONFIG_CMSIS_DSP
-	float norm_sq;
-	arm_dot_prod_f32(delta, delta, 3, &norm_sq);
-	float norm_diff;
-	arm_sqrt_f32(norm_sq, &norm_diff);
-#else
-	float norm_diff = sqrtf(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
-#endif
-
-	if (norm_diff <= threshold) {
-		*t += restdelta;
-	} else {
-		*t = 0;
+	if ((uint32_t)(now_ms - observation->observed_ms) > max_gap_ms ||
+	    !v_finite(observation->v, 3)) {
+		state->initialized = false;
+		return false;
 	}
-
-	if (*t > 2000) {
-		return 1;
+	if (state->initialized && observation->sequence == state->last_sequence) {
+		return false;
 	}
-	return 0;
+	bool stable = state->initialized &&
+		(uint32_t)(observation->observed_ms - state->last_observed_ms) <= max_gap_ms &&
+		v_diff_mag(observation->v, state->previous) <= threshold;
+	if (!stable) {
+		state->stable_since_ms = observation->observed_ms;
+	}
+	memcpy(state->previous, observation->v, sizeof(state->previous));
+	state->last_sequence = observation->sequence;
+	state->last_observed_ms = observation->observed_ms;
+	state->initialized = true;
+	return stable && (uint32_t)(observation->observed_ms - state->stable_since_ms) >= 2000U;
 }
 #endif
 
 int sensor_offsetBias_internal(
-	float *dest1,
-	float *dest2,
+	float *gyro_bias,
 	float *avg_temp,
 	float *temp_range,
 	int max_sample_time_ms,
@@ -76,6 +72,9 @@ int sensor_offsetBias_internal(
 )
 {
 	float rawData[3];
+	struct sensor_gyro_sample gyro_sample;
+	uint32_t last_gyro_sequence = 0;
+	bool have_gyro_sequence = false;
 	float min_a[3], max_a[3];
 	float min_g[3], max_g[3];
 	/* Gyro motion uses the range of short-window MEANS, not raw samples.
@@ -211,13 +210,19 @@ int sensor_offsetBias_internal(
 		accel_check_counter++;
 
 		// Accumulate Gyroscope
-		if (sensor_wait_gyro(rawData, K_MSEC(100))) {
+		if (sensor_wait_gyro(&gyro_sample, K_MSEC(100))) {
 			return -2; // Timeout
 		}
+		if (!v_finite(gyro_sample.v, 3) || !v_finite(&gyro_sample.dt, 1) || gyro_sample.dt <= 0.0f ||
+		    (have_gyro_sequence && gyro_sample.sequence != last_gyro_sequence + 1U)) {
+			return -2; // Lost/invalid raw interval: do not fit a partial stream.
+		}
+		last_gyro_sequence = gyro_sample.sequence;
+		have_gyro_sequence = true;
 
 		// Check Gyro Motion (windowed-mean range method)
 		for (int j = 0; j < 3; j++) {
-			gyro_win_sum[j] += (double)rawData[j];
+			gyro_win_sum[j] += (double)gyro_sample.v[j];
 		}
 		gyro_win_count++;
 		if (gyro_win_count >= gyro_motion_window) {
@@ -251,9 +256,9 @@ int sensor_offsetBias_internal(
 		}
 
 		// Accumulate gyro data using online algorithm
-		gyro_sum[0] += (double)rawData[0];
-		gyro_sum[1] += (double)rawData[1];
-		gyro_sum[2] += (double)rawData[2];
+		gyro_sum[0] += (double)gyro_sample.v[0];
+		gyro_sum[1] += (double)gyro_sample.v[1];
+		gyro_sum[2] += (double)gyro_sample.v[2];
 
 #if CONFIG_SENSOR_USE_TCAL
 		// Sample and accumulate temperature
@@ -320,16 +325,9 @@ int sensor_offsetBias_internal(
 #endif
 
 	// Calculate averages
-	dest2[0] = (float)(gyro_sum[0] / i);
-	dest2[1] = (float)(gyro_sum[1] / i);
-	dest2[2] = (float)(gyro_sum[2] / i);
-
-#if !CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-	// In single-side calibration mode, do NOT calculate accelerometer bias.
-	dest1[0] = 0.0f;
-	dest1[1] = 0.0f;
-	dest1[2] = 0.0f;
-#endif
+	gyro_bias[0] = (float)(gyro_sum[0] / i);
+	gyro_bias[1] = (float)(gyro_sum[1] / i);
+	gyro_bias[2] = (float)(gyro_sum[2] / i);
 
 	return 0;
 }
@@ -338,11 +336,10 @@ int sensor_offsetBias_internal(
  * Standard sensor offset bias collection function
  * Uses default timing: BIAS_COLLECT_MAX_SAMPLE_TIME_MS max, BIAS_COLLECT_MIN_SAMPLE_TIME_MS min
  */
-int sensor_offsetBias(float *dest1, float *dest2, float *avg_temp, float *temp_range)
+int sensor_offsetBias(float *gyro_bias, float *avg_temp, float *temp_range)
 {
 	return sensor_offsetBias_internal(
-		dest1,
-		dest2,
+		gyro_bias,
 		avg_temp,
 		temp_range,
 		BIAS_COLLECT_MAX_SAMPLE_TIME_MS,

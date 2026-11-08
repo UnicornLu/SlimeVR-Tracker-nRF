@@ -1,0 +1,217 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "../harness/include/atomic.h"
+
+#if KERNEL_HZ == 31250
+#define CONFIG_SOC_SERIES_NRF54L 1
+#endif
+#define SYS_STATUS_CONNECTION_ERROR 0x20
+#define LOG_WRN(...) ((void)0)
+#define ESB_ST_PAIRED 1
+static uint64_t now_ticks;
+static bool locked, change_on_unlock, refresh_on_unlock;
+static unsigned irq_depth;
+static bool server_time_synced, channel_wait_normal;
+static atomic_t channel_redirect_pending;
+static int esb_conn_state, status_bits;
+static int64_t g_last_sync_timestamp;
+static uint32_t g_last_rx_raw_ticks, g_min_rtt_ticks, g_min_rtt_age;
+struct esb_sync_filter {
+	uint32_t offset;
+	uint32_t last_local_ticks;
+	uint32_t reference_offset;
+	uint32_t reference_local_ticks;
+	int32_t skew_ppb;
+	uint32_t update_count;
+	bool initialized;
+};
+static struct esb_sync_filter sync_filter;
+
+static atomic_t tdma_cfg_pack;
+static unsigned irq_lock(void) { unsigned prior = irq_depth++; locked = true; return prior; }
+static void irq_unlock(unsigned key)
+{
+	(void)key;
+	assert(irq_depth > 0 && key + 1 == irq_depth);
+	irq_depth = key;
+	locked = irq_depth != 0;
+	if (!locked && change_on_unlock) {
+		server_time_synced = false;
+		sync_filter.offset = 99;
+		sync_filter.last_local_ticks = 0;
+		sync_filter.skew_ppb = 0;
+	}
+	if (!locked && refresh_on_unlock) {
+		refresh_on_unlock = false;
+		server_time_synced = true;
+		g_last_sync_timestamp = (int64_t)(now_ticks * 1000ULL / KERNEL_HZ);
+		sync_filter.offset = 7;
+	}
+}
+static uint64_t k_uptime_ticks(void) { assert(locked); return now_ticks; }
+static int get_status(int mask) { assert(locked); return status_bits & mask; }
+static uint64_t k_ticks_to_us_near64(uint64_t ticks)
+{
+	assert(!locked);
+	return (ticks * 1000000ULL + KERNEL_HZ / 2) / KERNEL_HZ;
+}
+static uint64_t k_ticks_to_ms_floor64(uint64_t ticks)
+{
+	assert(!locked);
+	return ticks * 1000ULL / KERNEL_HZ;
+}
+#define CLAMP(x, lo, hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
+#include "production.inc"
+
+static void reset(void)
+{
+	now_ticks = 100ULL * KERNEL_HZ;
+	server_time_synced = true;
+	channel_wait_normal = false; atomic_set(&channel_redirect_pending, false);
+	esb_conn_state = ESB_ST_PAIRED;
+	status_bits = 0;
+	g_last_sync_timestamp = 100000;
+	sync_filter.offset = 1000;
+	sync_filter.last_local_ticks = 100U * 32768;
+	sync_filter.skew_ppb = 0;
+	tdma_cfg_pack = 0x80U | 1U | (22U << 8) | (10U << 16);
+	change_on_unlock = false;
+}
+static void unavailable(void)
+{
+	uint32_t local = 0, network = 0;
+	assert(!esb_get_status_clock(&local, &network));
+	assert(local == (uint32_t)net_ticks_from_kernel64(now_ticks));
+	assert(network == local);
+}
+static void filter_arithmetic(void)
+{
+	struct esb_sync_filter state = {0};
+	struct esb_sync_sample sample = { .local_ticks = 0, .offset = 0 };
+	assert(esb_sync_filter_update(&state, &sample) == 0);
+	assert(state.initialized && state.update_count == 0);
+	sample.local_ticks = 32768; sample.offset = 1;
+	assert(esb_sync_filter_update(&state, &sample) == 1);
+	assert(state.skew_ppb == 7629 && state.offset == 1 && state.update_count == 1);
+	state = (struct esb_sync_filter){0};
+	sample = (struct esb_sync_sample){0};
+	esb_sync_filter_update(&state, &sample);
+	sample.local_ticks = 32768; sample.offset = UINT32_MAX;
+	assert(esb_sync_filter_update(&state, &sample) == -1);
+	assert(state.skew_ppb == -7629 && state.offset == 0);
+	state = (struct esb_sync_filter){0};
+	sample = (struct esb_sync_sample){ .local_ticks = UINT32_MAX - 32767 };
+	esb_sync_filter_update(&state, &sample);
+	sample.local_ticks = 0; sample.offset = 1;
+	esb_sync_filter_update(&state, &sample);
+	assert(state.skew_ppb == 7629 && state.last_local_ticks == 0);
+	state = (struct esb_sync_filter){ .initialized = true, .update_count = 6 };
+	sample = (struct esb_sync_sample){ .offset = 32001 };
+	assert(esb_sync_filter_update(&state, &sample) == 32001);
+	assert(state.offset == 32001 && state.update_count == 6 && state.skew_ppb == 0);
+	state = (struct esb_sync_filter){ .initialized = true };
+	sample.offset = 32000;
+	assert(esb_sync_filter_update(&state, &sample) == 32000);
+	assert(state.offset == 24000 && state.update_count == 1);
+	state = (struct esb_sync_filter){0};
+	sample = (struct esb_sync_sample){ .offset = 100 };
+	esb_sync_filter_update(&state, &sample);
+	sample.local_ticks = 60U * 32768U;
+	esb_sync_filter_update(&state, &sample);
+	assert(state.reference_local_ticks == 0);
+	++sample.local_ticks;
+	esb_sync_filter_update(&state, &sample);
+	assert(state.reference_local_ticks == sample.local_ticks);
+}
+
+int main(void)
+{
+	filter_arithmetic();
+	g_min_rtt_age = 119;
+	g_min_rtt_ticks = 17;
+	esb_clear_time_sync_state();
+	assert(g_min_rtt_age == 119 && g_min_rtt_ticks == 10);
+	assert(!sync_filter.initialized && !server_time_synced && sync_filter.update_count == 0);
+	assert(net_ticks_from_ms_near32(1) == 33);
+	assert(net_ticks_from_ms_near32(15) == 492);
+	assert(net_ticks_from_ms_near32(1000) == 32768);
+	assert(net_ticks_to_ms_floor32(1) == 0);
+	assert(net_ticks_to_ms_ceil32(1) == 1);
+	assert(net_ticks_to_ms_floor32(32768) == 1000);
+	assert(net_ticks_to_ms_ceil32(32768) == 1000);
+	assert(net_ticks_to_us_ceil64(31) == 947);
+	assert(net_ticks_to_us_ceil64(32768) == 1000000);
+	reset();
+	struct esb_network_clock clock;
+	reset(); now_ticks = 0; g_last_sync_timestamp = 0; sync_filter.offset = 0;
+	assert(esb_get_network_clock(&clock));
+	assert(clock.receiver_ticks == 0 && clock.local_kernel_ticks == 0 && clock.sync_age_ms == 0);
+	assert(esb_get_sync_age_ms() == 0);
+	reset(); sync_filter.offset = 0x7fffffffU;
+	assert(esb_get_network_clock(&clock) && clock.receiver_ticks == 3276800U + 0x7fffffffU);
+	sync_filter.offset = 0x80000000U;
+	assert(esb_get_network_clock(&clock) && clock.receiver_ticks == 3276800U + 0x80000000U);
+	sync_filter.offset = 0xffffffffU;
+	assert(esb_get_network_clock(&clock) && clock.receiver_ticks == 3276799U);
+	assert(net_tick_difference(0x80000000U, 0) == -2147483648LL);
+	assert(net_tick_difference(0x7fffffffU, 0) == 2147483647LL);
+	assert(net_tick_difference(0, 0xffffffffU) == 1);
+	reset(); g_last_sync_timestamp = 100000 - TIME_SYNC_TIMEOUT_MS;
+	assert(esb_get_network_clock(&clock) && clock.sync_age_ms == TIME_SYNC_TIMEOUT_MS);
+	--g_last_sync_timestamp;
+	assert(!esb_get_network_clock(&clock) && esb_get_sync_age_ms() == -1);
+	reset(); g_last_sync_timestamp = 100000 - TIME_SYNC_TIMEOUT_MS - 1;
+	refresh_on_unlock = true;
+	assert(!esb_get_network_clock(&clock));
+	assert(server_time_synced && g_last_sync_timestamp == 100000);
+	assert(esb_get_network_clock(&clock) && clock.receiver_ticks == 3276807U);
+	reset(); sync_filter.last_local_ticks -= 65536; sync_filter.skew_ppb = 1000000;
+	change_on_unlock = true;
+	assert(esb_get_network_clock(&clock) && clock.receiver_ticks == 3276800U + 1065U);
+	change_on_unlock = false;
+	reset();
+#if CONFIG_CONNECTION_TDMA
+	uint32_t local, network;
+	assert(esb_get_status_clock(&local, &network));
+	assert(local == 3276800 && network == local + 1000);
+	sync_filter.offset = 0U - local;
+	assert(esb_get_status_clock(&local, &network) && network == 0);
+	reset(); status_bits = SYS_STATUS_CONNECTION_ERROR; unavailable();
+	reset(); esb_conn_state = 2; unavailable();
+	reset(); server_time_synced = false; unavailable();
+	reset(); channel_wait_normal = true; unavailable();
+	reset(); atomic_set(&channel_redirect_pending, true); unavailable();
+	reset(); tdma_cfg_pack &= ~TDMA_ENABLED_BIT; unavailable();
+	reset(); tdma_cfg_pack = 0; unavailable();
+	reset(); tdma_cfg_pack = TDMA_ENABLED_BIT; unavailable();
+	reset(); g_last_sync_timestamp = 100001; unavailable();
+	reset(); g_last_sync_timestamp -= TDMA_SYNC_STALE_MS;
+	assert(esb_get_status_clock(&local, &network));
+	--g_last_sync_timestamp; unavailable();
+	/* Accepted sync at uptime zero is not confused with no sync. */
+	reset(); now_ticks = 0; g_last_sync_timestamp = 0;
+	assert(esb_get_status_clock(&local, &network) && local == 0);
+	/* Wrap-safe elapsed time with both signs of drift, and network wrap. */
+	reset(); sync_filter.last_local_ticks -= 65536; sync_filter.skew_ppb = 1000000;
+	assert(esb_get_status_clock(&local, &network) && network == local + 1065);
+	sync_filter.skew_ppb = -1000000;
+	assert(esb_get_status_clock(&local, &network) && network == local + 935);
+	reset(); now_ticks = (1ULL << 32) + 2ULL * KERNEL_HZ;
+	g_last_sync_timestamp = now_ticks * 1000ULL / KERNEL_HZ;
+	uint32_t expected_local = (uint32_t)net_ticks_from_kernel64(now_ticks);
+	sync_filter.last_local_ticks = expected_local - 65536;
+	sync_filter.skew_ppb = 1000000;
+	sync_filter.offset = UINT32_MAX - expected_local;
+	assert(esb_get_status_clock(&local, &network));
+	assert(local == expected_local && network == 64);
+	/* Radio updates immediately after unlock cannot mix estimator epochs. */
+	reset(); sync_filter.last_local_ticks -= 65536; sync_filter.skew_ppb = 1000000;
+	change_on_unlock = true;
+	assert(esb_get_status_clock(&local, &network) && network == local + 1065);
+#else
+	unavailable();
+#endif
+	printf("status clock: kernel=%d TDMA=%d passed\n", KERNEL_HZ, CONFIG_CONNECTION_TDMA);
+}

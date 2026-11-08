@@ -1,26 +1,21 @@
 """Exercise real request owners; event and RTOS operations are injected leaves."""
 from pathlib import Path
+import os
 import re
 import subprocess
+import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness/python'))
+from c_extract import extract_block
+
+ROOT = Path(os.environ.get("SOURCE_ROOT", Path(__file__).resolve().parents[3]))
 
 
-def function(name):
-    source = (ROOT / "src/sensor/calibration/calibration.c").read_text()
-    match = re.search(rf"^(?:static )?(?:void|int|uint8_t|uint16_t) {name}\([^;]*?\)\s*\{{", source, re.M)
-    if not match:
-        raise RuntimeError(name)
-    depth = 0
-    for token in re.finditer(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', source[source.index("{", match.start()):], re.S):
-        if token.group() == "{":
-            depth += 1
-        elif token.group() == "}":
-            depth -= 1
-            if depth == 0:
-                return source[match.start():source.index("{", match.start()) + token.end()] + "\n"
-    raise RuntimeError(name)
+def function(name, source=None):
+    if source is None:
+        source = (ROOT / "src/sensor/calibration/calibration.c").read_text()
+    return extract_block(source, rf"^(?:static )?(?:void|int|bool|uint8_t|uint16_t|uint32_t|enum led_owner|struct led_token) {re.escape(name)}\([^;]*?\)\s*\{{") + "\n"
 
 
 PRELUDE = r'''
@@ -37,6 +32,26 @@ PRELUDE = r'''
 #define LOG_INF(...) ((void)0)
 static int calibration_request_lock, requested_calibration;
 static uint16_t requested_operation;
+static struct led_token requested_feedback;
+static uint32_t requested_generation;
+typedef int atomic_t;
+static atomic_t calibration_generation, calibration_kind;
+static int atomic_inc(atomic_t *value) { return (*value)++; }
+static int atomic_get(const atomic_t *value) { return *value; }
+static int atomic_set(atomic_t *value, int next) { int old = *value; *value = next; return old; }
+static uint32_t led_identity;
+static unsigned led_results[LED_SEMANTIC_COUNT], led_requests[LED_SEMANTIC_COUNT];
+uint32_t led_request_id(void) { return ++led_identity; }
+uint32_t led_event_id(void) { return ++led_identity; }
+struct led_token led_begin(enum led_owner owner, uint32_t request)
+{ return (struct led_token){owner, ++led_identity, request}; }
+enum led_admission led_state(struct led_token token, uint32_t revision, enum led_semantic semantic)
+{ (void)token; (void)revision; (void)semantic; return LED_ADMITTED; }
+enum led_admission led_result(struct led_token token, uint32_t event, enum led_semantic semantic)
+{ (void)token; (void)event; led_results[semantic]++; return LED_ADMITTED; }
+enum led_admission led_request_event(enum led_owner owner, uint32_t request, uint32_t event,
+                                    enum led_semantic semantic)
+{ (void)owner; (void)request; (void)event; led_requests[semantic]++; return LED_ADMITTED; }
 static bool mag_cal_led_pending, running;
 static uint8_t magneto_progress, sens_cal_axis;
 static uint16_t sens_cal_revolutions;
@@ -52,34 +67,48 @@ static void calibration_signal_wake(void) { wakes++; }
 static void sensor_calibration_samples_end(void) { sample_ends++; }
 static bool get_status(int status) { (void)status; return running; }
 static void set_status(int status,bool value) { (void)status; running=value; }
+#if CONFIG_SENSOR_TCAL_HEATED
+static bool reset_barrier, imu_candidate, imu_heated, sensitivity_maintenance;
+static bool sensor_tcal_heated_resetting_locked(void) { return reset_barrier; }
+static int sensor_calibration_imu_reserve_heated(void) {
+ if (imu_candidate || imu_heated) return -EBUSY;
+ imu_heated=true; return 0;
+}
+static void sensor_calibration_imu_release_heated(void) { imu_heated=false; }
+#endif
 '''
 
 TEST = r'''
 int main(void) {
  assert(sensor_calibration_request(CAL_REQUEST_IMU,CAL_REQUEST_USER)==0);
  uint16_t first=sensor_calibration_current_operation(); assert(first && accepted==1);
+ assert(led_results[LED_ACCEPTED]==1 && led_results[LED_SUCCESS]==0);
+ uint32_t first_generation=sensor_calibration_current_generation();
  for(unsigned i=0;i<1000;i++) {
   assert(sensor_calibration_request(CAL_REQUEST_TCAL_BOOT,CAL_REQUEST_AUTO)==-1);
   assert(sensor_calibration_request(CAL_REQUEST_IMU,CAL_REQUEST_AUTO_SILENT)==-1);
  }
  assert(accepted==1 && rejected==0 && sensor_calibration_current_operation()==first);
+ assert(led_results[LED_ACCEPTED]==1 && led_results[LED_SUCCESS]==0);
+ assert(sensor_calibration_current_generation()==first_generation);
  assert(sensor_calibration_request(CAL_REQUEST_IMU,CAL_REQUEST_USER)==-1);
  assert(rejected==1 && last_reason==CAL_REASON_BUSY && sensor_calibration_current_operation()==first);
  assert(sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER)==0);
  assert(sensor_calibration_current_operation()==0 && sample_ends==1);
  assert(sensor_calibration_request(CAL_REQUEST_IMU,CAL_REQUEST_AUTO_SILENT)==0);
  assert(sensor_calibration_current_operation()==0 && accepted==1);
+ assert(!requested_feedback.session && led_results[LED_ACCEPTED]==1 && led_results[LED_SUCCESS]==0);
  sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER);
  assert(sensor_calibration_request(CAL_REQUEST_TCAL_BOOT,CAL_REQUEST_AUTO)==0);
  assert(last_kind==(CAL_KIND_TCAL_BOOT|CAL_EVENT_ORIGIN_AUTO));
  sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER);
- sensor_request_calibration_mag(); first=sensor_calibration_current_operation();
+ assert(sensor_request_calibration_mag()==0); first=sensor_calibration_current_operation();
  assert(first && requested_calibration==CAL_REQUEST_MAG && mag_cal_led_pending);
  unsigned before=accepted; unsigned refused=rejected;
- sensor_request_calibration_mag();
+ assert(sensor_request_calibration_mag()==-EBUSY);
  assert(accepted==before && rejected==refused+1 && sensor_calibration_current_operation()==first);
  sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER);
- sensor_request_calibration_mag();
+ assert(sensor_request_calibration_mag()==0);
  assert(sensor_calibration_current_operation()!=first && requested_calibration==CAL_REQUEST_MAG);
  sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER);
  assert(sensor_request_calibration_sens(3,5)==-EINVAL);
@@ -87,20 +116,70 @@ int main(void) {
  assert(sensor_request_calibration_sens(2,0)==0);
  assert(sens_cal_axis==2 && sens_cal_revolutions==CONFIG_SENSOR_SENS_REV);
  assert(sensor_calibration_current_operation()!=0);
+ sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER);
+#if CONFIG_SENSOR_TCAL_HEATED
+ assert(sensor_calibration_request(CAL_REQUEST_TCAL_HEATED,CAL_REQUEST_USER)==-EINVAL);
+ assert(sensor_calibration_request(CAL_REQUEST_MAINTENANCE,CAL_REQUEST_USER)==-EINVAL);
+ imu_candidate=true;
+ sensor_tcal_heated_lock();
+ assert(sensor_calibration_heated_reserve_locked()==-EBUSY);
+ sensor_tcal_heated_unlock();
+ assert(requested_calibration==0 && !imu_heated);
+ imu_candidate=false;
+ sensor_tcal_heated_lock();
+ assert(sensor_calibration_heated_reserve_locked()==0);
+ sensor_tcal_heated_unlock();
+ assert(imu_heated && requested_calibration==CAL_REQUEST_TCAL_HEATED);
+ unsigned ends=sample_ends;
+ assert(sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER)==-EBUSY);
+ assert(sample_ends==ends && imu_heated);
+ assert(sensor_calibration_request(CAL_REQUEST_TCAL_BOOT,CAL_REQUEST_AUTO)==-1);
+ assert(sensor_calibration_request(CAL_REQUEST_TCAL_RUNTIME,CAL_REQUEST_AUTO)==-1);
+ assert(sensor_request_calibration_mag()==-EBUSY);
+ assert(sensor_request_calibration_sens(0,1)==-1);
+ assert(sensor_calibration_maintenance_begin()==-EBUSY);
+ sensor_tcal_heated_lock();
+ sensor_calibration_heated_release_locked();
+ sensor_tcal_heated_unlock();
+ assert(!imu_heated && requested_calibration==0);
+ assert(sensor_calibration_maintenance_begin()==0);
+ assert(sensor_calibration_request(CAL_REQUEST_CLEAR,CAL_REQUEST_USER)==-EBUSY);
+ sensor_tcal_heated_lock();
+ assert(sensor_calibration_heated_reserve_locked()==-EBUSY);
+ sensor_tcal_heated_unlock();
+ sensor_calibration_maintenance_end();
+ reset_barrier=true;
+ assert(sensor_calibration_maintenance_begin()==-EBUSY);
+ assert(sensor_calibration_request(CAL_REQUEST_IMU,CAL_REQUEST_USER)==-1);
+ assert(sensor_request_calibration_mag()==-EBUSY);
+ assert(sensor_request_calibration_sens(0,1)==-1);
+ sensor_tcal_heated_lock();
+ assert(sensor_calibration_heated_reserve_locked()==-EBUSY);
+ sensor_tcal_heated_unlock();
+ reset_barrier=false;
+ assert(sensor_calibration_request(CAL_REQUEST_IMU,CAL_REQUEST_USER)==0);
+#endif
+ assert(led_results[LED_SUCCESS]==0 && led_requests[LED_SUCCESS]==0);
  return 0;
 }
 '''
 
 
 def main():
-    names = ("calibration_request_kind", "sensor_calibration_current_operation", "sensor_calibration_request", "sensor_request_calibration_sens", "sensor_request_calibration_mag")
-    source = PRELUDE + "\n".join(function(name) for name in names) + TEST
-    with tempfile.TemporaryDirectory(prefix="cal-request-") as directory:
-        path = Path(directory)
-        (path / "test.c").write_text(source)
-        subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-DCONFIG_SENSOR_USE_SENS_CALIBRATION=1", "-I", str(ROOT / "src"), str(path / "test.c"), "-o", str(path / "test")], check=True)
-        subprocess.run([str(path / "test")], check=True)
-    print("calibration request ownership: PASS")
+    names = ("calibration_next_generation", "sensor_calibration_generation_valid",
+             "calibration_led_owner", "calibration_led_accept", "calibration_request_kind",
+             "sensor_calibration_current_generation", "sensor_calibration_current_operation",
+             "sensor_calibration_request", "sensor_request_calibration_sens", "sensor_request_calibration_mag")
+    heated_names = ("sensor_tcal_heated_lock", "sensor_tcal_heated_unlock", "sensor_calibration_heated_reserve_locked", "sensor_calibration_heated_release_locked", "sensor_calibration_maintenance_begin", "sensor_calibration_maintenance_end")
+    for heated in (False, True):
+        selected = heated_names + names if heated else names
+        source = PRELUDE + function("calibration_mag_pending") + "\n".join(function(name) for name in selected) + TEST
+        with tempfile.TemporaryDirectory(prefix="cal-request-") as directory:
+            path = Path(directory)
+            (path / "test.c").write_text(source)
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-DCONFIG_CONNECTION_RAW_COLLECTION=1", "-DCONFIG_SENSOR_USE_MAGNETOMETER=1", "-DCONFIG_SENSOR_USE_SENS_CALIBRATION=1", f"-DCONFIG_SENSOR_TCAL_HEATED={int(heated)}", "-I", str(ROOT / "src"), str(path / "test.c"), "-o", str(path / "test")], check=True)
+            subprocess.run([str(path / "test")], check=True)
+    print("calibration request ownership (heated off/on): PASS")
 
 
 if __name__ == "__main__":

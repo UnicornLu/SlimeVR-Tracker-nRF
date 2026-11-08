@@ -63,8 +63,8 @@ static int64_t oneshot_deadline_ms;
 LOG_MODULE_REGISTER(BMM150, LOG_LEVEL_DBG);
 
 static int read_trim_registers(void);
-static float compensate_x(int16_t mag_data_x, uint16_t data_rhall);
-static float compensate_y(int16_t mag_data_y, uint16_t data_rhall);
+static float compensate_x(int16_t mag_data_x, uint16_t data_rhall, float xy_term);
+static float compensate_y(int16_t mag_data_y, uint16_t data_rhall, float xy_term);
 static float compensate_z(int16_t mag_data_z, uint16_t data_rhall);
 
 int bmm1_init(float period_s, float *actual_period_s)
@@ -75,7 +75,6 @@ int bmm1_init(float period_s, float *actual_period_s)
 
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM150_POWER_CTRL, 0x01);
 	if (err) {
-		LOG_ERR("Communication error");
 		return (err < 0 ? err : 0);
 	}
 	k_msleep(2); // BMM150 start-up
@@ -94,15 +93,12 @@ void bmm1_shutdown(void)
 	last_config_code = 0xff; // invalidate configuration cache
 	oneshot_pending = false;
 	oneshot_failed = false;
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM150_POWER_CTRL, 0x00);
-	if (err) {
-		LOG_ERR("Communication error");
-	}
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM150_POWER_CTRL, 0x00);
 }
 
 int bmm1_update_odr(float period_s, float *actual_period_s)
 {
-	int requested_odr_hz; // Truncate fractional Hz before selecting a supported rate.
+	float requested_odr_hz;
 	uint8_t odr_code;
 	uint8_t mode_code;
 	uint8_t xy_repetitions_code; // repetitions = 1 + 2 * code
@@ -185,7 +181,6 @@ int bmm1_update_odr(float period_s, float *actual_period_s)
 	return 0;
 error:
 	last_config_code = 0xff;
-	LOG_ERR("Communication error");
 	return err;
 }
 
@@ -197,9 +192,6 @@ void bmm1_mag_oneshot(void)
 	oneshot_pending = true;
 	oneshot_failed = err != 0;
 	oneshot_deadline_ms = k_uptime_get() + (measurement_us + 999U) / 1000U + 1;
-	if (err) {
-		LOG_ERR("Communication error");
-	}
 }
 
 bool bmm1_mag_read(float m[3])
@@ -216,7 +208,6 @@ bool bmm1_mag_read(float m[3])
 		while (true) {
 			int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, BMM150_OP_CTRL, &status);
 			if (err) {
-				LOG_ERR("Communication error");
 				oneshot_pending = false;
 				return false;
 			}
@@ -236,7 +227,6 @@ bool bmm1_mag_read(float m[3])
 		uint8_t status = 0;
 		int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, BMM150_DATA_READY_STATUS, &status);
 		if (err) {
-			LOG_ERR("Communication error");
 			return false;
 		}
 		if (!(status & BMM150_DATA_READY_MASK)) {
@@ -244,9 +234,14 @@ bool bmm1_mag_read(float m[3])
 		}
 	}
 	uint8_t rawData[8];
-	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, BMM150_DATAX_LSB, &rawData[0], 8);
+	int err = was_oneshot ? ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, BMM150_DATAX_LSB, &rawData[0], 8)
+			      : ssi_burst_read_frame(SENSOR_INTERFACE_DEV_MAG, BMM150_DATAX_LSB, 0, 2, &rawData[0], 8);
 	if (err) {
-		LOG_ERR("Communication error");
+		return false;
+	}
+	if ((rawData[1] == 0x80 && (rawData[0] & 0xF8) == 0) ||
+	    (rawData[3] == 0x80 && (rawData[2] & 0xF8) == 0) ||
+	    (rawData[5] == 0x80 && (rawData[4] & 0xFE) == 0)) {
 		return false;
 	}
 	bmm1_mag_process(rawData, m);
@@ -260,8 +255,15 @@ void bmm1_mag_process(uint8_t *raw_m, float m[3])
 		mag[i] = (int16_t)((((uint16_t)raw_m[(i * 2) + 1]) << 8) | (raw_m[i * 2] & 0xFE)) / (i < 2 ? 8 : 2);
 	}
 	uint16_t rhall = (uint16_t)((((uint16_t)raw_m[7]) << 6) | (raw_m[6] >> 2));
-	m[0] = compensate_x(mag[0], rhall) / 100; // uT to gauss
-	m[1] = compensate_y(mag[1], rhall) / 100;
+	float xy_term = 0;
+	if (rhall != 0 && dig_xyz1 != 0 && (mag[0] != -4096 || mag[1] != -4096)) {
+		float ratio = ((float)dig_xyz1) * 16384.0f / rhall;
+		float delta = ratio - 16384.0f;
+		float quadratic = ((float)dig_xy2) * (delta * delta / 268435456.0f);
+		xy_term = quadratic + delta * ((float)dig_xy1) / 16384.0f;
+	}
+	m[0] = compensate_x(mag[0], rhall, xy_term) / 100; // uT to gauss
+	m[1] = compensate_y(mag[1], rhall, xy_term) / 100;
 	m[2] = compensate_z(mag[2], rhall) / 100;
 }
 
@@ -300,44 +302,35 @@ static int read_trim_registers(void)
 	return 0;
 
 error:
-	LOG_ERR("Communication error");
 	return err;
 }
 
 // from boschsensortec BMM150_SensorAPI
 // returns value in microtesla
-static float compensate_x(int16_t mag_data_x, uint16_t data_rhall)
+static float compensate_x(int16_t mag_data_x, uint16_t data_rhall, float xy_term)
 {
 	float retval = 0;
 
 	/* Overflow condition check */
 	if ((mag_data_x != -4096) && (data_rhall != 0) && (dig_xyz1 != 0)) {
 		/* Processing compensation equations */
-		float x0 = (((float)dig_xyz1) * 16384.0f / data_rhall);
-		retval = (x0 - 16384.0f);
-		float x1 = ((float)dig_xy2) * (retval * retval / 268435456.0f);
-		float x2 = x1 + retval * ((float)dig_xy1) / 16384.0f;
 		float x3 = ((float)dig_x2) + 160.0f;
-		float x4 = mag_data_x * ((x2 + 256.0f) * x3);
+		float x4 = mag_data_x * ((xy_term + 256.0f) * x3);
 		retval = ((x4 / 8192.0f) + (((float)dig_x1) * 8.0f)) / 16.0f;
 	}
 
 	return retval;
 }
 
-static float compensate_y(int16_t mag_data_y, uint16_t data_rhall)
+static float compensate_y(int16_t mag_data_y, uint16_t data_rhall, float xy_term)
 {
 	float retval = 0;
 
 	/* Overflow condition check */
 	if ((mag_data_y != -4096) && (data_rhall != 0) && (dig_xyz1 != 0)) {
 		/* Processing compensation equations */
-		float y0 = ((float)dig_xyz1) * 16384.0f / data_rhall;
-		retval = y0 - 16384.0f;
-		float y1 = ((float)dig_xy2) * (retval * retval / 268435456.0f);
-		float y2 = y1 + retval * ((float)dig_xy1) / 16384.0f;
 		float y3 = ((float)dig_y2) + 160.0f;
-		float y4 = mag_data_y * (((y2) + 256.0f) * y3);
+		float y4 = mag_data_y * ((xy_term + 256.0f) * y3);
 		retval = ((y4 / 8192.0f) + (((float)dig_y1) * 8.0f)) / 16.0f;
 	}
 
@@ -375,5 +368,6 @@ const sensor_mag_t sensor_mag_bmm150 = {
 
 	*bmm1_mag_process,
 	6,
-	8 // rhall does not get read by limited external interface
+	8, // rhall does not get read by limited external interface
+	.cached_poll_safe = false,
 };

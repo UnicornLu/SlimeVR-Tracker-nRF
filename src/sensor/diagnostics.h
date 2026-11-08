@@ -31,30 +31,16 @@
 #define SENSOR_DEBUG_QDEV_QOUT 0
 #endif
 
+#define SENSOR_DEBUG_MAX_DURATION_SEC 60U
+
 /* Console-safe session transitions. Expiry and output accounting are atomic;
- * already reserved output can finish printing after a stop/restart. */
-void sensor_debug_start(uint32_t duration_sec);
-void sensor_debug_stop(void);
+ * already reserved output can finish printing after expiry or restart. */
+int sensor_debug_start(uint32_t duration_sec);
 bool sensor_debug_is_active(void);
-
-#if CONFIG_SENSOR_RANGE_STATS
-// Sensor range tracking - records min/max values during runtime (not persisted)
-typedef struct {
-	float gyro_max[3];     // Maximum gyro values per axis (deg/s)
-	float gyro_min[3];     // Minimum gyro values per axis (deg/s)
-	float accel_max[3];    // Maximum accel values per axis (g)
-	float accel_min[3];    // Minimum accel values per axis (g)
-	uint64_t sample_count; // Total samples processed
-	bool initialized;      // Whether tracking has been initialized
-} sensor_range_stats_t;
-
-// Get the current range statistics
-const sensor_range_stats_t *sensor_get_range_stats(void);
-// Reset range statistics
-void sensor_reset_range_stats(void);
-// Print range statistics to console
-void sensor_print_range_stats(void);
-#endif // CONFIG_SENSOR_RANGE_STATS
+bool sensor_diagnostics_maintenance_active(void);
+#if CONFIG_VQF_BENCH
+void sensor_benchmark_active(bool active);
+#endif
 
 /* Sample hooks and frame output are owned exclusively by the sensor thread.
  * A frame belongs to the session captured at reset; restarting discards an
@@ -64,15 +50,12 @@ void sensor_diagnostics_on_decoded_gyro(const float g[3]);
 void sensor_diagnostics_on_raw_gyro(const float g[3]);
 void sensor_diagnostics_on_cal_gyro(const float g[3]);
 void sensor_diagnostics_on_raw_accel(const float a[3]);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_diagnostics_on_mag(const float raw[3], const float calibrated[3]);
+#endif
 void sensor_diagnostics_output(
 	const float q[4], const float lin_a[3], const float avg_a[3], float temp, bool mag_enabled
 );
-
-#if CONFIG_SENSOR_RANGE_STATS
-void sensor_diagnostics_on_cal_accel(const float a[3]);
-void sensor_diagnostics_set_ranges(float accel_range, float gyro_range);
-#endif
 
 #if SENSOR_DEBUG_QDEV_QOUT
 /* Frame correction remains sensor-owned; computed only for a debug output. */

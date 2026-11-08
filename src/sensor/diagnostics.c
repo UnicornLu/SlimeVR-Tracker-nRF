@@ -22,8 +22,9 @@
 */
 #include "diagnostics.h"
 #include "sensor.h"
+#include "calibration/calibration.h"
+#include "connection/connection.h"
 
-#include <math.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -50,6 +51,9 @@ static sensor_debug_state_t debug_state = {
 	.enabled = false,
 	.output_every_n = 4 // Default: output every 4 accel samples
 };
+#if CONFIG_VQF_BENCH
+static bool benchmark_active;
+#endif
 static struct k_spinlock debug_lock;
 
 /* Reset at the FIFO processing boundary, then retained through publish. */
@@ -60,35 +64,12 @@ static struct {
 	float debug_cal_g_sum[3];
 	int debug_g_samples;
 	int debug_a_samples;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	float debug_raw_m[3];
 	float debug_cal_m[3];
 	bool debug_mag_valid;
-} frame;
-
-#if CONFIG_SENSOR_RANGE_STATS
-// Sensor range tracking state - records min/max values during runtime (not persisted)
-static sensor_range_stats_t range_stats
-	= {.gyro_max = {-INFINITY, -INFINITY, -INFINITY},
-	   .gyro_min = {INFINITY, INFINITY, INFINITY},
-	   .accel_max = {-INFINITY, -INFINITY, -INFINITY},
-	   .accel_min = {INFINITY, INFINITY, INFINITY},
-	   .sample_count = 0,
-	   .initialized = false};
-#endif // CONFIG_SENSOR_RANGE_STATS
-
-#if CONFIG_SENSOR_RANGE_STATS
-static float accel_actual_range;
-static float gyro_actual_range;
-
-static void sensor_update_range_stats_gyro(const float g[3]);
-static void sensor_update_range_stats_accel(const float a[3]);
-
-void sensor_diagnostics_set_ranges(float accel_range, float gyro_range)
-{
-	accel_actual_range = accel_range;
-	gyro_actual_range = gyro_range;
-}
 #endif
+} frame;
 
 /* Caller holds debug_lock: expiry and the counters it reports are one transition. */
 static bool sensor_debug_expire_locked(int64_t now, uint32_t *output_count)
@@ -116,6 +97,9 @@ static uint64_t sensor_debug_session(void)
 
 static bool sensor_debug_frame_is_active(void)
 {
+	if (frame.session == 0) {
+		return false;
+	}
 	uint64_t session = sensor_debug_session();
 	return session != 0 && session == frame.session;
 }
@@ -159,6 +143,7 @@ void sensor_diagnostics_reset_frame(void)
 	frame.debug_cal_g_sum[2] = 0;
 	frame.debug_g_samples = 0;
 	frame.debug_a_samples = 0;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	frame.debug_raw_m[0] = 0;
 	frame.debug_raw_m[1] = 0;
 	frame.debug_raw_m[2] = 0;
@@ -166,6 +151,7 @@ void sensor_diagnostics_reset_frame(void)
 	frame.debug_cal_m[1] = 0;
 	frame.debug_cal_m[2] = 0;
 	frame.debug_mag_valid = false;
+#endif
 	frame.session = sensor_debug_session();
 }
 
@@ -197,10 +183,6 @@ void sensor_diagnostics_on_cal_gyro(const float g[3])
 			frame.debug_cal_g_sum[j] += g[j];
 		}
 	}
-
-#if CONFIG_SENSOR_RANGE_STATS
-	sensor_update_range_stats_gyro(g);
-#endif
 }
 
 void sensor_diagnostics_on_raw_accel(const float a[3])
@@ -213,13 +195,7 @@ void sensor_diagnostics_on_raw_accel(const float a[3])
 	}
 }
 
-#if CONFIG_SENSOR_RANGE_STATS
-void sensor_diagnostics_on_cal_accel(const float a[3])
-{
-	sensor_update_range_stats_accel(a);
-}
-#endif
-
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_diagnostics_on_mag(const float raw[3], const float calibrated[3])
 {
 	if (sensor_debug_frame_is_active()) {
@@ -228,12 +204,13 @@ void sensor_diagnostics_on_mag(const float raw[3], const float calibrated[3])
 		frame.debug_mag_valid = true;
 	}
 }
+#endif
 
 void sensor_diagnostics_output(
 	const float q[4], const float lin_a[3], const float avg_a[3], float temp, bool mag_enabled
 )
 {
-#if !CONFIG_SENSOR_USE_VQF
+#if !CONFIG_SENSOR_USE_VQF || !CONFIG_SENSOR_USE_MAGNETOMETER
 	ARG_UNUSED(mag_enabled);
 #endif
 	// Debug mode output - based on accel sample count, not time interval
@@ -287,6 +264,7 @@ void sensor_diagnostics_output(
 				(double)avg_cal_g[2]
 			);
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 			if (frame.debug_mag_valid) {
 				printk(
 					"     MAG: RAW[%.2f,%.2f,%.2f] CAL[%.2f,%.2f,%.2f]\n",
@@ -298,6 +276,7 @@ void sensor_diagnostics_output(
 					(double)frame.debug_cal_m[2]
 				);
 			}
+#endif
 
 #if CONFIG_SENSOR_USE_VQF
 			printk(
@@ -339,9 +318,10 @@ void sensor_diagnostics_output(
 			);
 #if IS_ENABLED(CONFIG_VQF_ADAPTIVE_TAU_ACC)
 			printk(
-				"     Adapt: tauAcc:%.2fs motInt:%.3f\n",
+				"     Adapt: tauAcc:%.2fs accDev:%.3f gyrSpeed:%.3f\n",
 				(double)vqf_info.tau_acc,
-				(double)vqf_info.motion_intensity
+				(double)vqf_info.acc_deviation,
+				(double)vqf_info.angular_speed
 			);
 #endif
 			printk(
@@ -376,6 +356,7 @@ void sensor_diagnostics_output(
 					printk("\n");
 				}
 			}
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 			if (mag_enabled) {
 				printk(
 					"     Mag: DisAng:%.2f° CorrRate:%.2f°/s\n",
@@ -399,6 +380,7 @@ void sensor_diagnostics_output(
 					(double)vqf_info.mag_candidate_dip
 				);
 			}
+#endif
 #else
 			printk(
 				"     Q[%.3f,%.3f,%.3f,%.3f] LinA[%.2f,%.2f,%.2f]\n",
@@ -432,9 +414,9 @@ void sensor_diagnostics_output(
 }
 
 // Debug mode control functions
-void sensor_debug_start(uint32_t duration_sec)
+int sensor_debug_start(uint32_t duration_sec)
 {
-	if (duration_sec == 0 || duration_sec > 30) {
+	if (duration_sec == 0 || duration_sec > SENSOR_DEBUG_MAX_DURATION_SEC) {
 		duration_sec = 10; // Default to 10 seconds
 	}
 
@@ -449,7 +431,9 @@ void sensor_debug_start(uint32_t duration_sec)
 	debug_state.accel_count = 0;
 	debug_state.output_count = 0;
 	uint32_t output_every_n = debug_state.output_every_n;
+	sensor_operation_result(LED_OWNER_SENSOR, 0, true);
 	k_spin_unlock(&debug_lock, key);
+	connection_feedback_maintenance_update();
 
 	float accel_odr = sensor_get_accel_odr();
 	LOG_INF(
@@ -458,18 +442,7 @@ void sensor_debug_start(uint32_t duration_sec)
 		(double)accel_odr,
 		output_every_n
 	);
-}
-
-void sensor_debug_stop(void)
-{
-	k_spinlock_key_t key = k_spin_lock(&debug_lock);
-	bool enabled = debug_state.enabled;
-	debug_state.enabled = false;
-	uint32_t output_count = debug_state.output_count;
-	k_spin_unlock(&debug_lock, key);
-	if (enabled) {
-		LOG_INF("Debug mode stopped. %u outputs generated", output_count);
-	}
+	return 0;
 }
 
 bool sensor_debug_is_active(void)
@@ -477,139 +450,23 @@ bool sensor_debug_is_active(void)
 	return sensor_debug_session() != 0;
 }
 
-#if CONFIG_SENSOR_RANGE_STATS
-// Sensor range tracking functions
-const sensor_range_stats_t *sensor_get_range_stats(void)
+bool sensor_diagnostics_maintenance_active(void)
 {
-	return &range_stats;
+	bool active = sensor_debug_is_active();
+#if CONFIG_VQF_BENCH
+	k_spinlock_key_t key = k_spin_lock(&debug_lock);
+	active |= benchmark_active;
+	k_spin_unlock(&debug_lock, key);
+#endif
+	return active;
 }
 
-void sensor_reset_range_stats(void)
+#if CONFIG_VQF_BENCH
+void sensor_benchmark_active(bool active)
 {
-	for (int i = 0; i < 3; i++) {
-		range_stats.gyro_max[i] = -INFINITY;
-		range_stats.gyro_min[i] = INFINITY;
-		range_stats.accel_max[i] = -INFINITY;
-		range_stats.accel_min[i] = INFINITY;
-	}
-	range_stats.sample_count = 0;
-	range_stats.initialized = false;
-	LOG_INF("Range statistics reset");
+	k_spinlock_key_t key = k_spin_lock(&debug_lock);
+	benchmark_active = active;
+	k_spin_unlock(&debug_lock, key);
+	connection_feedback_maintenance_update();
 }
-
-// Internal function to update range statistics with new gyro data
-static void sensor_update_range_stats_gyro(const float g[3])
-{
-	if (!range_stats.initialized) {
-		range_stats.initialized = true;
-	}
-	for (int i = 0; i < 3; i++) {
-		if (g[i] > range_stats.gyro_max[i]) {
-			range_stats.gyro_max[i] = g[i];
-		}
-		if (g[i] < range_stats.gyro_min[i]) {
-			range_stats.gyro_min[i] = g[i];
-		}
-	}
-}
-
-// Internal function to update range statistics with new accel data
-static void sensor_update_range_stats_accel(const float a[3])
-{
-	if (!range_stats.initialized) {
-		range_stats.initialized = true;
-	}
-	for (int i = 0; i < 3; i++) {
-		if (a[i] > range_stats.accel_max[i]) {
-			range_stats.accel_max[i] = a[i];
-		}
-		if (a[i] < range_stats.accel_min[i]) {
-			range_stats.accel_min[i] = a[i];
-		}
-	}
-	range_stats.sample_count++;
-}
-
-void sensor_print_range_stats(void)
-{
-	if (!range_stats.initialized) {
-		printk("Range statistics not initialized (no data collected yet)\n");
-		return;
-	}
-
-	printk("\n=== Sensor Range Statistics ===\n");
-	printk("Total samples: %llu\n", range_stats.sample_count);
-
-	printk("\nGyroscope (deg/s):\n");
-	printk(
-		"  X: min=%.2f, max=%.2f, peak=%.2f\n",
-		(double)range_stats.gyro_min[0],
-		(double)range_stats.gyro_max[0],
-		(double)fmaxf(fabsf(range_stats.gyro_min[0]), fabsf(range_stats.gyro_max[0]))
-	);
-	printk(
-		"  Y: min=%.2f, max=%.2f, peak=%.2f\n",
-		(double)range_stats.gyro_min[1],
-		(double)range_stats.gyro_max[1],
-		(double)fmaxf(fabsf(range_stats.gyro_min[1]), fabsf(range_stats.gyro_max[1]))
-	);
-	printk(
-		"  Z: min=%.2f, max=%.2f, peak=%.2f\n",
-		(double)range_stats.gyro_min[2],
-		(double)range_stats.gyro_max[2],
-		(double)fmaxf(fabsf(range_stats.gyro_min[2]), fabsf(range_stats.gyro_max[2]))
-	);
-
-	// Calculate overall peak gyro value
-	float gyro_peak = 0;
-	for (int i = 0; i < 3; i++) {
-		float axis_peak = fmaxf(fabsf(range_stats.gyro_min[i]), fabsf(range_stats.gyro_max[i]));
-		if (axis_peak > gyro_peak) {
-			gyro_peak = axis_peak;
-		}
-	}
-	// Use actual range if available, otherwise fall back to config value
-	float gyro_fs = (gyro_actual_range > 0) ? gyro_actual_range : (float)CONFIG_SENSOR_GYRO_FS;
-	printk("  Overall peak: %.2f deg/s (FS=%.0f)\n", (double)gyro_peak, (double)gyro_fs);
-	if (gyro_peak > gyro_fs * 0.9f) {
-		printk("  WARNING: Peak value exceeds 90%% of full scale!\n");
-	}
-
-	printk("\nAccelerometer (g):\n");
-	printk(
-		"  X: min=%.3f, max=%.3f, peak=%.3f\n",
-		(double)range_stats.accel_min[0],
-		(double)range_stats.accel_max[0],
-		(double)fmaxf(fabsf(range_stats.accel_min[0]), fabsf(range_stats.accel_max[0]))
-	);
-	printk(
-		"  Y: min=%.3f, max=%.3f, peak=%.3f\n",
-		(double)range_stats.accel_min[1],
-		(double)range_stats.accel_max[1],
-		(double)fmaxf(fabsf(range_stats.accel_min[1]), fabsf(range_stats.accel_max[1]))
-	);
-	printk(
-		"  Z: min=%.3f, max=%.3f, peak=%.3f\n",
-		(double)range_stats.accel_min[2],
-		(double)range_stats.accel_max[2],
-		(double)fmaxf(fabsf(range_stats.accel_min[2]), fabsf(range_stats.accel_max[2]))
-	);
-
-	// Calculate overall peak accel value
-	float accel_peak = 0;
-	for (int i = 0; i < 3; i++) {
-		float axis_peak = fmaxf(fabsf(range_stats.accel_min[i]), fabsf(range_stats.accel_max[i]));
-		if (axis_peak > accel_peak) {
-			accel_peak = axis_peak;
-		}
-	}
-	// Use actual range if available, otherwise fall back to config value
-	float accel_fs = (accel_actual_range > 0) ? accel_actual_range : (float)CONFIG_SENSOR_ACCEL_FS;
-	printk("  Overall peak: %.3f g (FS=%.0f)\n", (double)accel_peak, (double)accel_fs);
-	if (accel_peak > accel_fs * 0.9f) {
-		printk("  WARNING: Peak value exceeds 90%% of full scale!\n");
-	}
-
-	printk("================================\n");
-}
-#endif // CONFIG_SENSOR_RANGE_STATS
+#endif

@@ -31,11 +31,6 @@
 #define QMC5883L_ODR_100HZ 0x02
 #define QMC5883L_ODR_200HZ 0x03
 
-#define QMC5883L_ODR_10Hz QMC5883L_ODR_10HZ
-#define QMC5883L_ODR_50Hz QMC5883L_ODR_50HZ
-#define QMC5883L_ODR_100Hz QMC5883L_ODR_100HZ
-#define QMC5883L_ODR_200Hz QMC5883L_ODR_200HZ
-
 #define QMC5883L_RNG_2G 0x00
 #define QMC5883L_RNG_8G 0x01
 
@@ -74,13 +69,11 @@ int qmc5883l_init(float period_s, float *actual_period_s)
 
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_SET_RST, 0x01);
 	if (err) {
-		LOG_ERR("Communication error");
 		return err;
 	}
 
 	err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_2, QMC5883L_ROL_PNT | QMC5883L_INT_ENB);
 	if (err) {
-		LOG_ERR("Communication error");
 		return err;
 	}
 
@@ -94,15 +87,12 @@ void qmc5883l_shutdown(void)
 	oneshot_pending = false;
 	oneshot_failed = false;
 	last_raw_sample_valid = false;
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, QMC5883L_MODE_STANDBY);
-	if (err) {
-		LOG_ERR("Communication error");
-	}
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, QMC5883L_MODE_STANDBY);
 }
 
 int qmc5883l_update_odr(float period_s, float *actual_period_s)
 {
-	int requested_odr_hz; // Truncate fractional Hz before selecting a supported rate.
+	float requested_odr_hz;
 	uint8_t odr_code;
 	uint8_t mode_code;
 
@@ -115,19 +105,19 @@ int qmc5883l_update_odr(float period_s, float *actual_period_s)
 	}
 
 	if (mode_code == QMC5883L_MODE_STANDBY) {
-		odr_code = QMC5883L_ODR_200Hz;
+		odr_code = QMC5883L_ODR_200HZ;
 		period_s = INFINITY;
 	} else if (requested_odr_hz > 100) {
-		odr_code = QMC5883L_ODR_200Hz;
+		odr_code = QMC5883L_ODR_200HZ;
 		period_s = 1.0f / 200;
 	} else if (requested_odr_hz > 50) {
-		odr_code = QMC5883L_ODR_100Hz;
+		odr_code = QMC5883L_ODR_100HZ;
 		period_s = 1.0f / 100;
 	} else if (requested_odr_hz > 10) {
-		odr_code = QMC5883L_ODR_50Hz;
+		odr_code = QMC5883L_ODR_50HZ;
 		period_s = 1.0f / 50;
 	} else {
-		odr_code = QMC5883L_ODR_10Hz;
+		odr_code = QMC5883L_ODR_10HZ;
 		period_s = 1.0f / 10;
 	}
 
@@ -144,7 +134,6 @@ int qmc5883l_update_odr(float period_s, float *actual_period_s)
 		err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, config_code);
 	}
 	if (err) {
-		LOG_ERR("Communication error");
 		last_config_code = 0xff;
 		return err;
 	}
@@ -168,15 +157,12 @@ void qmc5883l_mag_oneshot(void)
 	int err = ssi_reg_write_byte(
 		SENSOR_INTERFACE_DEV_MAG,
 		QMC5883L_CTRL_1,
-		(QMC5883L_OSR_512 << 6) | (QMC5883L_RNG_8G << 4) | (QMC5883L_ODR_200Hz << 2) | QMC5883L_MODE_CONTINUOUS
+		(QMC5883L_OSR_512 << 6) | (QMC5883L_RNG_8G << 4) | (QMC5883L_ODR_200HZ << 2) | QMC5883L_MODE_CONTINUOUS
 	);
 	last_config_code = 0xff;
 	oneshot_failed = err != 0;
 	oneshot_pending = true;
 	oneshot_trigger_ms = k_uptime_get();
-	if (err) {
-		LOG_ERR("Communication error");
-	}
 }
 
 bool qmc5883l_mag_read(float m[3])
@@ -194,14 +180,14 @@ bool qmc5883l_mag_read(float m[3])
 		while ((status & QMC5883L_STATUS_DRDY) == 0) {
 			int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_STATUS, &status);
 			if (err) {
-				LOG_ERR("Communication error");
-				oneshot_pending = false;
-				return false;
+				goto read_error;
+			}
+			if (status & QMC5883L_STATUS_DRDY) {
+				break;
 			}
 			if (k_uptime_get() >= deadline_ms) {
 				LOG_WRN("Data ready status timeout!");
-				oneshot_pending = false;
-				return false;
+				goto read_error;
 			}
 		}
 		oneshot_trigger_ms = 0;
@@ -211,7 +197,7 @@ bool qmc5883l_mag_read(float m[3])
 				LOG_INF("Magnetometer overflow");
 			}
 			last_overflow = true;
-			return false;
+			goto read_error;
 		}
 		last_overflow = false;
 	}
@@ -219,7 +205,6 @@ bool qmc5883l_mag_read(float m[3])
 		uint8_t status = 0;
 		int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_STATUS, &status);
 		if (err) {
-			LOG_ERR("Communication error");
 			return false;
 		}
 		if (!(status & QMC5883L_STATUS_DRDY) || (status & QMC5883L_STATUS_OVL)) {
@@ -227,14 +212,18 @@ bool qmc5883l_mag_read(float m[3])
 		}
 	}
 	uint8_t rawData[6];
-	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, QMC5883L_XOUT_L, rawData, 6);
+	int err = was_oneshot ? ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, QMC5883L_XOUT_L, rawData, 6)
+			      : ssi_burst_read_frame(SENSOR_INTERFACE_DEV_MAG, QMC5883L_XOUT_L, 0, 2, rawData, 6);
 	if (err) {
-		LOG_ERR("Communication error");
+		goto read_error;
+	}
+	if (was_oneshot && ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, QMC5883L_MODE_STANDBY)) {
 		return false;
 	}
 
 	int64_t now = k_uptime_get();
-	if (last_raw_sample_valid && memcmp(rawData, last_raw_sample, 6) == 0) {
+	if (!was_oneshot && sensor_interface_get_spec(SENSOR_INTERFACE_DEV_MAG) == SENSOR_INTERFACE_SPEC_EXT &&
+	    last_raw_sample_valid && memcmp(rawData, last_raw_sample, 6) == 0) {
 		if ((now - last_mag_time_ms) < (mag_period_ms + mag_period_ms / 10)) {
 			return false;
 		}
@@ -249,6 +238,14 @@ bool qmc5883l_mag_read(float m[3])
 	last_raw_sample_valid = true;
 	qmc5883l_mag_process(rawData, m);
 	return true;
+
+read_error:
+	if (was_oneshot) {
+		oneshot_pending = false;
+		oneshot_trigger_ms = 0;
+		ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, QMC5883L_MODE_STANDBY);
+	}
+	return false;
 }
 
 void qmc5883l_mag_process(uint8_t *raw_m, float m[3])
@@ -272,4 +269,5 @@ const sensor_mag_t sensor_mag_qmc5883l
 
 	   qmc5883l_mag_process,
 	   6,
-	   6};
+	   6,
+	   .cached_poll_safe = false};

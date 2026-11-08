@@ -12,6 +12,9 @@
 #include <stdint.h>
 
 #if CONFIG_SENSOR_USE_TCAL
+_Static_assert(CONFIG_SENSOR_POLY_TEMP_MAX > CONFIG_SENSOR_POLY_TEMP_MIN,
+	       "Temperature calibration maximum must exceed minimum");
+
 // A single point in temperature calibration data
 struct TempCalPoint {
 	float temp;    // The temperature for this point
@@ -19,6 +22,11 @@ struct TempCalPoint {
 };
 #endif
 
+/* Retention is checked by build timestamp and CRC, not a schema version.
+ * A different firmware build normally invalidates the old layout. Layout
+ * changes also move the CRC, but do not guarantee rejection on their own.
+ * Invalid data resets retained-only runtime state, including watchdog data.
+ * When NVS is available, startup reloads surviving persistent values. */
 struct retained_data {
 	/* The build version of the firmware that last updated the
 	 * retained data.
@@ -59,18 +67,18 @@ struct retained_data {
 	uint8_t reboot_counter;
 	uint8_t paired_addr[8];
 
-	uint8_t sensor_data[128];
-
-	float accelBias[3];
 	float gyroBias[3];
-	float magBias[3];
 	float magBAinv[4][3];
 	float accBAinv[4][3];
 	float gyroSensScale[3]; // Gyro sensitivity
 
 
 	uint8_t fusion_id; // fusion_data_stored
-	uint8_t fusion_data[784];
+#if CONFIG_SENSOR_VQF_OUTPUT_OBSERVER
+	uint8_t fusion_data[904]; // VQF v2: native state+coeffs and output LP+actual yaw gauge
+#else
+	uint8_t fusion_data[840]; // VQF v1 or other fusion implementations
+#endif
 
 	uint16_t imu_addr;
 	uint16_t mag_addr;
@@ -102,7 +110,6 @@ struct retained_data {
 		(int)((CONFIG_SENSOR_POLY_TEMP_MAX - CONFIG_SENSOR_POLY_TEMP_MIN) * CONFIG_SENSOR_POLY_STEPS_PER_DEGREE)
 		struct TempCalPoint tempCalPoints[TCAL_BUFFER_SIZE];
 	float tempCalCoeffs[3][CONFIG_SENSOR_POLY_DEGREE + 1];
-	float tempCalCorrectionOffset[3];
 
 	struct {
 		uint16_t count;
@@ -152,7 +159,7 @@ struct retained_data {
 /* For simplicity in the sample just allow anybody to see and
  * manipulate the retained state.
  */
-extern struct retained_data *retained;
+extern struct retained_data *const retained;
 
 /* Check whether the retained data is valid, and if not reset it.
  *
@@ -160,6 +167,11 @@ extern struct retained_data *retained;
  * from previous sessions.
  */
 bool retained_validate(void);
+
+/* Reset retained data to the same defaults used for invalid retained state.
+ * The current uptime becomes the start of the new accounting interval.
+ */
+void retained_reset(void);
 
 /* Update any generic retained state and recalculate its checksum so
  * subsequent boots can verify the retained state.

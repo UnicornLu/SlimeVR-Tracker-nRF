@@ -39,8 +39,10 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <zephyr/logging/log.h>
 
 #include "BMM350.h"
+#include "mag_frame.h"
 
 #define BMM350_OTP_WORDS 32
+#define BMM350_TEMP_REFRESH_MS 1000
 #define BMM350_XY_SENSITIVITY 0.007069979f
 #define BMM350_Z_SENSITIVITY 0.007174964f
 #define BMM350_TEMP_SENSITIVITY 0.000981282f
@@ -65,6 +67,8 @@ static float last_temperature_c = 25.0f;
 static uint16_t last_state = UINT16_MAX;
 static bool oneshot_pending;
 static bool oneshot_failed;
+static struct mag_frame_filter frame_filter;
+static int64_t temperature_refresh_ms;
 
 LOG_MODULE_REGISTER(BMM350, LOG_LEVEL_DBG);
 
@@ -95,12 +99,21 @@ static int bmm3_wait_pmu(uint8_t command, int32_t timeout_ms)
 			return err;
 		}
 		if (status & 0x10) {
+			LOG_ERR("PMU command 0x%02x failed, status 0x%02x", (unsigned int)command,
+				(unsigned int)status);
 			return -EIO;
 		}
 		if (!(status & 0x01)) {
-			return ((status >> 5) & 0x07) == command ? 0 : -EIO;
+			if (((status >> 5) & 0x07) != command) {
+				LOG_ERR("PMU command 0x%02x returned status 0x%02x", (unsigned int)command,
+					(unsigned int)status);
+				return -EIO;
+			}
+			return 0;
 		}
 		if (k_uptime_get() >= deadline) {
+			LOG_ERR("PMU command 0x%02x timeout, status 0x%02x", (unsigned int)command,
+				(unsigned int)status);
 			return -ETIMEDOUT;
 		}
 		k_msleep(1);
@@ -133,6 +146,8 @@ static int bmm3_read_otp_word(uint8_t index, uint16_t *word)
 			return err;
 		}
 		if (status & BMM350_OTP_STATUS_ERROR) {
+			LOG_ERR("OTP word %u failed, status 0x%02x", (unsigned int)index,
+				(unsigned int)status);
 			return -EIO;
 		}
 		if (status & BMM350_OTP_STATUS_CMD_DONE) {
@@ -141,6 +156,7 @@ static int bmm3_read_otp_word(uint8_t index, uint16_t *word)
 		}
 	}
 	if (!ready) {
+		LOG_ERR("OTP word %u timeout", (unsigned int)index);
 		return -ETIMEDOUT;
 	}
 
@@ -242,6 +258,8 @@ int bmm3_init(float time, float *actual_time)
 	oneshot_failed = false;
 	compensation_valid = false;
 	last_temperature_c = 25.0f;
+	temperature_refresh_ms = 0;
+	mag_frame_reset(&frame_filter, 0.0f);
 
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM350_CMD, BMM350_CMD_SOFTRESET);
 	if (err) {
@@ -255,6 +273,7 @@ int bmm3_init(float time, float *actual_time)
 		goto error;
 	}
 	if (chip_id != BMM350_CHIP_ID) {
+		LOG_ERR("Unexpected chip ID 0x%02x", (unsigned int)chip_id);
 		err = -ENODEV;
 		goto error;
 	}
@@ -295,7 +314,6 @@ int bmm3_init(float time, float *actual_time)
 error:
 	last_state = UINT16_MAX;
 	compensation_valid = false;
-	LOG_ERR("Initialization failed: %d", err);
 	return err;
 }
 
@@ -307,10 +325,7 @@ void bmm3_shutdown(void)
 	compensation_valid = false;
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM350_OTP_CMD_REG, BMM350_OTP_CMD_PWR_OFF);
 	if (!err) {
-		err = bmm3_set_power_mode(PMU_CMD_SUS);
-	}
-	if (err) {
-		LOG_ERR("Communication error");
+		bmm3_set_power_mode(PMU_CMD_SUS);
 	}
 }
 
@@ -406,24 +421,54 @@ int bmm3_update_odr(float time, float *actual_time)
 	last_state = state;
 	oneshot_pending = false;
 	oneshot_failed = false;
+	mag_frame_reset(&frame_filter, target_mode == PMU_CMD_NM ? time : 0.0f);
 	*actual_time = time;
 	return 0;
 
 error:
 	last_state = UINT16_MAX;
-	LOG_ERR("Communication error");
 	return err;
 }
 
 void bmm3_mag_oneshot(void)
 {
 	last_state = UINT16_MAX;
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM350_PMU_CMD, PMU_CMD_FM_FAST);
+	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, BMM350_PMU_CMD, PMU_CMD_FM);
 	oneshot_pending = true;
 	oneshot_failed = err != 0;
-	if (err) {
-		LOG_ERR("Communication error");
+}
+
+/*
+ * A free-running hub reads INT_STATUS unobserved, consuming its read-clear
+ * DRDY, and the 13-byte status frame needs 19 hub bytes with per-slot dummy
+ * prefixes. Read XYZ in whole axes from a data address instead: BMM350 halts
+ * data updates only during a burst that starts at a data register.
+ */
+static bool bmm3_mag_read_free_running(float m[3])
+{
+	uint8_t xyz[9];
+	if (ssi_burst_read_frame(SENSOR_INTERFACE_DEV_MAG, BMM350_MAG_X_XLSB, 2, 3, xyz, sizeof(xyz))) {
+		return false;
 	}
+	if (!mag_frame_is_new(&frame_filter, xyz, sizeof(xyz))) {
+		return false;
+	}
+	int64_t now = k_uptime_get();
+	if (temperature_refresh_ms == 0 || now - temperature_refresh_ms >= BMM350_TEMP_REFRESH_MS) {
+		uint8_t raw[3];
+		if (!bmm3_read(BMM350_TEMP_XLSB, raw, sizeof(raw))) {
+			last_temperature_c = bmm3_compensate_temperature(decode_s24(raw));
+			temperature_refresh_ms = now;
+		}
+	}
+	float next_m[3];
+	if (!bmm3_compensate_mag(xyz, last_temperature_c, next_m)) {
+		return false;
+	}
+	m[0] = next_m[0];
+	m[1] = next_m[1];
+	m[2] = next_m[2];
+	return true;
 }
 
 bool bmm3_mag_read(float m[3])
@@ -436,13 +481,19 @@ bool bmm3_mag_read(float m[3])
 		oneshot_failed = false;
 		return false;
 	}
+	if (!oneshot_pending && sensor_interface_mag_free_running()) {
+		if (last_state == UINT16_MAX || (last_state >> 8) != PMU_CMD_NM) {
+			return false;
+		}
+		return bmm3_mag_read_free_running(m);
+	}
 
-	int64_t deadline = k_uptime_get() + 20;
+	/* Normal forced mode can take about 30 ms with eight-sample averaging. */
+	int64_t deadline = k_uptime_get() + 40;
 	uint8_t frame[13];
 	while (true) {
 		int err = bmm3_read(BMM350_INT_STATUS, frame, sizeof(frame));
 		if (err) {
-			LOG_ERR("Communication error");
 			oneshot_pending = false;
 			return false;
 		}
@@ -482,7 +533,6 @@ float bmm3_temp_read(float bias[3])
 	uint8_t raw[3];
 	int err = bmm3_read(BMM350_TEMP_XLSB, raw, sizeof(raw));
 	if (err) {
-		LOG_ERR("Communication error");
 		return NAN;
 	}
 	last_temperature_c = bmm3_compensate_temperature(decode_s24(raw));
@@ -507,4 +557,5 @@ const sensor_mag_t sensor_mag_bmm350
 	   bmm3_temp_read,
 	   bmm3_mag_process,
 	   3,
-	   15};
+	   15,
+	   .cached_poll_safe = false};

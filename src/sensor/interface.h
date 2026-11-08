@@ -31,9 +31,11 @@
 enum sensor_interface_dev
 {
 	SENSOR_INTERFACE_DEV_IMU,
-	SENSOR_INTERFACE_DEV_MAG
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	SENSOR_INTERFACE_DEV_MAG,
+#endif
+	SENSOR_INTERFACE_DEV_COUNT
 };
-#define SENSOR_INTERFACE_DEV_COUNT 2
 
 enum sensor_interface_spec
 {
@@ -43,35 +45,54 @@ enum sensor_interface_spec
 };
 
 typedef struct sensor_ext_ssi {
+	/* Transfers are unreported. The caller owns any operation-level diagnostic. */
 	int (*ext_write)(const uint8_t addr, const uint8_t *buf, uint32_t num_bytes);
-	/* Single I2CM transaction: write num_write bytes (a register address), then
-	 * read num_read register-data bytes. num_read counts register data only;
-	 * any device-internal dummy bytes are an IMU-driver concern, not part of
-	 * this budget. */
+	/* One logical register read, possibly using several physical I2CM
+	 * transactions. num_read includes any device dummy prefixes. */
 	int (*ext_write_read)(const uint8_t addr, const void *write_buf, size_t num_write, void *read_buf, size_t num_read);
-	/* Max register-data bytes readable in one I2CM transaction. Requests longer
-	 * than this are segmented by the interface layer (sub-register advanced by
-	 * the number of data bytes already read). */
+	/* Aggregate read capacity. Longer requests advance by register-data bytes. */
 	uint8_t ext_burst;
-	/* Optional policy hook. Disabling must quiesce pending background reads
-	 * before returning success. NULL means a synchronous-only backend. */
+	/* Physical transaction capacity for per-transaction dummy prefixes.
+	 * Zero uses ext_burst. */
+	uint8_t ext_single_burst;
+	/* Optional unreported policy hook. Disabling must quiesce pending
+	 * background reads before success. NULL means a synchronous-only backend. */
 	int (*ext_set_prefetch)(bool enabled);
+	/* Optional periodic magnetometer frame read in one acquisition. Each
+	 * physical transaction repeats the dummy prefix and carries whole words of
+	 * register data. Returns -EAGAIN instead of waiting for a background
+	 * acquisition, and -E2BIG when the frame cannot fit one acquisition. */
+	int (*ext_read_frame)(const uint8_t addr, uint8_t reg, uint8_t dummy_bytes, uint8_t word_bytes, uint8_t *buf, uint8_t num_bytes);
+	/* Reads repeat in the background without the driver observing them, so a
+	 * read-clear status bit cannot mark new data. */
+	bool ext_free_running;
+	/* Optional pure hint: an unread periodic frame is available. No I/O,
+	 * waiting, or consumption; ext_read_frame remains responsible for reading. */
+	bool (*ext_frame_ready)(void);
 } sensor_ext_ssi_t;
 
 void sensor_interface_register_sensor_imu_spi(struct spi_dt_spec *dev);
 void sensor_interface_register_sensor_imu_i2c(struct i2c_dt_spec *dev);
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_interface_register_sensor_mag_spi(struct spi_dt_spec *dev);
 void sensor_interface_register_sensor_mag_i2c(struct i2c_dt_spec *dev);
 int sensor_interface_register_sensor_mag_ext(uint8_t addr, uint8_t min_burst, uint8_t burst);
+#endif
 
 bool sensor_interface_imu_is_i2c(void);
 
 int sensor_interface_spi_configure(enum sensor_interface_dev dev, uint32_t frequency, uint32_t dummy_reads);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_interface_ext_configure(const sensor_ext_ssi_t *ext);
 const sensor_ext_ssi_t *sensor_interface_ext_get(void);
 /* Direct I2C/SPI is a no-op; EXT requires a configured backend. */
 int sensor_interface_ext_set_prefetch(bool enabled);
+/* True when magnetometer reads may repeat unobserved, consuming read-clear status. */
+bool sensor_interface_mag_free_running(void);
+/* True only for a currently selected EXT backend with a cached frame ready. */
+bool sensor_interface_mag_frame_ready(void);
+#endif
 enum sensor_interface_spec sensor_interface_get_spec(enum sensor_interface_dev dev);
 
 int ssi_write(enum sensor_interface_dev dev, const uint8_t *buf, uint32_t num_bytes);
@@ -80,6 +101,9 @@ int ssi_write_read(enum sensor_interface_dev dev, const void *write_buf, size_t 
 
 int ssi_burst_read(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t *buf, uint32_t num_bytes);
 int ssi_burst_read_dummy(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t dummy_bytes, uint8_t *buf, uint32_t num_bytes);
+/* Periodic data frame: segments only on word boundaries. -EAGAIN is unreported
+ * and means no new acquisition is available yet. */
+int ssi_burst_read_frame(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t dummy_bytes, uint8_t word_bytes, uint8_t *buf, uint32_t num_bytes);
 int ssi_burst_write(enum sensor_interface_dev dev, uint8_t start_addr, const uint8_t *buf, uint32_t num_bytes);
 int ssi_reg_read_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t *value);
 int ssi_reg_write_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t value);

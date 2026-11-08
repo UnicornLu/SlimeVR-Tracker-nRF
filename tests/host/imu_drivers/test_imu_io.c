@@ -1,0 +1,294 @@
+#include <assert.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <hal/nrf_gpio.h>
+
+#include "sensor/imu/ICM42686.h"
+#include "sensor/imu/ICM42688.h"
+#include "sensor/imu/LSM6DSM.h"
+#include "sensor/imu/LSM6DSO.h"
+
+/* DSM/DSO share these active-mode caches with the production LSM6DSV module. */
+uint8_t last_accel_mode = 0xff;
+uint8_t last_gyro_mode = 0xff;
+uint8_t last_accel_odr = 0xff;
+uint8_t last_gyro_odr = 0xff;
+float accel_sensitivity;
+float gyro_sensitivity;
+
+void host_bus_reset(void);
+void host_bus_fail_read(int reg);
+void host_bus_set_register(uint8_t reg, uint8_t value);
+uint8_t host_bus_register(uint8_t reg);
+size_t host_bus_write_count(void);
+uint8_t host_bus_write_reg(size_t index);
+uint8_t host_bus_write_value(size_t index);
+uint8_t host_bus_write_bank(size_t index);
+void host_bus_fail_transaction(size_t transaction);
+size_t host_bus_transaction_count(void);
+void host_bus_icm_banked(bool applied_on_failure);
+uint8_t host_bus_current_bank(void);
+void host_bus_fifo(uint8_t reg, bool bytes);
+size_t host_bus_interval_bytes(void);
+unsigned host_bus_gyro_discontinuities(void);
+
+static unsigned writes_value(uint8_t reg, uint8_t value)
+{
+	unsigned count = 0;
+	for (size_t i = 0; i < host_bus_write_count(); i++)
+		count += host_bus_write_reg(i) == reg && host_bus_write_value(i) == value;
+	return count;
+}
+
+struct icm_case {
+	int (*init)(float, float, float, float *, float *);
+	uint16_t (*fifo_read)(uint8_t *, uint16_t);
+	void (*accel_read)(float *);
+	void (*gyro_read)(float *);
+	uint8_t (*drdy)(uint16_t);
+	uint8_t count, clock_pin, accel, gyro, watermark, source;
+	float accel_range, gyro_range;
+};
+
+static void test_icm(const struct icm_case *d)
+{
+	float a, g;
+	host_bus_reset();
+	host_bus_fail_read(d->count);
+	assert(d->init(32768, .0025f, .0025f, &a, &g) == -1);
+	/* Failure must not trigger the internal-clock fallback writes. */
+	assert(writes_value(d->clock_pin, 0) == 0);
+	host_bus_reset();
+	assert(d->init(32768, .0025f, .0025f, &a, &g) == 0);
+	assert(writes_value(d->clock_pin, 0) == 1);
+	host_bus_reset();
+	host_bus_set_register(d->count + 1, 1);
+	assert(d->init(32768, .0025f, .0025f, &a, &g) == 0);
+	assert(writes_value(d->clock_pin, 0) == 0);
+	assert(fabsf(a - .002f * 32000 / 32768) < 1e-7f);
+
+	float v[3];
+	host_bus_reset();
+	host_bus_set_register(d->accel, 0x40);
+	host_bus_set_register(d->accel + 2, 0x80);
+	d->accel_read(v);
+	assert(v[0] == d->accel_range / 2 && v[1] == -d->accel_range && v[2] == 0);
+	host_bus_set_register(d->gyro, 0x40);
+	d->gyro_read(v);
+	assert(v[0] == d->gyro_range / 2);
+	host_bus_fail_read(d->accel);
+	d->accel_read(v);
+	assert(v[0] == 0 && v[1] == 0 && v[2] == 0);
+	host_bus_fail_read(d->gyro);
+	d->gyro_read(v);
+	assert(v[0] == 0 && v[1] == 0 && v[2] == 0);
+	host_bus_fail_read(-1);
+	assert(d->drdy(0xFAB) == (NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW));
+	assert(host_bus_register(d->watermark) == 0xAB);
+	assert(host_bus_register(d->watermark + 1) == 0x0F);
+	assert(host_bus_register(d->source) == 0x04);
+
+	/* Large hardware counts are clamped before multiplication/narrowing. */
+	uint8_t guarded[44];
+	memset(guarded, 0xCC, sizeof(guarded));
+	host_bus_reset();
+	host_bus_fifo(d->count, false);
+	host_bus_set_register(d->count, 0xFF);
+	host_bus_set_register(d->count + 1, 0xFF);
+	assert(d->fifo_read(guarded + 1, 41) == 2);
+	assert(host_bus_interval_bytes() == 40);
+	assert(guarded[0] == 0xCC && guarded[41] == 0xCC && guarded[42] == 0xCC);
+}
+
+
+struct lsm_wom_case {
+	const char *name;
+	int (*init)(float, float, float, float *, float *);
+	void (*update_fs)(float, float, float *, float *);
+	uint8_t (*setup_wom)(void);
+	uint8_t ctrl1, ctrl2, threshold;
+	bool selectable_threshold_scale;
+};
+
+static float lsm_accel_range(uint8_t ctrl1)
+{
+	/* Datasheet FS_XL[1:0] encoding, not the driver's range constants. */
+	static const float ranges_g[] = {2, 16, 4, 8};
+	return ranges_g[(ctrl1 >> 2) & 3];
+}
+
+static void test_lsm_wom(const struct lsm_wom_case *d)
+{
+	const float active_ranges[] = {2, 4, 8, 16};
+	for (size_t i = 0; i < sizeof(active_ranges) / sizeof(active_ranges[0]); i++) {
+		float a_range, g_range, a_period, g_period;
+		host_bus_reset();
+		d->update_fs(active_ranges[i], 1000, &a_range, &g_range);
+		assert(a_range == active_ranges[i] && g_range == 1000);
+		assert(d->init(0, .0025f, .0025f, &a_period, &g_period) == 0);
+		uint8_t active_ctrl1 = host_bus_register(d->ctrl1);
+		uint8_t active_ctrl2 = host_bus_register(d->ctrl2);
+		assert(lsm_accel_range(active_ctrl1) == active_ranges[i]);
+		assert(accel_sensitivity * 32768 == active_ranges[i]);
+		float active_gyro_sensitivity = gyro_sensitivity;
+
+		/*
+		 * Model the register reset performed by sensor_shutdown() before
+		 * sensor_setup_WOM(). Keep the driver caches intact, as in RAM.
+		 * WAKE_UP_DUR (0x5c) resets to zero, including DSO WAKE_THS_W.
+		 */
+		host_bus_reset();
+		assert(d->setup_wom() == (NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW));
+		uint8_t ctrl1 = host_bus_register(d->ctrl1);
+		uint8_t duration = host_bus_register(0x5c);
+		unsigned divisor = d->selectable_threshold_scale && (duration & 0x10) ? 256 : 64;
+		float threshold_mg = (host_bus_register(d->threshold) & 0x3f)
+			* lsm_accel_range(ctrl1) * 1000 / divisor;
+		assert(threshold_mg == 31.25f);
+		assert((ctrl1 >> 4) == 5); /* ODR_XL=0101: 208 Hz, unchanged. */
+		assert(duration == 0); /* No extra wake duration or alternate scale. */
+		assert(accel_sensitivity * 32768 == active_ranges[i]);
+		assert(gyro_sensitivity == active_gyro_sensitivity);
+
+		/*
+		 * Wake reinitialization must restore the saved active full scale
+		 * even at the same ODR; WOM must not replace update_fs()'s cache.
+		 */
+		host_bus_reset();
+		assert(d->init(0, .0025f, .0025f, &a_period, &g_period) == 0);
+		assert(host_bus_register(d->ctrl1) == active_ctrl1);
+		assert(host_bus_register(d->ctrl2) == active_ctrl2);
+		assert(lsm_accel_range(host_bus_register(d->ctrl1)) == active_ranges[i]);
+		assert(accel_sensitivity * 32768 == active_ranges[i]);
+		assert(gyro_sensitivity == active_gyro_sensitivity);
+		printf("%s: active=%.0fg, WOM=%.2fmg, restored=%.0fg\n",
+		       d->name, active_ranges[i], threshold_mg,
+		       lsm_accel_range(host_bus_register(d->ctrl1)));
+	}
+}
+
+static void test_wom_bus_failures(void)
+{
+	const struct {
+		const char *name;
+		uint8_t (*setup)(void);
+		bool banked;
+	} drivers[] = {
+		{"ICM42686", icm42686_setup_WOM, true},
+		{"ICM42688", icm_setup_WOM, true},
+		{"LSM6DSM", lsm6dsm_setup_WOM, false},
+		{"LSM6DSO", lsm6dso_setup_WOM, false},
+	};
+	for (size_t i = 0; i < sizeof(drivers) / sizeof(drivers[0]); i++) {
+		host_bus_reset();
+		if (drivers[i].banked) host_bus_icm_banked(false);
+		assert(drivers[i].setup() == (NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW));
+		size_t transactions = host_bus_transaction_count();
+		assert(transactions > 0);
+		if (drivers[i].banked) {
+			assert(host_bus_current_bank() == 0);
+			for (size_t j = 0; j < host_bus_write_count(); j++) {
+				uint8_t reg = host_bus_write_reg(j);
+				if (reg >= ICM42688_ACCEL_WOM_X_THR && reg <= ICM42688_ACCEL_WOM_Z_THR)
+					assert(host_bus_write_bank(j) == 4);
+			}
+		}
+		for (size_t failure = 1; failure <= transactions; failure++) {
+			host_bus_reset();
+			if (drivers[i].banked) host_bus_icm_banked(false);
+			host_bus_fail_transaction(failure);
+			assert(drivers[i].setup() == 0xFF);
+			if (drivers[i].banked) {
+				for (size_t j = 0; j < host_bus_write_count(); j++) {
+					uint8_t reg = host_bus_write_reg(j);
+					if (reg >= ICM42688_ACCEL_WOM_X_THR && reg <= ICM42688_ACCEL_WOM_Z_THR)
+						assert(host_bus_write_bank(j) == 4);
+				}
+				if (failure != 10) assert(host_bus_current_bank() == 0);
+			}
+		}
+		if (drivers[i].banked) {
+			for (unsigned applied = 0; applied < 2; applied++) {
+				host_bus_reset();
+				host_bus_icm_banked(applied);
+				host_bus_fail_transaction(6);
+				assert(drivers[i].setup() == 0xFF && host_bus_current_bank() == 0);
+				for (size_t j = 0; j < host_bus_write_count(); j++) {
+					uint8_t reg = host_bus_write_reg(j);
+					assert(reg < ICM42688_ACCEL_WOM_X_THR || reg > ICM42688_ACCEL_WOM_Z_THR);
+				}
+				host_bus_reset();
+				host_bus_icm_banked(applied);
+				host_bus_fail_transaction(10);
+				assert(drivers[i].setup() == 0xFF);
+				assert(writes_value(ICM42688_INT_SOURCE1, 0x07) == 0);
+				assert(writes_value(ICM42688_SMD_CONFIG, 0x01) == 0);
+			}
+		}
+		printf("%s WOM: %zu individual bus failures rejected\n", drivers[i].name, transactions);
+	}
+}
+
+static void test_dso_fifo_discontinuity(void)
+{
+	const uint8_t flags[] = {0, 1U << 5, 1U << 3, 1U << 6};
+	for (size_t i = 0; i < sizeof(flags); i++) {
+		host_bus_reset();
+		host_bus_fifo(LSM6DSO_FIFO_STATUS1, true);
+		host_bus_set_register(LSM6DSO_FIFO_STATUS1, 1);
+		host_bus_set_register(LSM6DSO_FIFO_STATUS1 + 1, flags[i]);
+		uint8_t record[7];
+		assert(lsm6dso_fifo_read(record, sizeof(record)) == 1);
+		assert(host_bus_gyro_discontinuities() == (i >= 2 ? 1U : 0U));
+	}
+	host_bus_reset();
+	host_bus_fail_read(LSM6DSO_FIFO_STATUS1);
+	uint8_t record[7];
+	assert(lsm6dso_fifo_read(record, sizeof(record)) == 0);
+	assert(host_bus_gyro_discontinuities() == 0);
+}
+
+int main(int argc, char **argv)
+{
+	const struct icm_case drivers[] = {
+		{icm_init, icm_fifo_read, icm_accel_read, icm_gyro_read, icm_setup_DRDY,
+		 ICM42688_FIFO_COUNTH, ICM42688_INTF_CONFIG5, ICM42688_ACCEL_DATA_X1,
+		 ICM42688_GYRO_DATA_X1, ICM42688_FIFO_CONFIG2, ICM42688_INT_SOURCE0, 16, 2000},
+		{icm42686_init, icm42686_fifo_read, icm42686_accel_read, icm42686_gyro_read, icm42686_setup_DRDY,
+		 ICM42686_FIFO_COUNTH, ICM42686_INTF_CONFIG5, ICM42686_ACCEL_DATA_X1,
+		 ICM42686_GYRO_DATA_X1, ICM42686_FIFO_CONFIG2, ICM42686_INT_SOURCE0, 32, 4000},
+	};
+	if (argc == 1 || !strcmp(argv[1], "icm")) {
+		for (unsigned i = 0; i < sizeof(drivers) / sizeof(drivers[0]); i++) test_icm(&drivers[i]);
+	}
+
+	if (argc == 1 || !strcmp(argv[1], "lsm")) {
+		test_dso_fifo_discontinuity();
+		float a = -42, g = -43;
+		host_bus_reset();
+		host_bus_fail_read(LSM6DSO_INTERNAL_FREQ_FINE);
+		assert(lsm6dso_init(0, .0025f, .0025f, &a, &g) == -1);
+		assert(a == -42 && g == -43);
+		assert(host_bus_write_count() == 1); /* no ODR/FIFO writes after the failed probe */
+		host_bus_reset();
+		host_bus_set_register(LSM6DSO_INTERNAL_FREQ_FINE, (uint8_t)-10);
+		assert(lsm6dso_init(0, .0025f, .0025f, &a, &g) == 0);
+		assert(a > 0 && g > 0);
+	}
+	if (argc == 1 || !strcmp(argv[1], "wom")) {
+		test_wom_bus_failures();
+		const struct lsm_wom_case wom_drivers[] = {
+			{"LSM6DSM", lsm6dsm_init, lsm6dsm_update_fs, lsm6dsm_setup_WOM,
+			 LSM6DSM_CTRL1, LSM6DSM_CTRL2, LSM6DSM_WAKE_UP_THS, false},
+			{"LSM6DSO", lsm6dso_init, lsm6dso_update_fs, lsm6dso_setup_WOM,
+			 LSM6DSO_CTRL1, LSM6DSO_CTRL2, LSM6DSO_WAKE_UP_THS, true},
+		};
+		for (size_t i = 0; i < sizeof(wom_drivers) / sizeof(wom_drivers[0]); i++)
+			test_lsm_wom(&wom_drivers[i]);
+	}
+	puts("IMU I/O: failed probes, zero-only fallback, full-packet capacity and family behavior pass");
+	return 0;
+}

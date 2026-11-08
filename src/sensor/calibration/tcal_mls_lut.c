@@ -22,10 +22,11 @@
 */
 #include "globals.h"
 #include "sensor/sensor.h"
-#include "system/watchdog.h"
+#include "util.h"
 
 #include <math.h>
 #include <string.h>
+#include <zephyr/kernel.h>
 
 #if CONFIG_CMSIS_DSP
 #include <arm_math.h>
@@ -37,6 +38,29 @@
 
 LOG_MODULE_REGISTER(cal_tcal_mls_lut, LOG_LEVEL_INF);
 
+static K_MUTEX_DEFINE(tcal_mutex);
+static uint32_t model_generation;
+static float build_temperature;
+static bool build_temperature_valid;
+
+void sensor_tcal_lock(void)
+{
+	k_mutex_lock(&tcal_mutex, K_FOREVER);
+}
+
+void sensor_tcal_unlock(void)
+{
+	k_mutex_unlock(&tcal_mutex);
+}
+
+uint32_t sensor_tcal_model_generation(void)
+{
+	sensor_tcal_lock();
+	uint32_t generation = model_generation;
+	sensor_tcal_unlock();
+	return generation;
+}
+
 // =============================================================================
 // T-Cal Moving Least Squares (MLS) Implementation
 // =============================================================================
@@ -46,18 +70,12 @@ LOG_MODULE_REGISTER(cal_tcal_mls_lut, LOG_LEVEL_INF);
 
 // MLS Configuration
 #define MLS_MAX_POINTS 10        // Maximum points to consider for efficiency
-#define MLS_EXTRAP_POINTS 4      // Number of edge points for linear extrapolation (matches LUT)
 
 // =============================================================================
-// MLS Cache - Performance Optimization
+// Exact MLS Memoization
 // =============================================================================
-// Since temperature changes slowly (over seconds), we can cache the MLS result
-// and only recompute when temperature changes significantly.
-// Temperature sensor noise can be ~0.1°C, so we use a larger threshold
-// to avoid unnecessary recomputation.
-//
-// We use multiple cache slots to cover a larger temperature range, which helps
-// when temperature oscillates slightly within a small range.
+// Cache only the result at the exact requested temperature and model generation.
+// Reusing a nearby fit would make canonical grid values depend on query history.
 
 // =============================================================================
 // LUT (Look-Up Table) + Linear Interpolation - O(1) Runtime Lookup
@@ -73,10 +91,10 @@ LOG_MODULE_REGISTER(cal_tcal_mls_lut, LOG_LEVEL_INF);
 // - RAM usage: ~0.9KB for standard 10-45°C range
 //
 // Incremental Build Strategy:
-// - At boot, first build entries within ±2°C of current temperature (priority zone)
-// - Return quickly to allow other threads to run
+// - Schedule entries within ±2°C of current temperature first (priority zone)
+// - Scheduling does no fitting on the caller's gyro path
 // - Continue building remaining entries in small batches during idle time
-// - LUT lookup falls back to MLS for entries not yet computed
+// - Canonical lookup computes at most two missing grid entries on demand
 
 #define MLS_LUT_STEP_SIZE (1.0f / MLS_LUT_STEP_PER_DEGREE)  // 0.5°C
 #define MLS_LUT_TEMP_MIN ((float)CONFIG_SENSOR_POLY_TEMP_MIN)
@@ -99,7 +117,7 @@ typedef struct {
 
 static struct {
 	MlsLutEntry entries[MLS_LUT_SIZE]; // Pre-computed bias values
-	uint32_t version;                   // Point count when LUT was built (for invalidation)
+	uint32_t version;                   // Model generation represented by the LUT
 	bool valid;                         // LUT has at least priority zone computed
 	MlsLutBuildState build_state;       // Current build state
 	int build_next_idx;                 // Next index to compute in background build
@@ -120,25 +138,23 @@ static struct {
 static bool sensor_tcal_lut_compute_entry(int idx);
 
 // =============================================================================
-// Legacy MLS Cache (kept for fallback and LUT building)
+// Exact-temperature MLS cache (shared by direct queries and grid construction)
 // =============================================================================
 
-#define MLS_CACHE_SLOTS 5            // Number of cache slots
-#define MLS_CACHE_TEMP_THRESHOLD 0.5f // Match within this threshold of cached temp
+#define MLS_CACHE_SLOTS 5
 
 typedef struct {
 	float temp;        // Temperature at which cache was computed
 	float bias[3];     // Cached bias values at temp
-	float slope[3];    // Local d(bias)/d(temp) slope used for smooth cached interpolation
 	bool valid;        // Cache validity flag
 } MlsCacheSlot;
 
 static struct {
 	MlsCacheSlot slots[MLS_CACHE_SLOTS]; // Cache slots covering temperature range
-	uint32_t count;                       // Point count when cached (invalidate all if points change)
+	uint32_t generation;                // Model generation represented by cached values
 } mls_cache = {
 	.slots = {{0}},
-	.count = 0
+	.generation = 0
 };
 
 /**
@@ -146,7 +162,7 @@ static struct {
  * Strategy:
  * 1. If an invalid slot exists, use it
  * 2. Find the slot with the largest distance from the query temperature
- *    (this preserves nearby cached values for interpolation)
+ *    (this preserves nearby temperatures likely to be queried again)
  * @param temp Query temperature for the new cache entry
  * @return Best slot index to use
  */
@@ -175,11 +191,13 @@ static int sensor_tcal_cache_select_slot(float temp)
 // =============================================================================
 void sensor_tcal_cache_invalidate(void)
 {
-	// Invalidate legacy cache slots
+	sensor_tcal_lock();
+	// Invalidate exact-temperature cache slots
 	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
 		mls_cache.slots[i].valid = false;
 	}
 	// Invalidate LUT and stop any incremental build in progress
+	mls_lut.version = model_generation;
 	mls_lut.valid = false;
 	mls_lut.build_state = MLS_LUT_BUILD_IDLE;
 	mls_lut.computed_count = 0;
@@ -188,6 +206,22 @@ void sensor_tcal_cache_invalidate(void)
 		mls_lut.entries[i].computed = false;
 	}
 	LOG_DBG("T-Cal cache/LUT invalidated, incremental build stopped");
+	sensor_tcal_unlock();
+}
+
+static void sensor_tcal_schedule_lut_locked(float current_temp);
+
+void sensor_tcal_model_changed(float current_temp)
+{
+	sensor_tcal_lock();
+	model_generation++;
+	sensor_tcal_cache_invalidate();
+	if (v_finite(&current_temp, 1)) {
+		sensor_tcal_schedule_lut_locked(current_temp);
+	} else if (build_temperature_valid) {
+		sensor_tcal_schedule_lut_locked(build_temperature);
+	}
+	sensor_tcal_unlock();
 }
 
 
@@ -206,8 +240,11 @@ void sensor_tcal_cache_invalidate(void)
  * @param bias_out Output: computed 3-axis bias
  * @return 0 on success, -1 if insufficient data
  */
-int sensor_tcal_mls_lookup(float temp, float bias_out[3])
+static int sensor_tcal_mls_lookup_locked(float temp, float bias_out[3])
 {
+	if (!v_finite(&temp, 1)) {
+		return -1;
+	}
 	// Check if we have any calibration data
 	if (retained->tempCalState.count < 1) {
 		LOG_ERR("T-Cal MLS: No calibration data available");
@@ -215,26 +252,19 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 	}
 
 	// Check multi-slot cache:
-	// First, check if point count changed (invalidates all cache slots)
-	if (mls_cache.count != retained->tempCalState.count) {
+	// Content replacement must invalidate even when the point count is unchanged.
+	if (mls_cache.generation != model_generation) {
 		// Invalidate all slots
 		for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
 			mls_cache.slots[i].valid = false;
 		}
-		mls_cache.count = retained->tempCalState.count;
+		mls_cache.generation = model_generation;
 	}
 
 	// Search for a matching cache slot
 	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
-		if (mls_cache.slots[i].valid &&
-		    fabsf(mls_cache.slots[i].temp - temp) < MLS_CACHE_TEMP_THRESHOLD) {
-			// Cache hit - return smoothly interpolated value using cached local slope.
-			// This prevents the output from becoming piecewise-constant within the
-			// cache threshold window (e.g. 36.10C vs 36.20C).
-			float dt = temp - mls_cache.slots[i].temp;
-			for (int axis = 0; axis < 3; axis++) {
-				bias_out[axis] = mls_cache.slots[i].bias[axis] + mls_cache.slots[i].slope[axis] * dt;
-			}
+		if (mls_cache.slots[i].valid && mls_cache.slots[i].temp == temp) {
+			memcpy(bias_out, mls_cache.slots[i].bias, sizeof(float) * 3);
 			return 0;
 		}
 	}
@@ -249,7 +279,6 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 				int slot = sensor_tcal_cache_select_slot(temp);
 				mls_cache.slots[slot].temp = temp;
 				memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
-				memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
 				mls_cache.slots[slot].valid = true;
 				LOG_DBG("T-Cal MLS: Single point at %.2fC (cached in slot %d)", (double)retained->tempCalPoints[i].temp, slot);
 				return 0;
@@ -270,7 +299,6 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 	// This avoids large stack allocations while scanning all buffer entries
 	WeightedPoint points[MLS_MAX_POINTS];
 	int point_count = 0;
-	int total_valid = 0;  // total points passing weight filter
 
 	float bandwidth_sq = MLS_BANDWIDTH * MLS_BANDWIDTH;
 	float min_selected_weight = 0.0f;  // track minimum weight in selected set
@@ -293,7 +321,6 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 			continue;
 		}
 
-		total_valid++;
 
 		if (point_count < MLS_MAX_POINTS) {
 			// Still filling the selection buffer
@@ -353,7 +380,6 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 		int slot = sensor_tcal_cache_select_slot(temp);
 		mls_cache.slots[slot].temp = temp;
 		memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
-		memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
 		mls_cache.slots[slot].valid = true;
 		LOG_DBG(
 			"T-Cal MLS: Clamped to nearest point %.2fC (query %.2fC)",
@@ -367,11 +393,10 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 	if (point_count == 1) {
 		memcpy(bias_out, points[0].bias, sizeof(float) * 3);
 
-		// Cache as a locally constant model (slope = 0)
+		// Cache the exact query result
 		int slot = sensor_tcal_cache_select_slot(temp);
 		mls_cache.slots[slot].temp = temp;
 		memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
-		memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
 		mls_cache.slots[slot].valid = true;
 
 		LOG_DBG(
@@ -437,28 +462,21 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 		int slot = sensor_tcal_cache_select_slot(temp);
 		mls_cache.slots[slot].temp = temp;
 		memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
-		memset(mls_cache.slots[slot].slope, 0, sizeof(mls_cache.slots[slot].slope));
 		mls_cache.slots[slot].valid = true;
 		LOG_DBG("T-Cal MLS: Degenerate case, using weighted average at %.2fC (cached in slot %d)", (double)temp, slot);
 		return 0;
 	}
 
-	// Solve for 'a' (the bias at query temperature) and local slope 'c'
-	// a = (sum_wb * sum_wdt2 - sum_wdtb * sum_wdt) / det
-	// c = (sum_w * sum_wdtb - sum_wdt * sum_wb) / det
-	float slope_out[3];
+	// Solve for 'a', the bias at this exact query temperature.
 	for (int axis = 0; axis < 3; axis++) {
 		double a = (sum_wb[axis] * sum_wdt2 - sum_wdtb[axis] * sum_wdt) / det;
-		double c = (sum_w * sum_wdtb[axis] - sum_wdt * sum_wb[axis]) / det;
 		bias_out[axis] = (float)a;
-		slope_out[axis] = (float)c;
 	}
 
 	// Update cache with computed result (select best slot based on distance)
 	int slot = sensor_tcal_cache_select_slot(temp);
 	mls_cache.slots[slot].temp = temp;
 	memcpy(mls_cache.slots[slot].bias, bias_out, sizeof(float) * 3);
-	memcpy(mls_cache.slots[slot].slope, slope_out, sizeof(float) * 3);
 	mls_cache.slots[slot].valid = true;
 
 	LOG_DBG(
@@ -474,12 +492,20 @@ int sensor_tcal_mls_lookup(float temp, float bias_out[3])
 	return 0;
 }
 
+int sensor_tcal_mls_lookup(float temp, float bias_out[3])
+{
+	sensor_tcal_lock();
+	int result = sensor_tcal_mls_lookup_locked(temp, bias_out);
+	sensor_tcal_unlock();
+	return result;
+}
+
 // =============================================================================
 // LUT Incremental Build Functions
 // =============================================================================
 
 /**
- * Helper function to compute and store a single LUT entry
+ * Compute and publish one LUT entry while holding the model lock.
  * @param idx LUT index to compute
  * @return true if successfully computed, false on error
  */
@@ -497,176 +523,126 @@ static bool sensor_tcal_lut_compute_entry(int idx)
 	float temp = MLS_LUT_IDX_TO_TEMP(idx);
 	float bias[3];
 
-	if (sensor_tcal_mls_lookup(temp, bias) == 0) {
+	if (sensor_tcal_mls_lookup_locked(temp, bias) == 0) {
 		memcpy(mls_lut.entries[idx].bias, bias, sizeof(float) * 3);
 		mls_lut.entries[idx].computed = true;
 		mls_lut.computed_count++;
+		if (mls_lut.computed_count == MLS_LUT_SIZE) {
+			mls_lut.valid = true;
+		}
 		return true;
 	}
 
 	return false;
 }
 
-/**
- * Build priority zone of LUT (±3°C around current temperature)
- * This is called at startup and when calibration points change.
- * Returns quickly after building the priority zone.
- * Background build continues via sensor_tcal_build_lut_continue().
- *
- * @param current_temp Current device temperature
- */
-void sensor_tcal_build_lut_priority(float current_temp)
+/* Model lock held. Schedule the current ±2C priority zone without fitting.
+ * The caller has already invalidated this generation's cache. */
+static void sensor_tcal_schedule_lut_locked(float current_temp)
 {
-	// Check if we have enough points for MLS
+	build_temperature = current_temp;
+	build_temperature_valid = true;
 	if (retained->tempCalState.count < MLS_MIN_POINTS_FOR_FIT) {
-		LOG_INF("T-Cal LUT: Not enough points (%u < %d), LUT disabled",
-		        retained->tempCalState.count, MLS_MIN_POINTS_FOR_FIT);
-		mls_lut.valid = false;
-		mls_lut.build_state = MLS_LUT_BUILD_IDLE;
 		return;
 	}
 
-	int64_t start_time = k_uptime_get();
-
-	// Reset LUT state for fresh build
-	mls_lut.valid = false;
-	mls_lut.version = retained->tempCalState.count;
-	mls_lut.computed_count = 0;
-
-	// Mark all entries as not computed
-	for (int i = 0; i < MLS_LUT_SIZE; i++) {
-		mls_lut.entries[i].computed = false;
-	}
-
-	// Clear legacy cache to force fresh MLS computation
-	for (int i = 0; i < MLS_CACHE_SLOTS; i++) {
-		mls_cache.slots[i].valid = false;
-	}
-	mls_cache.count = 0;
-
-	// Calculate priority zone indices (±3°C around current temp)
-	float priority_temp_min = current_temp - MLS_LUT_PRIORITY_RANGE;
-	float priority_temp_max = current_temp + MLS_LUT_PRIORITY_RANGE;
-
-	// Clamp to LUT range
-	if (priority_temp_min < MLS_LUT_TEMP_MIN) {
-		priority_temp_min = MLS_LUT_TEMP_MIN;
-	}
-	if (priority_temp_max > MLS_LUT_TEMP_MAX) {
-		priority_temp_max = MLS_LUT_TEMP_MAX;
-	}
-
-	mls_lut.priority_idx_min = (int)MLS_LUT_TEMP_TO_IDX(priority_temp_min);
-	mls_lut.priority_idx_max = (int)MLS_LUT_TEMP_TO_IDX(priority_temp_max) + 1;
-
-	// Clamp indices
-	if (mls_lut.priority_idx_min < 0) {
-		mls_lut.priority_idx_min = 0;
-	}
+	mls_lut.version = model_generation;
+	// Clamp before index conversion, including finite temperatures far outside the grid.
+	float center = fmaxf(MLS_LUT_TEMP_MIN, fminf(current_temp, MLS_LUT_TEMP_MAX));
+	float low = fmaxf(MLS_LUT_TEMP_MIN, center - MLS_LUT_PRIORITY_RANGE);
+	float high = fminf(MLS_LUT_TEMP_MAX, center + MLS_LUT_PRIORITY_RANGE);
+	mls_lut.priority_idx_min = (int)MLS_LUT_TEMP_TO_IDX(low);
+	mls_lut.priority_idx_max = (int)MLS_LUT_TEMP_TO_IDX(high) + 1;
 	if (mls_lut.priority_idx_max >= MLS_LUT_SIZE) {
 		mls_lut.priority_idx_max = MLS_LUT_SIZE - 1;
 	}
-
-	LOG_INF("T-Cal LUT: Building priority zone [%d-%d] (%.1f°C to %.1f°C)",
-	        mls_lut.priority_idx_min, mls_lut.priority_idx_max,
-	        (double)priority_temp_min, (double)priority_temp_max);
-
+	mls_lut.build_next_idx = mls_lut.priority_idx_min;
 	mls_lut.build_state = MLS_LUT_BUILD_PRIORITY;
-
-	// Build priority zone entries
-	int priority_count = 0;
-	for (int idx = mls_lut.priority_idx_min; idx <= mls_lut.priority_idx_max; idx++) {
-		if (sensor_tcal_lut_compute_entry(idx)) {
-			priority_count++;
-		}
-
-		// Feed watchdog periodically
-		if (priority_count % 20 == 0) {
-			watchdog_feed(WDT_CHANNEL_CALIBRATION);
-		}
-	}
-
-	// Mark LUT as valid once priority zone is complete
-	mls_lut.valid = true;
-
-	// Set up for background build of remaining entries
-	mls_lut.build_next_idx = 0;
-	mls_lut.build_state = MLS_LUT_BUILD_BACKGROUND;
-
-	int64_t elapsed = k_uptime_get() - start_time;
-	LOG_INF("T-Cal LUT: Priority zone built (%d entries) in %lld ms, background build started",
-	        priority_count, elapsed);
 }
 
 /**
- * Continue building LUT entries in background.
- * Called from calibration_thread main loop.
- * Processes a small batch of entries per call to avoid blocking.
- *
- * @return true if build is complete, false if more work remains
+ * Explicitly rebuild priority entries, then the rest of the LUT. No fitting
+ * here; callers may request a rebuild directly from the gyro collector.
+ */
+void sensor_tcal_build_lut_priority(float current_temp)
+{
+	if (!v_finite(&current_temp, 1)) {
+		return;
+	}
+	sensor_tcal_lock();
+	sensor_tcal_cache_invalidate();
+	sensor_tcal_schedule_lut_locked(current_temp);
+	sensor_tcal_unlock();
+}
+
+/**
+ * Run a bounded batch from the calibration worker, never with an outer
+ * model lock held. Each fit and its publication share one lock acquisition;
+ * mutation between entries restarts the build without publishing stale data.
  */
 bool sensor_tcal_build_lut_continue(void)
 {
-	// Check if build is needed
-	if (mls_lut.build_state != MLS_LUT_BUILD_BACKGROUND) {
-		return true;  // Not in background build state
-	}
-
-	// Check version match
-	if (mls_lut.version != retained->tempCalState.count) {
-		// Points changed, invalidate and stop
-		mls_lut.build_state = MLS_LUT_BUILD_IDLE;
-		mls_lut.valid = false;
-		return true;
-	}
-
-	// Process a batch of entries
-	int computed_this_batch = 0;
-	while (computed_this_batch < MLS_LUT_BATCH_SIZE && mls_lut.build_next_idx < MLS_LUT_SIZE) {
-		int idx = mls_lut.build_next_idx;
-		mls_lut.build_next_idx++;
-
-		// Skip already computed entries (priority zone)
-		if (mls_lut.entries[idx].computed) {
-			continue;
+	for (int work = 0; work < MLS_LUT_BATCH_SIZE; work++) {
+		sensor_tcal_lock();
+		if (mls_lut.build_state != MLS_LUT_BUILD_PRIORITY &&
+		    mls_lut.build_state != MLS_LUT_BUILD_BACKGROUND) {
+			sensor_tcal_unlock();
+			return true;
+		}
+		if (mls_lut.version != model_generation) {
+			sensor_tcal_cache_invalidate();
+			sensor_tcal_unlock();
+			return true;
 		}
 
-		sensor_tcal_lut_compute_entry(idx);
-		computed_this_batch++;
+		if (mls_lut.build_state == MLS_LUT_BUILD_BACKGROUND) {
+			while (mls_lut.build_next_idx < MLS_LUT_SIZE &&
+			       mls_lut.entries[mls_lut.build_next_idx].computed) {
+				mls_lut.build_next_idx++;
+			}
+		}
+		if (mls_lut.build_next_idx >= MLS_LUT_SIZE) {
+			mls_lut.build_state = MLS_LUT_BUILD_COMPLETE;
+			sensor_tcal_unlock();
+			return true;
+		}
+
+		if (!sensor_tcal_lut_compute_entry(mls_lut.build_next_idx)) {
+			sensor_tcal_cache_invalidate();
+			sensor_tcal_unlock();
+			return true;
+		}
+		mls_lut.build_next_idx++;
+		if (mls_lut.build_state == MLS_LUT_BUILD_PRIORITY &&
+		    mls_lut.build_next_idx > mls_lut.priority_idx_max) {
+			mls_lut.valid = true;
+			mls_lut.build_state = MLS_LUT_BUILD_BACKGROUND;
+			mls_lut.build_next_idx = 0;
+		}
+		if (mls_lut.computed_count == MLS_LUT_SIZE) {
+			mls_lut.build_state = MLS_LUT_BUILD_COMPLETE;
+			sensor_tcal_unlock();
+			return true;
+		}
+		sensor_tcal_unlock();
 	}
 
-	// Check if complete
-	if (mls_lut.build_next_idx >= MLS_LUT_SIZE) {
-		mls_lut.build_state = MLS_LUT_BUILD_COMPLETE;
-		return true;
-	}
-
-	// Yield CPU time
 	k_msleep(MLS_LUT_BATCH_YIELD_MS);
 	return false;
 }
 
 // =============================================================================
-// LUT Lookup Function - O(1) Linear Interpolation
+// Canonical Grid Lookup
 // =============================================================================
-/**
- * Fast O(1) lookup using pre-computed LUT with linear interpolation.
- * For entries not yet computed (during incremental build), falls back to -1.
- *
- * @param temp Query temperature
- * @param bias_out Output: interpolated 3-axis bias
- * @return 0 on success, -1 if required entries not computed
- */
-int sensor_tcal_lut_lookup(float temp, float bias_out[3])
+static int sensor_tcal_grid_lookup_locked(float temp, float bias_out[3])
 {
-	// Check LUT validity and version
-	if (!mls_lut.valid || mls_lut.version != retained->tempCalState.count) {
+	if (!v_finite(&temp, 1) || mls_lut.version != model_generation) {
 		return -1;  // LUT not available
 	}
 
 	/* Outside configured LUT range: clamp to nearest edge entry (no slope run-away). */
 	if (temp < MLS_LUT_TEMP_MIN) {
-		if (!mls_lut.entries[0].computed) {
+		if (!sensor_tcal_lut_compute_entry(0)) {
 			return -1;
 		}
 		memcpy(bias_out, mls_lut.entries[0].bias, sizeof(float) * 3);
@@ -674,7 +650,7 @@ int sensor_tcal_lut_lookup(float temp, float bias_out[3])
 	}
 	if (temp > MLS_LUT_TEMP_MAX) {
 		int hi = MLS_LUT_SIZE - 1;
-		if (!mls_lut.entries[hi].computed) {
+		if (!sensor_tcal_lut_compute_entry(hi)) {
 			return -1;
 		}
 		memcpy(bias_out, mls_lut.entries[hi].bias, sizeof(float) * 3);
@@ -701,9 +677,8 @@ int sensor_tcal_lut_lookup(float temp, float bias_out[3])
 		idx_lo = 0;
 	}
 
-	// Check if required entries are computed
-	if (!mls_lut.entries[idx_lo].computed || !mls_lut.entries[idx_hi].computed) {
-		return -1;  // Required entries not yet computed, caller should use MLS fallback
+	if (!sensor_tcal_lut_compute_entry(idx_lo) || !sensor_tcal_lut_compute_entry(idx_hi)) {
+		return -1;
 	}
 
 	// Linear interpolation
@@ -732,21 +707,36 @@ int sensor_tcal_lut_lookup(float temp, float bias_out[3])
 	return 0;
 }
 
-
+int sensor_tcal_curve_lookup(float temp, float bias_out[3])
+{
+	sensor_tcal_lock();
+	int result = sensor_tcal_grid_lookup_locked(temp, bias_out);
+	sensor_tcal_unlock();
+	return result;
+}
 
 MlsLutBuildState sensor_tcal_lut_get_build_state(void)
 {
-	return mls_lut.build_state;
+	sensor_tcal_lock();
+	MlsLutBuildState state = mls_lut.build_state;
+	sensor_tcal_unlock();
+	return state;
 }
 
 bool sensor_tcal_lut_is_valid(void)
 {
-	return mls_lut.valid;
+	sensor_tcal_lock();
+	bool valid = mls_lut.valid && mls_lut.version == model_generation;
+	sensor_tcal_unlock();
+	return valid;
 }
 
 int sensor_tcal_lut_get_computed_count(void)
 {
-	return mls_lut.computed_count;
+	sensor_tcal_lock();
+	int count = mls_lut.computed_count;
+	sensor_tcal_unlock();
+	return count;
 }
 
 

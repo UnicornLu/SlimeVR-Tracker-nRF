@@ -53,7 +53,7 @@ static struct {
 	uint32_t generation, served, episode, last_sample, last_check, suppress;
 	uint32_t summary_time, norm_count;
 	float field, dip, candidate_field, reference_norm, reference_dip;
-	float norm_mean, norm_var, dir_bias, center[3], last_dir[3];
+	float norm_mean, norm_var, dir_bias, center[3], last_dir[3], last_raw[3];
 	uint16_t recent_count, admitted_since_fit;
 	uint16_t operation, cancelled_operation, replacement_operation;
 	uint8_t cancel_reason;
@@ -62,15 +62,41 @@ static struct {
 	bool trusted, dip_known, trial, unchanged, candidate_dip_known;
 	float validation_norm, validation_dip;
 	bool validation_dip_known;
+	struct led_token replacement_feedback;
+	bool replacement_applied, replacement_stored;
+	int replacement_error;
 	struct online_mag_diagnostics diagnostics;
 } online;
+static int online_config_storage_error; /* Serialized by the storage transaction. */
 
 _Static_assert(
 	sizeof(pool) + sizeof(heads) + sizeof(counts) + sizeof(directions) + sizeof(candidate) + sizeof(previous)
 			+ sizeof(replacement) + sizeof(online) + sizeof(online_lock) + sizeof(online_debug)
+			+ sizeof(online_config_storage_error)
 		<= 6272,
 	"online magnetic state must fit the former two-pool budget"
 );
+
+static void replacement_feedback_complete_locked(void)
+{
+	if (online.replacement_feedback.session && online.replacement_applied && online.replacement_stored) {
+		struct led_token token = online.replacement_feedback;
+		online.replacement_feedback = (struct led_token){0};
+		sensor_calibration_result(token, online.replacement_error < 0 ? LED_APPLIED_NOT_SAVED : LED_SUCCESS);
+	}
+}
+
+void magneto_online_feedback_storage(struct led_token feedback, int result)
+{
+	k_spinlock_key_t key = k_spin_lock(&online_lock);
+	if (feedback.session && feedback.session == online.replacement_feedback.session &&
+	    feedback.request_id == online.replacement_feedback.request_id) {
+		online.replacement_error = result;
+		online.replacement_stored = true;
+		replacement_feedback_complete_locked();
+	}
+	k_spin_unlock(&online_lock, key);
+}
 
 static float dot3(const float a[3], const float b[3])
 {
@@ -200,6 +226,7 @@ static void reset_episode_locked(uint32_t now)
 	memset(directions, 0, sizeof(directions));
 	memset(online.center, 0, sizeof(online.center));
 	memset(online.last_dir, 0, sizeof(online.last_dir));
+	memset(online.last_raw, 0, sizeof(online.last_raw));
 	online.recent_count = 0;
 	online.admitted_since_fit = 0;
 	online.dir_bias = 1;
@@ -298,24 +325,55 @@ static void log_snapshot(const char *event, const struct online_mag_diagnostics 
 	}
 }
 
+static bool apply_replacement_locked(void)
+{
+	if (!online.replace_pending) {
+		return false;
+	}
+	memcpy(magBAinv, replacement, sizeof(replacement));
+	online.replace_pending = false;
+	online.trial = false;
+	reference_locked(0, 0);
+	finish_cancel_locked();
+	cal_event_end(online.replacement_operation, CAL_OUTCOME_SUCCESS, CAL_PHASE_APPLIED, CAL_REASON_NONE);
+	online.replacement_operation = 0;
+	online.replacement_applied = true;
+	replacement_feedback_complete_locked();
+	return true;
+}
+
+static bool rollback_cancelled_trial_locked(void)
+{
+	if (online.served == online.generation || !online.trial) {
+		return false;
+	}
+	memcpy(magBAinv, previous, sizeof(previous));
+	online.trial = false;
+	reference_locked(online.dip_known ? online.field : 0, online.dip_known ? online.dip : 0);
+	return true;
+}
+
+/* A disabled magnetometer still has a real sensor-frame model consumer. */
+void magneto_online_apply_pending(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&online_lock);
+	bool applied = apply_replacement_locked();
+	bool rolled_back = rollback_cancelled_trial_locked();
+	if (rolled_back) {
+		finish_cancel_locked();
+	}
+	k_spin_unlock(&online_lock, key);
+	if (applied || rolled_back) {
+		tracker_events_notify();
+	}
+}
+
 /* All live matrix publications after startup happen here/on this sensor call. */
 static void service_locked(uint32_t now)
 {
-	if (online.replace_pending) {
-		memcpy(magBAinv, replacement, sizeof(replacement));
-		online.replace_pending = false;
-		online.trial = false;
-		reference_locked(0, 0);
-		finish_cancel_locked();
-		cal_event_end(online.replacement_operation, CAL_OUTCOME_SUCCESS, CAL_PHASE_APPLIED, CAL_REASON_NONE);
-		online.replacement_operation = 0;
-	}
+	apply_replacement_locked();
 	if (online.served != online.generation) {
-		if (online.trial) {
-			memcpy(magBAinv, previous, sizeof(previous));
-			online.trial = false;
-			reference_locked(online.dip_known ? online.field : 0, online.dip_known ? online.dip : 0);
-		}
+		rollback_cancelled_trial_locked();
 		finish_cancel_locked();
 		/* Cancellation invalidates the fit immediately, but its borrowed
 		 * memory is not reusable until the fitter explicitly releases it. */
@@ -345,13 +403,18 @@ void magneto_online_snapshot_BAinv(float out[4][3])
 	k_spin_unlock(&online_lock, key);
 }
 
-void magneto_online_replace_BAinv_and_reset(const float value[4][3], uint16_t operation_id)
+void magneto_online_replace_BAinv_and_reset(const float value[4][3], uint16_t operation_id, struct led_token feedback)
 {
 	bool calibrated = has_model(value, false);
 	k_spinlock_key_t key = k_spin_lock(&online_lock);
 	const uint8_t reason = operation_id || calibrated ? CAL_REASON_REPLACED : CAL_REASON_RESET;
 	cancel_locked(k_uptime_get_32(), reason);
 	cal_event_end(online.replacement_operation, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLY_PENDING, reason);
+	sensor_calibration_result(online.replacement_feedback, LED_CANCELLED);
+	online.replacement_feedback = feedback;
+	online.replacement_applied = false;
+	online.replacement_stored = false;
+	online.replacement_error = 0;
 	online.replacement_operation = operation_id;
 	memset(&online.diagnostics, 0, sizeof(online.diagnostics));
 	online.updates = 0;
@@ -370,6 +433,8 @@ void magneto_online_replace_BAinv_and_reset(const float value[4][3], uint16_t op
 		finish_cancel_locked();
 		cal_event_end(online.replacement_operation, CAL_OUTCOME_SUCCESS, CAL_PHASE_APPLIED, CAL_REASON_NONE);
 		online.replacement_operation = 0;
+		online.replacement_applied = true;
+		replacement_feedback_complete_locked();
 		reference_locked(0, 0);
 	}
 	k_spin_unlock(&online_lock, key);
@@ -448,11 +513,12 @@ bool sensor_calibration_get_online_mag_debug(void)
 	return enabled;
 }
 
-void sensor_calibration_set_online_mag_debug(bool enabled)
+int sensor_calibration_set_online_mag_debug(bool enabled)
 {
 	k_spinlock_key_t key = k_spin_lock(&online_lock);
 	online_debug = enabled;
 	k_spin_unlock(&online_lock, key);
+	return sensor_operation_result(LED_OWNER_MAG, 0, true);
 }
 
 bool sensor_calibration_get_online_mag_enabled(void)
@@ -463,19 +529,25 @@ bool sensor_calibration_get_online_mag_enabled(void)
 	return enabled;
 }
 
-void sensor_calibration_set_online_mag_enabled(bool enabled)
+int sensor_calibration_set_online_mag_enabled(bool enabled)
 {
+	sys_warm_transaction_begin();
 	uint8_t mode = enabled ? MAG_ONLINE_CALIBRATION_ENABLED : MAG_ONLINE_CALIBRATION_DISABLED;
 	/* Repeated configuration must not discard a candidate or roll back a trial. */
 	if (sensor_calibration_get_online_mag_enabled() == enabled && retained->mag_online_calibration_mode == mode) {
-		return;
+		int err = online_config_storage_error;
+		sys_warm_transaction_end(false);
+		return sensor_operation_result(LED_OWNER_MAG, err, true);
 	}
 	magneto_online_runtime_configure(enabled);
 	if (!enabled) {
 		sensor_calibration_online_mag_retained_clear();
 	}
-	sys_write(MAG_ONLINE_CALIBRATION_ID, &retained->mag_online_calibration_mode, &mode, sizeof(mode));
+	int err = sys_write(MAG_ONLINE_CALIBRATION_ID, &retained->mag_online_calibration_mode, &mode, sizeof(mode));
+	online_config_storage_error = err;
+	sys_warm_transaction_end(false);
 	LOG_INF("Online mag calibration %s (persisted)", enabled ? "enabled" : "disabled");
+	return sensor_operation_result(LED_OWNER_MAG, err, true);
 }
 
 void sensor_calibration_online_mag_retained_save(void)
@@ -493,6 +565,25 @@ void sensor_calibration_online_mag_retained_clear(void)
 	sys_warm_transaction_begin();
 	memset(&retained->onlineMagState, 0, sizeof(retained->onlineMagState));
 	sys_warm_transaction_end(true);
+}
+
+/* Called by reset-all under storage ownership. Retire only transactions
+ * admitted before the clear; do not alter the currently live matrix. */
+void sensor_calibration_online_mag_cancel_pending(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&online_lock);
+	online.trial = false; /* Cancellation must not roll the live matrix back. */
+	cancel_locked(k_uptime_get_32(), CAL_REASON_RESET);
+	cal_event_end(online.replacement_operation, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLY_PENDING, CAL_REASON_RESET);
+	online.replacement_operation = 0;
+	sensor_calibration_result(online.replacement_feedback, LED_CANCELLED);
+	online.replacement_feedback = (struct led_token){0};
+	online.replace_pending = false;
+	online.replacement_applied = false;
+	online.replacement_stored = false;
+	online.updates = 0;
+	k_spin_unlock(&online_lock, key);
+	tracker_events_notify();
 }
 
 void sensor_calibration_online_mag_cold_start(void)
@@ -654,7 +745,10 @@ static bool metrics_pass(bool trusted, bool allow_unchanged, struct evidence *e)
 		= dc >= 12 && (unsigned)__builtin_popcount(dip_poles) >= required_poles && e->diagnostics.dip_count >= 96;
 	e->dip_known = dip_coverage && dip_sq <= 0.0064f;
 	e->old_dip_known = dip_coverage && old_dip_sq <= 0.0064f;
-	if (cells < 12 || (unsigned)__builtin_popcount(poles) < required_poles || e->diagnostics.radial_count < 96) {
+	/* Partial radial coverage still needs both signs of two dominant axes.
+	 * Reference dip deliberately retains the broader coverage above. */
+	unsigned pairs = (poles & (poles >> 1)) & 0x15U;
+	if (cells < 10 || __builtin_popcount(pairs) < 2 || e->diagnostics.radial_count < 96) {
 		e->diagnostics.rejection = ONLINE_MAG_REJECT_COVERAGE;
 		return false;
 	}
@@ -688,7 +782,7 @@ static bool metrics_pass(bool trusted, bool allow_unchanged, struct evidence *e)
  * evaluation; a concurrent reset can only invalidate generation, not reuse them. */
 struct sample_policy {
 	uint32_t generation, episode;
-	float field, dip, candidate_field, center[3], last_dir[3];
+	float field, dip, candidate_field, center[3], last_dir[3], last_raw[3];
 	uint8_t phase;
 	bool trusted, dip_known;
 };
@@ -921,6 +1015,7 @@ void sensor_calibration_online_mag_sample(const float raw[3], const float up[3],
 	};
 	memcpy(p.center, online.center, sizeof(p.center));
 	memcpy(p.last_dir, online.last_dir, sizeof(p.last_dir));
+	memcpy(p.last_raw, online.last_raw, sizeof(p.last_raw));
 	memcpy(matrix, magBAinv, sizeof(matrix));
 	summary_due = ELAPSED(now, online.summary_time) >= 1000U;
 	online.last_sample = now;
@@ -928,7 +1023,8 @@ void sensor_calibration_online_mag_sample(const float raw[3], const float up[3],
 	tracker_events_notify();
 
 	/* No IRQ-off floating point loops, inverse trig, or structural checks. */
-	if (!isfinite(dot3(raw, raw)) || dot3(raw, raw) < 1e-12f) {
+	float raw_sq = dot3(raw, raw);
+	if (!isfinite(raw_sq) || raw_sq < 1e-12f) {
 		if (p.phase != TRAINING) {
 			finish_sample(now, &p, ONLINE_MAG_REJECT_SAMPLE, false, NULL);
 		}
@@ -946,6 +1042,18 @@ void sensor_calibration_online_mag_sample(const float raw[3], const float up[3],
 	}
 	/* Collection geometry is independent of the old correction/reference.
 	 * A stale hard-iron center must not crowd all new samples into one octant. */
+	/* Recentring noisy stationary data can rotate its normalized direction.
+	 * Compare raw chords to the last admission, never to the moving center.
+	 * last_dir is nonzero exactly when an accepted raw history exists. */
+	if (dot3(p.last_dir, p.last_dir) > 0) {
+		float chord[3];
+		for (unsigned i = 0; i < 3; ++i) {
+			chord[i] = raw[i] - p.last_raw[i];
+		}
+		if (dot3(chord, chord) < 0.0004f * fmaxf(raw_sq, dot3(p.last_raw, p.last_raw))) {
+			goto validate;
+		}
+	}
 	for (unsigned i = 0; i < 3; ++i) {
 		dir[i] = raw[i] - p.center[i];
 	}
@@ -979,6 +1087,7 @@ void sensor_calibration_online_mag_sample(const float raw[3], const float up[3],
 			++counts[octant];
 		}
 		memcpy(online.last_dir, dir, sizeof(dir));
+		memcpy(online.last_raw, raw, sizeof(online.last_raw));
 		if (online.phase == TRAINING && trusted && isfinite(field) && field > 0) {
 			online.field = field;
 			online.dip = dip;

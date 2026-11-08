@@ -10,6 +10,7 @@
 #include <string.h>
 #include "system/esb_ota_flash.h"
 #include "vectors.h"
+#include "../led_feedback_stub.h"
 
 #define LOG_INF(...) ((void)0)
 #define LOG_ERR(...) ((void)0)
@@ -27,10 +28,11 @@ static unsigned reads, fail_read, reserve_calls, preparations, copies, reboots;
 static int read_error;
 static int64_t now_ms;
 static uint8_t reported_status;
-uint8_t esb_ota_get_status(void);
+static uint8_t esb_ota_get_status(void);
 static int64_t k_uptime_get(void) { return now_ms; }
 static void k_msleep(int ms) { now_ms += ms; }
-static void ota_send_status(void) { reported_status = esb_ota_get_status(); }
+static void ota_update_led(void);
+static void ota_send_status(void) { reported_status = esb_ota_get_status(); ota_update_led(); }
 
 static int flash_read(const void *dev, uint32_t address, void *buffer, size_t size)
 {
@@ -86,6 +88,7 @@ static void fixture(uint32_t size, uint32_t expected)
 	memset(flash_image, 0xFF, sizeof(flash_image));
 	ota_reboot_pending = 0;
 	ota.state = OTA_STATE_RECEIVING;
+	ota.session_started = true;
 	ota.image_size = ota.bytes_written = size;
 	ota.image_crc32 = expected;
 	ota.staging_base = flash_base;
@@ -93,6 +96,13 @@ static void fixture(uint32_t size, uint32_t expected)
 	read_error = -EIO;
 	now_ms = 0;
 	reported_status = OTA_STATUS_IDLE;
+	memset(led_test_events, 0, sizeof(led_test_events));
+	led_test_quiesced = false;
+	ota_feedback = led_begin(LED_OWNER_RADIO, led_request_id());
+	ota_feedback_revision = 0;
+	ota_feedback_terminal = false;
+	ota_feedback_state = LED_NONE;
+	ota_update_led();
 }
 
 static void valid_full_range_crc(void)
@@ -100,8 +110,10 @@ static void valid_full_range_crc(void)
 	fixture(4, UINT32_MAX); /* CRC32 of FF FF FF FF is legitimately FFFFFFFF. */
 	assert(esb_ota_handle_verify() == 0);
 	assert(reported_status == OTA_STATUS_VERIFY_OK);
+	assert(led_test_events[LED_SUCCESS] == 0);
 	assert(esb_ota_handle_activate() == 0);
 	assert(reported_status == OTA_STATUS_COMPLETE);
+	assert(led_test_events[LED_SUCCESS] == 0);
 	assert(reboots == 1);
 	assert(copies == !OTA_USE_MCUBOOT);
 }
@@ -119,10 +131,12 @@ static void flash_error_blocks_activation(bool after_success, unsigned failing_c
 	assert(esb_ota_handle_verify() == error);
 	assert(reported_status == OTA_STATUS_FLASH_ERROR);
 	assert(reads == failing_chunk);
+	assert(led_test_events[LED_FAILED] == 1);
 	/* Even a transient read error cannot authorize ACTIVATE after I/O recovers. */
 	fail_read = 0;
 	assert(esb_ota_handle_activate() == -EINVAL);
 	assert(reserve_calls == 0 && preparations == 0 && copies == 0 && reboots == 0);
+	assert(led_test_events[LED_REJECTED] == 1 && led_test_events[LED_SUCCESS] == 0);
 }
 
 static void mismatch_blocks_activation(void)

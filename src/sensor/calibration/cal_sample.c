@@ -42,9 +42,23 @@ struct cal_sample_vector {
 	float v[3];
 };
 
-K_MSGQ_DEFINE(accel_sample_queue, sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY, 4);
-K_MSGQ_DEFINE(gyro_sample_queue, sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY, 4);
-K_MSGQ_DEFINE(mag_sample_queue, sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY, 4);
+static char __noinit __aligned(4) _k_fifo_buf_accel_sample_queue[
+	CAL_SAMPLE_QUEUE_CAPACITY * sizeof(struct cal_sample_vector)];
+static STRUCT_SECTION_ITERABLE(k_msgq, accel_sample_queue) =
+	Z_MSGQ_INITIALIZER(accel_sample_queue, _k_fifo_buf_accel_sample_queue,
+		sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY);
+static char __noinit __aligned(4) _k_fifo_buf_gyro_sample_queue[
+	CAL_SAMPLE_QUEUE_CAPACITY * sizeof(struct sensor_gyro_sample)];
+static STRUCT_SECTION_ITERABLE(k_msgq, gyro_sample_queue) =
+	Z_MSGQ_INITIALIZER(gyro_sample_queue, _k_fifo_buf_gyro_sample_queue,
+		sizeof(struct sensor_gyro_sample), CAL_SAMPLE_QUEUE_CAPACITY);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static char __noinit __aligned(4) _k_fifo_buf_mag_sample_queue[
+	CAL_SAMPLE_QUEUE_CAPACITY * sizeof(struct cal_sample_vector)];
+static STRUCT_SECTION_ITERABLE(k_msgq, mag_sample_queue) =
+	Z_MSGQ_INITIALIZER(mag_sample_queue, _k_fifo_buf_mag_sample_queue,
+		sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY);
+#endif
 
 static float latest_accel[3] = {0};
 /* Serialize admission, nonblocking queue publication and session purge. The
@@ -52,21 +66,30 @@ static float latest_accel[3] = {0};
  * preempted before the lock across an end/begin boundary. */
 static struct k_spinlock sample_lock;
 static atomic_t sample_session;
+static uint32_t gyro_sample_sequence;
 #define CAL_SAMPLE_CHANNEL_MASK (CAL_SAMPLE_ACCEL | CAL_SAMPLE_GYRO | CAL_SAMPLE_MAG)
 static bool accel_snapshot_valid;
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+static uint32_t accel_observation_sequence;
+static uint32_t accel_observation_time;
+#endif
+#if CONFIG_SENSOR_TCAL_HEATED
+static int64_t accel_snapshot_time;
+#endif
 
-static void publish_sample_locked(struct k_msgq *queue, const float v[3])
+static void publish_sample_locked(struct k_msgq *queue, const void *sample)
 {
-	float discarded[3];
+	struct sensor_gyro_sample discarded;
 
-	if (k_msgq_put(queue, v, K_NO_WAIT) == -ENOMSG) {
+	if (k_msgq_put(queue, sample, K_NO_WAIT) == -ENOMSG) {
 		/* Explicit overflow policy: discard the oldest queued vector and keep
 		 * the newest one. This is loss, never a duplicate or fabricated sample. */
-		(void)k_msgq_get(queue, discarded, K_NO_WAIT);
-		(void)k_msgq_put(queue, v, K_NO_WAIT);
+		(void)k_msgq_get(queue, &discarded, K_NO_WAIT);
+		(void)k_msgq_put(queue, sample, K_NO_WAIT);
 	}
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 static void publish_sample(struct k_msgq *queue, const float v[3], uint8_t channel)
 {
 	atomic_val_t session = atomic_get(&sample_session);
@@ -79,8 +102,9 @@ static void publish_sample(struct k_msgq *queue, const float v[3], uint8_t chann
 	}
 	k_spin_unlock(&sample_lock, key);
 }
+#endif
 
-static int wait_sample(struct k_msgq *queue, float v[3], k_timeout_t timeout, const char *name)
+static int wait_sample(struct k_msgq *queue, void *v, k_timeout_t timeout, const char *name)
 {
 	if (k_msgq_get(queue, v, timeout) != 0) {
 		LOG_ERR("%s wait timed out", name);
@@ -101,7 +125,12 @@ static void samples_set_channels(uint8_t channels)
 	);
 	k_msgq_purge(&accel_sample_queue);
 	k_msgq_purge(&gyro_sample_queue);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	k_msgq_purge(&mag_sample_queue);
+#else
+	channels &= (uint8_t)~CAL_SAMPLE_MAG;
+#endif
+	gyro_sample_sequence = 0;
 	atomic_set(&sample_session, next | (channels & CAL_SAMPLE_CHANNEL_MASK));
 	k_spin_unlock(&sample_lock, key);
 }
@@ -122,6 +151,13 @@ void sensor_sample_accel(const float a[3])
 	k_spinlock_key_t key = k_spin_lock(&sample_lock);
 	memcpy(latest_accel, a, sizeof(latest_accel));
 	accel_snapshot_valid = true;
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+	accel_observation_sequence++;
+	accel_observation_time = k_uptime_get_32();
+#endif
+	#if CONFIG_SENSOR_TCAL_HEATED
+	accel_snapshot_time = k_uptime_get();
+	#endif
 	if ((session & CAL_SAMPLE_ACCEL) && session == atomic_get(&sample_session)) {
 		publish_sample_locked(&accel_sample_queue, a);
 	}
@@ -147,16 +183,48 @@ bool sensor_peek_accel(float a[3])
 	return valid;
 }
 
-void sensor_sample_gyro(const float g[3])
+#if CONFIG_SENSOR_TCAL_HEATED
+bool sensor_peek_accel_fresh(float a[3], int64_t max_age_ms)
 {
-	publish_sample(&gyro_sample_queue, g, CAL_SAMPLE_GYRO);
+	if (a == NULL || max_age_ms < 0) {
+		return false;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	int64_t age = k_uptime_get() - accel_snapshot_time;
+	bool valid = accel_snapshot_valid && age >= 0 && age <= max_age_ms &&
+	             v_finite(latest_accel, 3);
+	if (valid) {
+		memcpy(a, latest_accel, sizeof(latest_accel));
+	}
+	k_spin_unlock(&sample_lock, key);
+	return valid;
+}
+#endif
+
+void sensor_sample_gyro(const float g[3], float dt)
+{
+	atomic_val_t session = atomic_get(&sample_session);
+	if (!(session & CAL_SAMPLE_GYRO)) {
+		return;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	if (session == atomic_get(&sample_session)) {
+		struct sensor_gyro_sample sample = {
+			.v = {g[0], g[1], g[2]},
+			.dt = dt,
+			.sequence = ++gyro_sample_sequence,
+		};
+		publish_sample_locked(&gyro_sample_queue, &sample);
+	}
+	k_spin_unlock(&sample_lock, key);
 }
 
-int sensor_wait_gyro(float g[3], k_timeout_t timeout)
+int sensor_wait_gyro(struct sensor_gyro_sample *sample, k_timeout_t timeout)
 {
-	return wait_sample(&gyro_sample_queue, g, timeout, "Gyroscope");
+	return wait_sample(&gyro_sample_queue, sample, timeout, "Gyroscope");
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void sensor_sample_mag(const float m[3])
 {
 	publish_sample(&mag_sample_queue, m, CAL_SAMPLE_MAG);
@@ -166,6 +234,7 @@ int sensor_wait_mag(float m[3], k_timeout_t timeout)
 {
 	return wait_sample(&mag_sample_queue, m, timeout, "Magnetometer");
 }
+#endif
 
 static int wait_latest_accel(float a[3], k_timeout_t timeout)
 {
@@ -180,6 +249,28 @@ static int wait_latest_accel(float a[3], k_timeout_t timeout)
 	}
 	return 0;
 }
+
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+int sensor_wait_accel_observation(struct sensor_accel_observation *observation, k_timeout_t timeout)
+{
+	if (wait_latest_accel(observation->v, timeout) != 0) {
+		return -1;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	memcpy(observation->v, latest_accel, sizeof(observation->v));
+	observation->sequence = accel_observation_sequence;
+	observation->observed_ms = accel_observation_time;
+	k_spin_unlock(&sample_lock, key);
+	return 0;
+}
+
+void sensor_discard_pending_accel(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	k_msgq_purge(&accel_sample_queue);
+	k_spin_unlock(&sample_lock, key);
+}
+#endif
 
 bool wait_for_motion(bool motion, int samples)
 {

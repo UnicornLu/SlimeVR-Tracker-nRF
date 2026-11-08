@@ -16,10 +16,10 @@
 #include <hal/nrf_gpio.h>
 
 #include "ICM42686.h"
-#include "icm426xx_hires.h"
+#include "icm_hires.h"
 #include "sensor/sensor_none.h"
 
-#define PACKET_SIZE ICM426XX_HIRES_PACKET_SIZE
+#define PACKET_SIZE ICM_HIRES_PACKET_SIZE
 #define ICM42686_FIFO_COUNT_RECORDS 0x40
 #define ICM42686_FIFO_HIRES_EN 0x10
 #define ICM42686_FIFO_TEMP_EN 0x04
@@ -34,22 +34,7 @@ static const float gyro_sensitivity = 4000.0f / 32768.0f;
 static const float accel_sensitivity_32 = 32.0f / ((uint32_t)2 << 30);  // 32G forced
 static const float gyro_sensitivity_32 = 4000.0f / ((uint32_t)2 << 30); // 4000dps forced
 
-static const float odr_hz[]
-	= {32000.0f, 16000.0f, 8000.0f, 4000.0f, 2000.0f, 1000.0f, 500.0f, 200.0f, 100.0f, 50.0f, 25.0f, 12.5f};
-
-static const uint8_t odrs[]
-	= {ICM42686_AODR_32kHz,
-	   ICM42686_AODR_16kHz,
-	   ICM42686_AODR_8kHz,
-	   ICM42686_AODR_4kHz,
-	   ICM42686_AODR_2kHz,
-	   ICM42686_AODR_1kHz,
-	   ICM42686_AODR_500Hz,
-	   ICM42686_AODR_200Hz,
-	   ICM42686_AODR_100Hz,
-	   ICM42686_AODR_50Hz,
-	   ICM42686_AODR_25Hz,
-	   ICM42686_AODR_12_5Hz};
+#include "icm426xx_odr.h"
 
 static uint8_t last_accel_odr = 0xff;
 static uint8_t last_gyro_odr = 0xff;
@@ -69,6 +54,8 @@ static float fifo_temp;
 static bool fifo_temp_valid;
 
 LOG_MODULE_REGISTER(ICM42686, LOG_LEVEL_DBG);
+
+#include "icm426xx_io.h"
 
 int icm42686_init(
 	float clock_rate,
@@ -146,7 +133,10 @@ int icm42686_init(
 		k_msleep(10);
 
 		uint8_t raw_count[2];
-		ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM42686_FIFO_COUNTH, raw_count, 2);
+		int probe_err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM42686_FIFO_COUNTH, raw_count, 2);
+		if (probe_err) {
+			return probe_err;
+		}
 
 		uint16_t fifo_count = (uint16_t)(raw_count[0] << 8 | raw_count[1]);
 
@@ -174,10 +164,6 @@ int icm42686_init(
 		}
 	}
 
-	if (err) {
-		LOG_ERR("Communication error");
-	}
-
 	return (err < 0 ? err : 0);
 }
 
@@ -189,12 +175,8 @@ void icm42686_shutdown(void)
 	last_accel_mode = 0xff;
 	last_gyro_mode = 0xff;
 
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_DEVICE_CONFIG,
-								 0x01); // soft reset
-
-	if (err) {
-		LOG_ERR("Communication error");
-	}
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_DEVICE_CONFIG,
+			   0x01); // soft reset
 }
 
 void icm42686_update_fs(float accel_range, float gyro_range, float *accel_actual_range, float *gyro_actual_range)
@@ -213,8 +195,6 @@ int icm42686_update_odr(
 	float *gyro_actual_period_s
 )
 {
-	float requested_odr_hz;
-
 	uint8_t accel_fs_bits = ICM42686_AFS_32G;
 	uint8_t gyro_fs_bits = ICM42686_GFS_4000DPS;
 
@@ -230,16 +210,7 @@ int icm42686_update_odr(
 		accel_period_s = 0;
 	} else {
 		accel_mode = ICM42686_aMode_LN;
-		requested_odr_hz = (1.0f / accel_period_s) / clock_scale;
-		size_t selected = 0;
-		for (size_t i = 1; i < ARRAY_SIZE(odr_hz); i++) {
-			if (requested_odr_hz > odr_hz[i]) {
-				break;
-			}
-			selected = i;
-		}
-		accel_odr_bits = odrs[selected];
-		accel_period_s = 1.0f / odr_hz[selected];
+		accel_odr_bits = icm426xx_select_odr((1.0f / accel_period_s) / clock_scale, &accel_period_s);
 	}
 
 	accel_period_s /= clock_scale;
@@ -253,16 +224,7 @@ int icm42686_update_odr(
 		gyro_period_s = 0;
 	} else {
 		gyro_mode = ICM42686_gMode_LN;
-		requested_odr_hz = (1.0f / gyro_period_s) / clock_scale;
-		size_t selected = 0;
-		for (size_t i = 1; i < ARRAY_SIZE(odr_hz); i++) {
-			if (requested_odr_hz > odr_hz[i]) {
-				break;
-			}
-			selected = i;
-		}
-		gyro_odr_bits = odrs[selected];
-		gyro_period_s = 1.0f / odr_hz[selected];
+		gyro_odr_bits = icm426xx_select_odr((1.0f / gyro_period_s) / clock_scale, &gyro_period_s);
 	}
 
 	gyro_period_s /= clock_scale;
@@ -292,7 +254,6 @@ int icm42686_update_odr(
 		last_gyro_odr = 0xff;
 		last_accel_mode = 0xff;
 		last_gyro_mode = 0xff;
-		LOG_ERR("Communication error");
 		return err;
 	}
 
@@ -321,143 +282,35 @@ int icm42686_update_odr(
 
 uint16_t icm42686_fifo_read(uint8_t *data, uint16_t capacity_bytes)
 {
-	fifo_temp_valid = false;
-	uint16_t total_packets = 0;
-	uint16_t packet_count = UINT16_MAX;
-
-	while (packet_count > 0 && capacity_bytes >= PACKET_SIZE) {
-		uint8_t raw_count[2];
-
-		int err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM42686_FIFO_COUNTH, &raw_count[0], 2);
-		if (err) {
-			fifo_temp_valid = false;
-			LOG_ERR("Failed to read FIFO count");
-			return total_packets;
-		}
-
-		packet_count = (uint16_t)(raw_count[0] << 8 | raw_count[1]);
-
-		if (!packet_count) {
-			break;
-		}
-
-		float extra_read_packets = packet_count * fifo_multiplier;
-		packet_count += extra_read_packets;
-
-		uint16_t byte_count = packet_count * PACKET_SIZE;
-		uint16_t packet_capacity = capacity_bytes / PACKET_SIZE;
-
-		if (packet_count > packet_capacity) {
-			LOG_WRN("FIFO read buffer limit reached, %d packets dropped", packet_count - packet_capacity);
-
-			packet_count = packet_capacity;
-			byte_count = packet_count * PACKET_SIZE;
-		}
-
-		err = ssi_burst_read_interval(SENSOR_INTERFACE_DEV_IMU, ICM42686_FIFO_DATA, data, byte_count, PACKET_SIZE);
-
-		if (err) {
-			fifo_temp_valid = false;
-			LOG_ERR("Communication error");
-			return total_packets;
-		}
-		if (!icm426xx_hires_temperature(data, packet_count, &fifo_temp)) {
-			fifo_temp_valid = true;
-		}
-
-		data += packet_count * PACKET_SIZE;
-		capacity_bytes -= packet_count * PACKET_SIZE;
-		total_packets += packet_count;
-	}
-
-	return total_packets;
+	return icm426xx_fifo_read(ICM42686_FIFO_COUNTH, ICM42686_FIFO_DATA, fifo_multiplier,
+		data, capacity_bytes, &fifo_temp, &fifo_temp_valid);
 }
 
 int icm42686_fifo_process(uint16_t index, uint8_t *data, float a[3], float g[3])
 {
 	const uint16_t packet_offset = index * PACKET_SIZE;
 	const uint8_t *packet = &data[packet_offset];
-	return icm426xx_hires_decode(packet, accel_sensitivity_32, gyro_sensitivity_32, a, g);
+	return icm_hires_decode(packet, accel_sensitivity_32, gyro_sensitivity_32, a, g);
 }
 
 void icm42686_accel_read(float a[3])
 {
-	uint8_t raw_accel[6];
-
-	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM42686_ACCEL_DATA_X1, &raw_accel[0], 6);
-
-	if (err) {
-		LOG_ERR("Communication error");
-		memset(a, 0, 3 * sizeof(*a));
-		return;
-	}
-
-	for (int i = 0; i < 3; i++) {
-		a[i] = (int16_t)((((uint16_t)raw_accel[i * 2]) << 8) | raw_accel[1 + (i * 2)]);
-
-		a[i] *= accel_sensitivity;
-	}
+	icm426xx_vector_read(ICM42686_ACCEL_DATA_X1, accel_sensitivity, a);
 }
 
 void icm42686_gyro_read(float g[3])
 {
-	uint8_t raw_gyro[6];
-
-	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM42686_GYRO_DATA_X1, &raw_gyro[0], 6);
-
-	if (err) {
-		LOG_ERR("Communication error");
-		memset(g, 0, 3 * sizeof(*g));
-		return;
-	}
-
-	for (int i = 0; i < 3; i++) {
-		g[i] = (int16_t)((((uint16_t)raw_gyro[i * 2]) << 8) | raw_gyro[1 + (i * 2)]);
-
-		g[i] *= gyro_sensitivity;
-	}
+	icm426xx_vector_read(ICM42686_GYRO_DATA_X1, gyro_sensitivity, g);
 }
 
 float icm42686_temp_read(void)
 {
-	if (fifo_temp_valid) {
-		return fifo_temp;
-	}
-
-	uint8_t raw_temp[2];
-
-	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, ICM42686_TEMP_DATA1, &raw_temp[0], 2);
-
-	if (err) {
-		LOG_ERR("Communication error");
-		return NAN;
-	}
-
-	float temp = (int16_t)((((uint16_t)raw_temp[0]) << 8) | raw_temp[1]);
-
-	temp /= 132.48f;
-	temp += 25;
-
-	return temp;
+	return icm426xx_temp_read(ICM42686_TEMP_DATA1, fifo_temp, fifo_temp_valid);
 }
 
 uint8_t icm42686_setup_DRDY(uint16_t threshold)
 {
-	uint8_t buf[2];
-
-	buf[0] = threshold & 0xFF;
-	buf[1] = (threshold >> 8) & 0x0F;
-
-	int err = ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, ICM42686_FIFO_CONFIG2, buf, 2);
-
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_INT_SOURCE0,
-							  0x04); // FIFO threshold interrupt
-
-	if (err) {
-		LOG_ERR("Communication error");
-	}
-
-	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW;
+	return icm426xx_setup_DRDY(ICM42686_FIFO_CONFIG2, ICM42686_INT_SOURCE0, threshold);
 }
 
 uint8_t icm42686_setup_WOM(void)
@@ -480,10 +333,17 @@ uint8_t icm42686_setup_WOM(void)
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_INTF_CONFIG1,
 							  0x00); // set low power clock
 
+	if (err) {
+		goto fail;
+	}
+
 	k_msleep(1);
 
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_REG_BANK_SEL,
-							  0x04); // select register bank 4
+	err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_REG_BANK_SEL,
+				 0x04); // select register bank 4
+	if (err) {
+		goto restore_bank;
+	}
 
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_ACCEL_WOM_X_THR, 0x08);
 
@@ -493,8 +353,12 @@ uint8_t icm42686_setup_WOM(void)
 
 	k_msleep(1);
 
+restore_bank:
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_REG_BANK_SEL,
-							  0x00); // select register bank 0
+				  0x00); // select register bank 0
+	if (err) {
+		goto fail;
+	}
 
 	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, ICM42686_INT_SOURCE1,
 							  0x07); // enable WOM interrupt
@@ -505,10 +369,13 @@ uint8_t icm42686_setup_WOM(void)
 							  0x01); // enable WOM feature
 
 	if (err) {
-		LOG_ERR("Communication error");
+		goto fail;
 	}
 
 	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW;
+
+fail:
+	return 0xFF;
 }
 
 const sensor_imu_t sensor_imu_icm42686

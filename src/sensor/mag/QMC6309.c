@@ -104,16 +104,13 @@ void qmc_shutdown(void)
 	oneshot_pending = false;
 	oneshot_failed = false;
 	last_raw_sample_valid = false;
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC6309_CTRL_REG_2, SOFT_RESET_MASK);
-	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC6309_CTRL_REG_2, SOFT_RESET_CLEAR);
-	if (err) {
-		LOG_ERR("Communication error");
-	}
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC6309_CTRL_REG_2, SOFT_RESET_MASK);
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC6309_CTRL_REG_2, SOFT_RESET_CLEAR);
 }
 
 int qmc_update_odr(float period_s, float *actual_period_s)
 {
-	int requested_odr_hz; // Truncate fractional Hz before selecting a supported rate.
+	float requested_odr_hz;
 	uint8_t odr_code;
 	uint8_t mode_code;
 
@@ -135,7 +132,7 @@ int qmc_update_odr(float period_s, float *actual_period_s)
 	} else if (requested_odr_hz > 50) {
 		odr_code = ODR_100Hz;
 		period_s = 1.f / 100;
-	} else if (qmc6309h || requested_odr_hz > 25) {
+	} else if (qmc6309h || requested_odr_hz > 10) {
 		/* QMC6309H codes 000/001 are unsupported; QMC6309 uses them for 1/10 Hz. */
 		odr_code = ODR_50Hz;
 		period_s = 1.f / 50;
@@ -166,7 +163,6 @@ int qmc_update_odr(float period_s, float *actual_period_s)
 		);
 	}
 	if (err) {
-		LOG_ERR("Communication error");
 		last_state = 0xff;
 		return err;
 	}
@@ -196,9 +192,6 @@ void qmc_mag_oneshot(void)
 	oneshot_failed = err != 0;
 	oneshot_pending = true;
 	oneshot_trigger_ms = k_uptime_get();
-	if (err) {
-		LOG_ERR("Communication error");
-	}
 }
 
 bool qmc_mag_read(float m[3])
@@ -217,9 +210,11 @@ bool qmc_mag_read(float m[3])
 		while ((status & STAT_DATA_RDY_MASK) == 0) {
 			int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, QMC6309_STAT_REG, &status);
 			if (err) {
-				LOG_ERR("Communication error");
 				oneshot_pending = false;
 				return false;
+			}
+			if (status & STAT_DATA_RDY_MASK) {
+				break;
 			}
 			if (k_uptime_get() >= deadline_ms) {
 				LOG_WRN("Data ready status timeout!");
@@ -242,7 +237,6 @@ bool qmc_mag_read(float m[3])
 		uint8_t status = 0;
 		int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, QMC6309_STAT_REG, &status);
 		if (err) {
-			LOG_ERR("Communication error");
 			return false;
 		}
 		if (!(status & STAT_DATA_RDY_MASK) || (status & STAT_OVERFLOW_MASK)) {
@@ -250,16 +244,15 @@ bool qmc_mag_read(float m[3])
 		}
 	}
 	uint8_t rawData[6];
-	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, QMC6309_OUTX_L_REG, rawData, 6);
+	int err = was_oneshot ? ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, QMC6309_OUTX_L_REG, rawData, 6)
+			      : ssi_burst_read_frame(SENSOR_INTERFACE_DEV_MAG, QMC6309_OUTX_L_REG, 0, 2, rawData, 6);
 	if (err) {
-		LOG_ERR("Communication error");
 		return false;
 	}
-	// Reject byte-identical readings until the cached period plus its integer
-	// 10% margin expires. A new conversion can have identical values, so this
-	// heuristic trades exact freshness detection for bounded duplicate suppression.
+	// External continuous reads lack a status bit, so retain their duplicate heuristic.
 	int64_t now = k_uptime_get();
-	if (last_raw_sample_valid && memcmp(rawData, last_raw_sample, 6) == 0) {
+	if (!was_oneshot && sensor_interface_get_spec(SENSOR_INTERFACE_DEV_MAG) == SENSOR_INTERFACE_SPEC_EXT &&
+	    last_raw_sample_valid && memcmp(rawData, last_raw_sample, 6) == 0) {
 		if ((now - last_mag_time_ms) < (mag_period_ms + mag_period_ms / 10)) {
 			return false;
 		}
@@ -299,4 +292,5 @@ const sensor_mag_t sensor_mag_qmc6309
 
 	   qmc_mag_process,
 	   6,
-	   6};
+	   6,
+	   .cached_poll_safe = false};

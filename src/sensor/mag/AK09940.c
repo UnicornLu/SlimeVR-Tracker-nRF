@@ -3,15 +3,27 @@
 #include <zephyr/logging/log.h>
 
 #include "AK09940.h"
+#include "mag_frame.h"
 
 static const float sensitivity = 10; // nT/LSB
 
+static struct mag_frame_filter frame_filter;
 static uint8_t last_mode_code = 0xff;
 static int64_t oneshot_trigger_ms = 0;
 static bool oneshot_pending;
 static bool oneshot_failed;
 
 LOG_MODULE_REGISTER(AK09940, LOG_LEVEL_DBG);
+
+static int ak_set_mode(uint8_t mode)
+{
+	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, AK09940_CNTL3, MT_LND2 << 5 | MODE_PDM);
+	if (err || mode == MODE_PDM) {
+		return err;
+	}
+	k_busy_wait(100);
+	return ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, AK09940_CNTL3, MT_LND2 << 5 | mode);
+}
 
 int ak_init(float period_s, float *actual_period_s)
 {
@@ -27,15 +39,12 @@ void ak_shutdown(void)
 	last_mode_code = 0xff; // invalidate mode cache
 	oneshot_pending = false;
 	oneshot_failed = false;
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, AK09940_CNTL4, 0x01);
-	if (err) {
-		LOG_ERR("Communication error");
-	}
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, AK09940_CNTL4, 0x01);
 }
 
 int ak_update_odr(float period_s, float *actual_period_s)
 {
-	int requested_odr_hz; // Truncate fractional Hz before selecting a supported rate.
+	float requested_odr_hz;
 	uint8_t mode_code;
 
 	if (period_s <= 0 || period_s == INFINITY) // power down mode or single measurement mode
@@ -79,16 +88,16 @@ int ak_update_odr(float period_s, float *actual_period_s)
 		mode_code = MODE_PDM; // set PDM, oneshot will set SMM
 	}
 
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, AK09940_CNTL3, MT_LND2 << 5 | mode_code);
+	int err = ak_set_mode(mode_code);
 	if (err) {
 		last_mode_code = 0xff;
-		LOG_ERR("Communication error");
 		return err;
 	}
 
 	last_mode_code = requested_mode_code;
 	oneshot_pending = false;
 	oneshot_failed = false;
+	mag_frame_reset(&frame_filter, period_s);
 	*actual_period_s = period_s;
 	return 0;
 }
@@ -96,17 +105,10 @@ int ak_update_odr(float period_s, float *actual_period_s)
 void ak_mag_oneshot(void)
 {
 	last_mode_code = 0xff;
-	int err = ssi_reg_write_byte(
-		SENSOR_INTERFACE_DEV_MAG,
-		AK09940_CNTL3,
-		MT_LND2 << 5 | MODE_SMM
-	); // low-noise drive 2, single measurement
+	int err = ak_set_mode(MODE_SMM);
 	oneshot_trigger_ms = k_uptime_get();
 	oneshot_pending = true;
 	oneshot_failed = err != 0;
-	if (err) {
-		LOG_ERR("Communication error");
-	}
 }
 
 bool ak_mag_read(float m[3])
@@ -118,12 +120,13 @@ bool ak_mag_read(float m[3])
 	}
 
 	uint8_t frame[12];
+	bool free_running = false;
 	if (oneshot_pending) {
-		int64_t deadline_ms = oneshot_trigger_ms + 2;
+		/* LND2 takes up to 3.1 ms; allow for the millisecond trigger quantization. */
+		int64_t deadline_ms = oneshot_trigger_ms + 5;
 		while (true) {
 			int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, AK09940_ST1, frame, sizeof(frame));
 			if (err) {
-				LOG_ERR("Communication error");
 				oneshot_pending = false;
 				return false;
 			}
@@ -137,10 +140,18 @@ bool ak_mag_read(float m[3])
 			}
 		}
 		oneshot_pending = false;
+	} else if (sensor_interface_mag_free_running()) {
+		// Unobserved hub reads consume the read-clear DRDY; detect new data by payload below.
+		if (last_mode_code == 0xff || last_mode_code == MODE_PDM || last_mode_code == MODE_SMM) {
+			return false;
+		}
+		if (ssi_burst_read_frame(SENSOR_INTERFACE_DEV_MAG, AK09940_ST1, 0, 1, frame, sizeof(frame))) {
+			return false;
+		}
+		free_running = true;
 	} else {
 		int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, AK09940_ST1, frame, sizeof(frame));
 		if (err) {
-			LOG_ERR("Communication error");
 			return false;
 		}
 		if (!(frame[0] & AK09940_ST1_DRDY)) {
@@ -149,7 +160,7 @@ bool ak_mag_read(float m[3])
 	}
 
 	uint8_t st2 = frame[11];
-	if (st2 & (AK09940_ST2_INV | AK09940_ST2_DOR)) {
+	if (st2 & AK09940_ST2_INV) {
 		return false;
 	}
 	for (int i = 0; i < 3; i++) {
@@ -157,6 +168,9 @@ bool ak_mag_read(float m[3])
 		if (raw == 0x1ffff) {
 			return false;
 		}
+	}
+	if (free_running && !mag_frame_is_new(&frame_filter, &frame[1], 9)) {
+		return false;
 	}
 	ak_mag_process(&frame[1], m);
 	return true;
@@ -168,7 +182,6 @@ float ak_temp_read(float bias[3])
 	uint8_t rawTemp;
 	int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, AK09940_TMPS, &rawTemp);
 	if (err) {
-		LOG_ERR("Communication error");
 		return NAN;
 	}
 	// Temperature [˚C] = 30 – (TMPS) / 1.7
@@ -201,4 +214,5 @@ const sensor_mag_t sensor_mag_ak09940
 
 	   *ak_mag_process,
 	   12,
-	   12};
+	   12,
+	   .cached_poll_safe = false};

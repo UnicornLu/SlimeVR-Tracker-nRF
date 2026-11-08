@@ -3,9 +3,11 @@
 #include <zephyr/logging/log.h>
 
 #include "LIS3MDL.h"
+#include "mag_frame.h"
 
 static const float sensitivity = 1.0 / 3421; // Always 8G (FS = ±8 gauss: 3421 LSB/Gauss)
 
+static struct mag_frame_filter frame_filter;
 static uint16_t last_state = 0xffff;
 static bool oneshot_pending;
 static bool oneshot_failed;
@@ -32,7 +34,6 @@ int lis3_init(float period_s, float *actual_period_s)
 
 error:
 	last_state = 0xffff;
-	LOG_ERR("Communication error");
 	return (err < 0 ? err : 0);
 }
 
@@ -41,15 +42,12 @@ void lis3_shutdown(void)
 	last_state = 0xffff;
 	oneshot_pending = false;
 	oneshot_failed = false;
-	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS3MDL_CTRL_REG2, 0x04);
-	if (err) {
-		LOG_ERR("Communication error");
-	}
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS3MDL_CTRL_REG2, 0x04);
 }
 
 int lis3_update_odr(float period_s, float *actual_period_s)
 {
-	int requested_odr_hz = 0; // Preserve integer-Hz truncation, including sub-Hz requests.
+	float requested_odr_hz = 0;
 	uint8_t performance_code = OM_UHP;
 	uint8_t odr_code = DO_0_625Hz;
 	uint8_t fast_odr_enabled = 0;
@@ -97,13 +95,13 @@ int lis3_update_odr(float period_s, float *actual_period_s)
 	} else if (requested_odr_hz > 5) {
 		odr_code = DO_10Hz;
 		period_s = 1.0 / 10;
-	} else if (requested_odr_hz > 2.5) {
+	} else if (requested_odr_hz > 2.5f) {
 		odr_code = DO_5Hz;
 		period_s = 1.0 / 5;
-	} else if (requested_odr_hz > 1.25) {
+	} else if (requested_odr_hz > 1.25f) {
 		odr_code = DO_2_5Hz;
 		period_s = 1.0 / 2.5;
-	} else if (requested_odr_hz > 0.625) {
+	} else if (requested_odr_hz > 0.625f) {
 		odr_code = DO_1_25Hz;
 		period_s = 1.0 / 1.25;
 	} else if (requested_odr_hz > 0) {
@@ -149,11 +147,11 @@ int lis3_update_odr(float period_s, float *actual_period_s)
 	last_state = state;
 	oneshot_pending = false;
 	oneshot_failed = false;
+	mag_frame_reset(&frame_filter, mode_code == MD_CONTINUOUS_CONV ? period_s : 0.0f);
 	*actual_period_s = period_s;
 	return 0;
 error:
 	last_state = 0xffff;
-	LOG_ERR("Communication error");
 	return err;
 }
 
@@ -165,13 +163,11 @@ void lis3_mag_oneshot(void)
 	oneshot_failed = err != 0;
 	oneshot_pending = true;
 	oneshot_deadline_ms = k_uptime_get() + 20;
-	if (err) {
-		LOG_ERR("Communication error");
-	}
 }
 
 bool lis3_mag_read(float m[3])
 {
+	bool was_oneshot = oneshot_pending;
 	if (oneshot_pending) {
 		if (oneshot_failed) {
 			oneshot_pending = false;
@@ -183,7 +179,6 @@ bool lis3_mag_read(float m[3])
 		while ((mode & 0x03) == MD_SINGLE_CONV) {
 			int err = ssi_reg_read_byte(SENSOR_INTERFACE_DEV_MAG, LIS3MDL_CTRL_REG3, &mode);
 			if (err) {
-				LOG_ERR("Communication error");
 				oneshot_pending = false;
 				return false;
 			}
@@ -199,9 +194,17 @@ bool lis3_mag_read(float m[3])
 	}
 
 	uint8_t frame[7];
+	if (!was_oneshot && sensor_interface_mag_free_running()) {
+		// Unobserved hub reads consume the read-clear ZYXDA; detect new data by payload.
+		if (ssi_burst_read_frame(SENSOR_INTERFACE_DEV_MAG, LIS3MDL_STATUS_REG, 0, 1, frame, sizeof(frame))
+			|| !mag_frame_is_new(&frame_filter, &frame[1], sizeof(frame) - 1)) {
+			return false;
+		}
+		lis3_mag_process(&frame[1], m);
+		return true;
+	}
 	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, LIS3MDL_STATUS_REG, frame, sizeof(frame));
 	if (err) {
-		LOG_ERR("Communication error");
 		return false;
 	}
 	if (!(frame[0] & LIS3MDL_STATUS_ZYXDA)) {
@@ -217,7 +220,6 @@ float lis3_temp_read(float bias[3])
 	uint8_t rawTemp[2];
 	int err = ssi_burst_read(SENSOR_INTERFACE_DEV_MAG, LIS3MDL_TEMP_OUT_L, &rawTemp[0], 2);
 	if (err) {
-		LOG_ERR("Communication error");
 		return NAN;
 	}
 	// The output value is a signed 16-bit word in two's complement.
@@ -248,4 +250,5 @@ const sensor_mag_t sensor_mag_lis3mdl
 
 	   *lis3_mag_process,
 	   7,
-	   7};
+	   7,
+	   .cached_poll_safe = false};

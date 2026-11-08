@@ -5,70 +5,149 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness/python'))
+from c_extract import extract_block
 
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get("SOURCE_ROOT", HERE.parents[2]))
 
 
 def function(source, name):
-    match = re.search(rf"^(?:static )?(?:void|int|bool|float) {name}\([^;{{]*\)\s*\{{", source, re.M)
-    if match is None:
-        raise ValueError(name)
-    tokens = re.compile(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[{}]', re.S)
-    depth = 0
-    for token in tokens.finditer(source, source.index("{", match.start())):
-        if token.group() == "{":
-            depth += 1
-        elif token.group() == "}":
-            depth -= 1
-            if depth == 0:
-                return source[match.start():token.end()]
-    raise ValueError(name)
+    return extract_block(source, rf"^(?:static )?(?:void|int|bool|float) {re.escape(name)}\([^;{{]*\)\s*\{{")
 
 
 PRELUDE = r'''
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
+#include <float.h>
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifndef CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+#define CONFIG_SENSOR_USE_ACCEL_CALIBRATION 1
+#endif
+#define CONFIG_SENSOR_ACCEL_OVERSAMPLING 1
+#define CONFIG_SENSOR_USE_TCAL 1
+#define CONFIG_SENSOR_TCAL_HEATED 0
+#define CONFIG_SENSOR_POLY_TEMP_MIN 20
+#define CONFIG_SENSOR_POLY_STEPS_PER_DEGREE 1
+#define TCAL_BUFFER_SIZE 16
+#define IS_ENABLED(value) 0
 #include "sensor/calibration/calibration.h"
+#include "sensor/calibration/bias_collect.h"
+#include "sensor/calibration/tcal_mls_lut.h"
 #include "sensor/calibration/mag_common.h"
 #include "connection/tracker_event_protocol.h"
 #define CONFIG_CMSIS_DSP 0
 #define DEBUG 0
 #define K_MSEC(ms) (ms)
 #define SYS_STATUS_CALIBRATION_RUNNING 1
-#define SYS_LED_PRIORITY_SENSOR 1
-#define SYS_LED_PATTERN_OFF 0
-#define SYS_LED_PATTERN_LONG 1
-#define SYS_LED_PATTERN_ON 2
-#define SYS_LED_PATTERN_FLASH 3
-#define SYS_LED_PATTERN_ONESHOT_PROGRESS 4
-#define SYS_LED_PATTERN_ONESHOT_COMPLETE 5
 #define WDT_CHANNEL_CALIBRATION 0
 #define MAIN_MAG_BIAS_ID 1
+#define CAL_SAMPLE_MAG 4
 #define LOG_INF(...) ((void)0)
 #define LOG_WRN(...) ((void)0)
 #define LOG_ERR(...) ((void)0)
+#define LOG_DBG(...) ((void)0)
+#define MAIN_GYRO_TEMP_ID 2
 #define printk(...) ((void)0)
-static struct { double ata[100]; } mag_cal_workspace;
-static struct { float magBAinv[4][3]; } storage;
-static typeof(storage) *retained = &storage;
+#include "sensor/calibration/mag_fit.h"
+struct sensor_accel_observation { float v[3]; uint32_t sequence, observed_ms; };
+union mag_cal_workspace mag_cal_workspace;
+double norm_sum, sample_count;
+static struct {
+    float magBAinv[4][3];
+    struct { unsigned update_count; float last_buf_avg_norm; } onlineMagState;
+    float gyroTemp;
+    struct { bool valid; unsigned count; } tempCalState;
+    struct { float temp, bias[3]; } tempCalPoints[TCAL_BUFFER_SIZE];
+} storage;
+static typeof(storage) *const retained = &storage;
+static float last_manual_sample[3];
+static float live_matrix[4][3], durable_matrix[4][3], raw_queued[3];
+static bool raw_available, invalid_fit, mag_cal_led_pending;
+static unsigned online_resets, metadata_clears;
+static int feedback_storage_result;
 static bool running, admission, inject_motion;
-static int led, mag_wait_error, solver_error;
+static int mag_wait_error, solver_error;
 static int64_t now;
 static unsigned reads, pose_limit, motion_retries, ends, commits, solver_calls, token_reads;
+static unsigned pose_number, accel_sequence, accel_drains;
+static uint32_t first_capture_ms;
 static uint8_t outcome, reason, phase, completion_reason, pending_phase;
 static uint16_t current_operation = 41, pending_operation;
 static float pending_matrix[4][3];
+static bool pending_partial;
+/* Semantic LED leaves: submission is observed per semantic. */
+static unsigned led_results[LED_SEMANTIC_COUNT];
+static unsigned led_requests[LED_SEMANTIC_COUNT];
+static uint32_t led_identity;
+uint32_t led_request_id(void) { return ++led_identity; }
+uint32_t led_event_id(void) { return ++led_identity; }
+struct led_token led_begin(enum led_owner owner, uint32_t request_id) {
+    return (struct led_token){owner, ++led_identity, request_id};
+}
+enum led_admission led_state(struct led_token token, uint32_t revision, enum led_semantic semantic) {
+    (void)token; (void)revision; (void)semantic; return LED_ADMITTED;
+}
+enum led_admission led_result(struct led_token token, uint32_t event_id, enum led_semantic semantic) {
+    (void)event_id;
+    if (token.session) led_results[semantic]++;
+    return LED_ADMITTED;
+}
+enum led_admission led_request_event(enum led_owner owner, uint32_t request_id, uint32_t event_id,
+                                     enum led_semantic semantic) {
+    (void)owner; (void)request_id; (void)event_id;
+    led_requests[semantic]++;
+    return LED_ADMITTED;
+}
 uint16_t sensor_calibration_current_operation(void) { token_reads++; return current_operation; }
+struct led_token sensor_calibration_current_feedback(void) {
+    /* Admission captures the owner token once; a silent request carries none. */
+    return current_operation ? (struct led_token){LED_OWNER_MAG, current_operation, 0} : (struct led_token){0};
+}
+/* Request-generation guard: cal_imu captures before collection; the owner
+ * validates it at commit. */
+static bool generation_valid_result = true;
+uint32_t sensor_calibration_current_generation(void) { return 1; }
+bool sensor_calibration_generation_valid(uint32_t generation) {
+    (void)generation; return generation_valid_result;
+}
+void sensor_calibration_invalidate_requests(void) {}
+/* The manual mag fit write is guarded under a warm storage transaction. */
+static unsigned warm_begin, warm_end, warm_depth;
+void sys_warm_transaction_begin(void) { warm_begin++; warm_depth++; }
+void sys_warm_transaction_mark(uint16_t id, const void *data, size_t size) {
+    (void)id; (void)data; (void)size;
+}
+void sys_warm_transaction_end(bool schedule) {
+    (void)schedule; assert(warm_depth); warm_end++; warm_depth--;
+}
+/* Late storage bookkeeping from the outer warm transaction; the manual
+ * request's captured generation must still own the record. */
+static uint32_t recorded_error_generation;
+static int recorded_error;
+static unsigned recorded_errors;
+void sensor_calibration_record_storage_error(uint32_t generation, int error) {
+    if (error >= 0) return; /* The private owner records only failed receipts. */
+    assert(warm_depth); /* Bookkeeping must land before its storage barrier ends. */
+    assert(generation == sensor_calibration_current_generation());
+    recorded_error_generation = generation; recorded_error = error; recorded_errors++;
+}
+void cal_event_start(uint16_t op, uint8_t p, uint8_t detail) {
+    (void)detail; assert(op == current_operation); pending_phase = p;
+}
 void cal_event_step(uint16_t op, uint8_t p, uint8_t detail) {
     assert(op == current_operation);
     pending_phase = p;
+    if (p == CAL_PHASE_CAPTURE_POSE && first_capture_ms == 0) first_capture_ms = (uint32_t)now;
+    if (p == CAL_PHASE_POSE_DONE) pose_number = detail;
     if (p == CAL_PHASE_RETRY && detail == CAL_REASON_MOTION) {
         assert(ends == 0); motion_retries++;
     }
@@ -83,80 +162,350 @@ void cal_event_set_completion_reason(uint16_t op, uint8_t why) {
 }
 void tracker_events_notify(void) {}
 static int64_t k_uptime_get(void) { return now; }
+static uint32_t k_uptime_get_32(void) { return (uint32_t)now; }
+static float sensor_get_accel_odr(void) { return 100.0f; }
 static void k_msleep(int ms) { now += ms; }
 static void watchdog_feed(int channel) { (void)channel; }
 static void wait_for_threads(void) {}
 static bool get_status(int status) { (void)status; return running; }
 static void set_status(int status, bool value) { (void)status; running=value; }
-static void set_led(int pattern, int priority) { (void)priority; led=pattern; }
 void sensor_calibration_samples_end(void) { admission=false; }
+void sensor_calibration_samples_begin(uint8_t channels) { (void)channels; admission=true; }
+static void sensor_sample_mag(const float m[3]) { memcpy(raw_queued,m,sizeof(raw_queued)); raw_available=true; }
 static void samples_begin(void) { admission=true; }
 static int sensor_wait_mag(float m[3], int timeout) {
-    (void)timeout; assert(admission); m[0]=.5f; m[1]=m[2]=0; return mag_wait_error;
+    (void)timeout; assert(admission);
+    if (raw_available) { memcpy(m,raw_queued,sizeof(raw_queued)); raw_available=false; }
+    else { m[0]=.5f; m[1]=m[2]=0; }
+    return mag_wait_error;
 }
 static int sensor_wait_accel(float a[3], int timeout) {
     (void)timeout;
-    unsigned i = reads++;
-    unsigned pose = i / 700;
+    reads++;
+    unsigned pose = pose_number;
     if (pose >= pose_limit) pose=pose_limit-1;
     memset(a, 0, 3*sizeof(float));
     a[pose % 3] = pose < 3 ? 1 : -1;
-    /* First stationary capture starts after 22 reads. One real vector jump
-     * then stable data exercises retry without mocking the owner decision. */
-    if (inject_motion && i == 22) { a[0]=0; a[1]=1; }
+    if (inject_motion && pending_phase == CAL_PHASE_CAPTURE_POSE && sample_count >= 17) {
+        a[0]=0; a[1]=1; inject_motion=false;
+    }
     now += 2;
     return 0;
 }
-void magneto_center_reset(mag_center_estimator_t *value) { memset(value,0,sizeof(*value)); }
-static void magneto_online_snapshot_BAinv(float out[4][3]) { memcpy(out,storage.magBAinv,sizeof(storage.magBAinv)); }
-static void magneto_online_replace_BAinv_and_reset(const float value[4][3], uint16_t op) {
-    assert(op == current_operation); memcpy(pending_matrix,value,sizeof(pending_matrix)); pending_operation=op;
+static int sensor_wait_accel_observation(struct sensor_accel_observation *observation, int timeout) {
+    int err=sensor_wait_accel(observation->v,timeout);
+    observation->observed_ms=(uint32_t)now;
+    observation->sequence=++accel_sequence;
+    return err;
+}
+static void sensor_discard_pending_accel(void) { accel_drains++; }
+static bool sensor_peek_accel(float a[3]) { (void)a; return false; }
+static float magneto_online_min_dir_change_threshold(void) { return .01f; }
+static void magneto_online_snapshot_BAinv(float out[4][3]) { memcpy(out,live_matrix,sizeof(live_matrix)); }
+static void magneto_online_reset(void) { online_resets++; }
+void sensor_calibration_online_mag_retained_clear(void) {
+    assert(warm_depth);
+    metadata_clears++;
+    memset(&retained->onlineMagState,0,sizeof(retained->onlineMagState));
+}
+static int __attribute__((unused)) calibration_clear_mag_owned(float m[][3], bool write, struct led_token token) {
+    (void)m; (void)write; (void)token;
+    memset(live_matrix,0,sizeof(live_matrix)); memset(retained->magBAinv,0,sizeof(retained->magBAinv));
+    memset(durable_matrix,0,sizeof(durable_matrix)); memset(&retained->onlineMagState,0,sizeof(retained->onlineMagState));
+    return 0;
+}
+int sensor_calibration_request(int id, enum cal_request_origin origin) { (void)id; (void)origin; return 0; }
+static void magneto_online_replace_BAinv_and_reset(const float value[4][3], uint16_t op,
+                                                  struct led_token feedback) {
+    assert(op == current_operation); (void)feedback;
+    memcpy(pending_matrix,value,sizeof(pending_matrix)); pending_operation=op;
+}
+static void magneto_online_feedback_storage(struct led_token feedback, int result) {
+    (void)feedback; feedback_storage_result=result;
 }
 static void sensor_fusion_reset_mag_ref(void) {}
 static void sensor_mag_ref_reset(void) {}
 static void sensor_refresh_sensor_ids(void) {}
-int sensor_calibration_validate_mag(float value[][3], bool restore) { (void)value; (void)restore; return 0; }
+int sensor_calibration_validate_mag(float value[][3], bool restore) {
+    (void)value; (void)restore; return invalid_fit ? -1 : 0;
+}
+static int sys_write_error, warm_flush_error;
+static unsigned sys_writes, warm_flushes;
+static float durable_gyro_temp;
 static int sys_write(int id, void *dst, const void *value, size_t size) {
-    (void)id; memcpy(dst,value,size); return 0;
+    memmove(dst, value, size);
+    sys_writes++;
+    if (id == MAIN_GYRO_TEMP_ID && !sys_write_error) {
+        assert(warm_depth && size == sizeof(durable_gyro_temp));
+        memcpy(&durable_gyro_temp, value, size);
+    }
+    if (id == MAIN_MAG_BIAS_ID && !sys_write_error) memcpy(durable_matrix,value,size);
+    return sys_write_error;
+}
+int sys_flush_warm(void) {
+    assert(warm_depth); warm_flushes++; return warm_flush_error;
 }
 void sensor_calibration_identity_accel(float matrix[4][3]) {
     memset(matrix,0,12*sizeof(float)); matrix[1][0]=matrix[2][1]=matrix[3][2]=1;
 }
-int sensor_calibration_commit_accel(const float matrix[4][3], uint16_t op) {
+int sensor_calibration_commit_accel(const float matrix[4][3], uint16_t op,
+                                   struct led_token feedback, bool partial, uint32_t generation) {
     assert(pending_phase == CAL_PHASE_APPLY_PENDING && ends == 0);
-    commits++; pending_operation=op; memcpy(pending_matrix,matrix,sizeof(pending_matrix)); return 0;
+    assert(feedback.session != 0); /* Manual requests always carry an owner token. */
+    assert(generation == 1); /* Actual worker captured the pre-collection generation. */
+    commits++; pending_operation=op; pending_partial=partial;
+    memcpy(pending_matrix,matrix,sizeof(pending_matrix)); return 0;
 }
 static void magneto_sample(double x,double y,double z,double *ata,double *norm,double *count) {
-    (void)x;(void)y;(void)z;(void)ata; *norm += 1; *count += 1;
+    memcpy(last_manual_sample, (float[3]){x,y,z}, sizeof(last_manual_sample));
+    (void)ata; *norm += sqrt(x*x+y*y+z*z); *count += 1;
 }
 static int magneto_current_calibration(float matrix[4][3],double *ata,double norm,double count) {
     (void)ata;(void)norm; assert(count > 0); solver_calls++;
-    sensor_calibration_identity_accel(matrix); return solver_error;
+    sensor_calibration_identity_accel(matrix); matrix[0][0]=.125f; return solver_error;
+}
+'''
+
+IMU_LEAVES = r'''
+tcal_temp_direction_t tcal_current_direction;
+float tcal_direction_ref_temp, runtime_cal_last_temp;
+static unsigned tcal_lock_depth, model_updates, measured_bias_marks, state_updates;
+static bool tcal_auto_enabled;
+static float measured_gyro[3], measured_temp;
+static float pending_gyro_bias[3];
+static bool pending_persist_gyro;
+static int pending_prior_error;
+static uint32_t pending_generation;
+static struct led_token pending_feedback;
+bool wait_for_motion(bool motion, int samples) { (void)motion; (void)samples; return true; }
+int sensor_offsetBias(float *g, float *temp, float *range) {
+    memcpy(g, measured_gyro, sizeof(measured_gyro));
+    *temp = measured_temp; *range = 0.125f;
+    return 0;
+}
+bool sensor_tcal_get_auto_calibration(void) { return tcal_auto_enabled; }
+void sensor_tcal_lock(void) { tcal_lock_depth++; }
+void sensor_tcal_unlock(void) { assert(tcal_lock_depth); tcal_lock_depth--; }
+void sensor_tcal_refresh_model(void) { assert(tcal_lock_depth); model_updates++; }
+void sensor_tcal_mark_measured_bias(void) { assert(tcal_lock_depth); measured_bias_marks++; }
+void update_tcal_state(void) { assert(warm_depth && !tcal_lock_depth); state_updates++; }
+int sensor_calibration_commit_bias(const float g[3], bool persist,
+                                  uint16_t op, struct led_token feedback, int prior_error,
+                                  uint32_t generation) {
+    assert(pending_phase == CAL_PHASE_APPLY_PENDING && ends == 0 && warm_depth);
+    commits++;
+    memcpy(pending_gyro_bias, g, sizeof(pending_gyro_bias));
+    pending_persist_gyro = persist; pending_operation = op;
+    pending_feedback = feedback; pending_prior_error = prior_error; pending_generation = generation;
+    return 0;
 }
 '''
 
 HELPERS = r'''
-static void sensor_sample_mag_magneto_sample(const float m[3]) {
-    (void)m; sample_count++; /* Acquisition leaf: this test never starts MAG fitting. */
-}
 static void reset_case(void) {
     memset(&storage,0,sizeof(storage)); magneto_reset();
-    running=admission=inject_motion=false; led=0; now=0;
+    memset(live_matrix,0,sizeof(live_matrix)); memset(durable_matrix,0,sizeof(durable_matrix));
+    raw_available=invalid_fit=mag_cal_led_pending=false;
+    online_resets=metadata_clears=0; feedback_storage_result=0;
+    pose_number=accel_sequence=accel_drains=0;
+    first_capture_ms=0;
+    running=admission=inject_motion=false; now=0;
     mag_wait_error=solver_error=0; reads=0; pose_limit=6;
     motion_retries=ends=commits=solver_calls=token_reads=0;
     outcome=reason=phase=completion_reason=pending_phase=0; pending_operation=0;
+    pending_partial=false; memset(led_results,0,sizeof(led_results));
+    memset(led_requests,0,sizeof(led_requests));
+    warm_begin=warm_end=warm_depth=0;
+    recorded_error_generation=0; recorded_error=0; recorded_errors=0;
+    sys_write_error=warm_flush_error=0; sys_writes=warm_flushes=0; durable_gyro_temp=0;
+    tcal_current_direction=TCAL_DIR_UNKNOWN; tcal_direction_ref_temp=NAN;
+    tcal_lock_depth=model_updates=measured_bias_marks=state_updates=0;
+    tcal_auto_enabled=true; measured_temp=25.0f;
+    const float gyro[3]={2.0f,-4.0f,.5f};
+    memcpy(measured_gyro,gyro,sizeof(gyro));
+    memset(pending_gyro_bias,0,sizeof(pending_gyro_bias));
+    pending_persist_gyro=false; pending_prior_error=0; pending_generation=0;
+    pending_feedback=(struct led_token){0}; generation_valid_result=true;
 }
 '''
 
 TESTS = r'''
+static void expect_vector(const float actual[3], const float expected[3]) {
+    for (unsigned axis=0; axis<3; axis++) assert(fabsf(actual[axis]-expected[axis]) < 0.000001f);
+}
+static void test_accel_rest_observations(void) {
+    struct accel_rest_state state={0};
+    struct sensor_accel_observation sample={{1,0,0},0,0};
+    for (unsigned i=0; i<=100; i++) {
+        sample.sequence=i+1; sample.observed_ms=i*20;
+        assert(isAccRest(&sample,sample.observed_ms,100,.02f,&state)==(i==100));
+    }
+    assert(!isAccRest(&sample,2001,100,.02f,&state));
+    sample.v[0]=.9f; sample.sequence++; sample.observed_ms+=20;
+    assert(!isAccRest(&sample,sample.observed_ms,100,.02f,&state));
+    for (unsigned i=1; i<=100; i++) {
+        sample.sequence++; sample.observed_ms+=20;
+        assert(isAccRest(&sample,sample.observed_ms,100,.02f,&state)==(i==100));
+    }
+    sample.sequence++; sample.observed_ms+=101;
+    assert(!isAccRest(&sample,sample.observed_ms,100,.02f,&state));
+    assert(!isAccRest(&sample,sample.observed_ms+101,100,.02f,&state));
+    assert(!state.initialized);
+    state=(struct accel_rest_state){0};
+    sample.observed_ms=UINT32_MAX-999;
+    for (unsigned i=0; i<=100; i++) {
+        sample.sequence++;
+        assert(isAccRest(&sample,sample.observed_ms,100,.02f,&state)==(i==100));
+        sample.observed_ms+=20;
+    }
+}
+static void seed_confirmed_mag(void) {
+    reset_case();
+    const float old[4][3]={{.4f,-.2f,.1f},{1,0,0},{0,1,0},{0,0,1}};
+    memcpy(live_matrix,old,sizeof(old));
+    memcpy(retained->magBAinv,old,sizeof(old));
+    memcpy(durable_matrix,old,sizeof(old));
+    retained->onlineMagState.update_count=8;
+    retained->onlineMagState.last_buf_avg_norm=.52f;
+    mag_cal_led_pending=true;
+    manual_worker_step();
+    assert(online_resets==1 && admission && magneto_progress==0x80);
+    assert(!memcmp(live_matrix,old,sizeof(old)) && !memcmp(retained->magBAinv,old,sizeof(old)));
+    assert(!memcmp(durable_matrix,old,sizeof(old)));
+    assert(retained->onlineMagState.update_count==8 && retained->onlineMagState.last_buf_avg_norm==.52f);
+    assert(sys_writes==0 && metadata_clears==0);
+}
+static void expect_old_mag(void) {
+    const float old[4][3]={{.4f,-.2f,.1f},{1,0,0},{0,1,0},{0,0,1}};
+    assert(!memcmp(live_matrix,old,sizeof(old)) && !memcmp(retained->magBAinv,old,sizeof(old)));
+    assert(!memcmp(durable_matrix,old,sizeof(old)));
+    assert(retained->onlineMagState.update_count==8 && retained->onlineMagState.last_buf_avg_norm==.52f);
+    assert(sys_writes==0 && metadata_clears==0);
+}
+static void prepare_mag_trial(void) {
+    sample_count=MAG_CAL_MIN_SAMPLES-1;
+    norm_sum=.5*sample_count;
+    for (unsigned i=0; i<3; i++) {
+        dir_min[i]=-1; dir_max[i]=1;
+        manual_center_estimator.min[i]=-.5f;
+        manual_center_estimator.max[i]=.5f;
+    }
+    manual_center_estimator.initialized=true;
+}
+static void test_manual_replacement(void) {
+    seed_confirmed_mag();
+    float raw[3]={.7f,.3f,-.1f};
+    sensor_calibration_process_mag(raw);
+    const float raw_expected[3]={.7f,.3f,-.1f};
+    const float corrected[3]={.3f,.5f,-.2f};
+    expect_vector(raw,corrected);
+    manual_worker_step();
+    expect_vector(last_manual_sample,raw_expected);
+    assert(sample_count==1); expect_old_mag();
+    mag_wait_error=-ETIMEDOUT;
+    assert(sensor_calibrate_mag()==-1 && reason==CAL_REASON_SAMPLE_TIMEOUT);
+    expect_old_mag();
+
+    seed_confirmed_mag(); generation_valid_result=false;
+    assert(sensor_calibrate_mag()==-ECANCELED && outcome==CAL_OUTCOME_CANCELLED);
+    expect_old_mag();
+
+    seed_confirmed_mag(); prepare_mag_trial(); solver_error=-EDOM;
+    assert(sensor_calibrate_mag()==1 && ends==0 && admission && running);
+    assert(solver_calls==1 && sample_count==MAG_CAL_MIN_SAMPLES && magneto_progress==0x80);
+    expect_old_mag();
+
+    seed_confirmed_mag(); prepare_mag_trial(); invalid_fit=true;
+    assert(sensor_calibrate_mag()==-1 && reason==CAL_REASON_INVALID_MODEL);
+    expect_old_mag();
+
+    for (int failure=0; failure<2; failure++) {
+        seed_confirmed_mag(); prepare_mag_trial();
+        /* The final .5-norm sample makes the mean exactly 1: scale must be .5, once. */
+        norm_sum=sample_count+.5;
+        sys_write_error=failure ? -EIO : 0;
+        assert(sensor_calibrate_mag()==0);
+        assert(metadata_clears==1 && retained->onlineMagState.update_count==0);
+        assert(pending_operation==current_operation && sys_writes==1);
+        assert(solver_calls==1); /* Publish the successful trial, never solve again. */
+        const float expected[4][3]={{.125f,0,0},{.5f,0,0},{0,.5f,0},{0,0,.5f}};
+        for (unsigned row=0; row<4; row++) expect_vector(pending_matrix[row],expected[row]);
+        assert(!memcmp(retained->magBAinv,pending_matrix,sizeof(pending_matrix)));
+        assert(feedback_storage_result==(failure ? -EIO : 0));
+        if (failure) assert(memcmp(durable_matrix,pending_matrix,sizeof(pending_matrix))!=0);
+        else assert(!memcmp(durable_matrix,pending_matrix,sizeof(pending_matrix)));
+        memcpy(live_matrix,pending_matrix,sizeof(live_matrix)); /* Sensor owner applies the handoff. */
+        assert(!memcmp(live_matrix,retained->magBAinv,sizeof(live_matrix)));
+    }
+}
+static void existing_tcal_point(void) {
+    unsigned slot=TEMP_TO_IDX(measured_temp);
+    retained->tempCalState.count=1;
+    retained->tempCalState.valid=true;
+    retained->tempCalPoints[slot].temp=measured_temp;
+    const float previous[3]={10.0f,2.0f,-3.5f};
+    memcpy(retained->tempCalPoints[slot].bias,previous,sizeof(previous));
+    tcal_quality_t quality;
+    assert(!sensor_tcal_assess_quality(measured_temp,&quality)); /* Sparse coverage forces an update. */
+}
+static void test_imu_tcal_preserves_measured_candidate(void) {
+    static const struct {
+        float reference;
+        tcal_temp_direction_t direction;
+        float blended[3];
+    } cases[] = {
+        {24.0f,TCAL_DIR_RISING,{4.4f,-2.2f,-.7f}},
+        {26.0f,TCAL_DIR_FALLING,{8.8f,1.1f,-2.9f}},
+        {25.0f,TCAL_DIR_UNKNOWN,{6.0f,-1.0f,-1.5f}},
+    };
+    for (unsigned i=0; i<sizeof(cases)/sizeof(cases[0]); i++) {
+        reset_case(); existing_tcal_point();
+        tcal_direction_ref_temp=cases[i].reference;
+        sensor_calibrate_imu();
+        assert(commits==1 && ends==0 && token_reads==1);
+        assert(pending_operation==current_operation && pending_feedback.session==current_operation);
+        assert(pending_generation==1 && !pending_persist_gyro && pending_prior_error==0);
+        expect_vector(pending_gyro_bias,measured_gyro); /* Captured before the worker blends its local vector. */
+        expect_vector(retained->tempCalPoints[TEMP_TO_IDX(measured_temp)].bias,cases[i].blended);
+        assert(tcal_current_direction==cases[i].direction && tcal_direction_ref_temp==measured_temp);
+        assert(retained->tempCalState.count==1 && !retained->tempCalState.valid);
+        assert(retained->tempCalPoints[TEMP_TO_IDX(measured_temp)].temp==measured_temp);
+        assert(retained->gyroTemp==measured_temp && durable_gyro_temp==measured_temp);
+        assert(model_updates==1 && measured_bias_marks==1 && state_updates==1);
+        assert(warm_begin==warm_end && warm_depth==0 && tcal_lock_depth==0);
+        assert(led_results[LED_SUCCESS]==0 && led_results[LED_PARTIAL]==0);
+        assert(led_results[LED_APPLIED_NOT_SAVED]==0 && led_requests[LED_SUCCESS]==0);
+    }
+}
+static void test_imu_tcal_late_storage_failure(void) {
+    reset_case(); existing_tcal_point();
+    tcal_direction_ref_temp=24.0f;
+    warm_flush_error=-ENOSPC;
+    sensor_calibrate_imu();
+    assert(commits==1 && pending_prior_error==0); /* The error did not exist at commit. */
+    assert(sys_writes==1 && warm_flushes==1 && durable_gyro_temp==measured_temp);
+    assert(recorded_errors==1 && recorded_error_generation==pending_generation);
+    assert(recorded_error==-ENOSPC);
+    expect_vector(pending_gyro_bias,measured_gyro);
+    const float blended[3]={4.4f,-2.2f,-.7f};
+    expect_vector(retained->tempCalPoints[TEMP_TO_IDX(measured_temp)].bias,blended);
+    assert(warm_begin==warm_end && warm_depth==0 && tcal_lock_depth==0 && ends==0);
+    /* This extracted worker does not link the frame/persistence owner: it may
+     * record the late failure, but must not fabricate a terminal receipt. */
+    assert(led_results[LED_SUCCESS]==0 && led_requests[LED_SUCCESS]==0);
+    assert(led_results[LED_PARTIAL]==0 && led_results[LED_APPLIED_NOT_SAVED]==0);
+}
 int main(void) {
     reset_case();
-    samples_begin(); magneto_progress=0x80; running=true; led=SYS_LED_PATTERN_LONG;
+    samples_begin(); magneto_progress=0x80; running=true;
     mag_wait_error=-ETIMEDOUT;
     assert(sensor_calibrate_mag() == -1);
     assert(token_reads == 1 && ends == 1 && outcome == CAL_OUTCOME_FAILED);
     assert(reason == CAL_REASON_SAMPLE_TIMEOUT && phase == CAL_PHASE_COLLECT);
-    assert(!admission && !running && magneto_progress == 0 && led == SYS_LED_PATTERN_OFF);
+    assert(!admission && !running && magneto_progress == 0);
+    /* The abandoned manual session submits its own failure receipt exactly once. */
+    assert(led_results[LED_FAILED] == 1);
+    assert(led_results[LED_SUCCESS] == 0);
     /* Next admitted session can collect rather than inheriting timeout state. */
     current_operation++;
     ends=token_reads=0; mag_wait_error=0;
@@ -166,26 +515,33 @@ int main(void) {
 
     reset_case(); inject_motion=true;
     float matrix[4][3]; int captured=0;
-    assert(sensor_6_sideBias(matrix,&captured) == -3);
+    assert(sensor_calibration_collect_accel_poses(matrix,&captured) == -3);
     assert(captured == 6 && motion_retries == 1 && ends == 0 && token_reads == 1);
+    assert(first_capture_ms >= 2000 && accel_drains >= 7);
+    assert(sample_count == 3000 && norm_sum == 3000);
 
     reset_case(); pose_limit=5;
-    sensor_calibrate_6_side();
+    sensor_calibrate_accel();
     assert(ends == 1 && outcome == CAL_OUTCOME_FAILED && reason == CAL_REASON_INSUFFICIENT_SAMPLES);
     assert(commits == 0 && solver_calls == 0);
 
     reset_case(); pose_limit=6;
-    sensor_calibrate_6_side();
+    sensor_calibrate_accel();
     assert(ends == 0 && commits == 1 && solver_calls == 1);
     assert(pending_operation == current_operation && completion_reason == CAL_REASON_PARTIAL);
+    assert(pending_partial); /* The pose wrapper must hand partiality to the owner. */
     /* Applying belongs to imu_calibration's independently tested frame owner;
      * the pose wrapper may queue a partial candidate, never complete it here. */
 
     reset_case(); pose_limit=6; solver_error=-EDOM;
-    sensor_calibrate_6_side();
+    sensor_calibrate_accel();
     assert(ends == 1 && outcome == CAL_OUTCOME_FAILED && reason == CAL_REASON_FIT_ERROR);
     assert(commits == 0);
-    puts("manual MAG timeout recovery / 18-pose retry and partial handoff: PASS");
+    test_manual_replacement();
+    test_imu_tcal_preserves_measured_candidate();
+    test_accel_rest_observations();
+    test_imu_tcal_late_storage_failure();
+    puts("manual MAG recovery / partial handoff / IMU T-Cal measured candidate and late storage receipt: PASS");
     return 0;
 }
 '''
@@ -194,25 +550,55 @@ int main(void) {
 def main():
     cal = ROOT / "src/sensor/calibration"
     mag = (cal / "cal_mag.c").read_text()
+    calibration = (cal / "calibration.c").read_text()
+    case_start = calibration.index("case CAL_REQUEST_MAG:", calibration.index("static void calibration_thread(void)\n{"))
+    case_end = calibration.index("\n#endif\n\t\tdefault:", case_start)
+    worker = ("static void manual_worker_step(void) { int requested = CAL_REQUEST_MAG; "
+              "uint16_t operation = sensor_calibration_current_operation(); switch (requested) {\n"
+              + calibration[case_start:case_end] + "\ndefault: break; }}")
     imu = (cal / "cal_imu.c").read_text()
     bias = (cal / "bias_collect.c").read_text()
     util = (ROOT / "src/util.c").read_text()
+    runtime = (cal / "tcal_runtime.c").read_text()
+    magneto = (cal / "magneto.c").read_text()
+    runtime_header = (cal / "tcal_runtime.h").read_text()
+    tcal_constants = "\n".join(line for line in runtime_header.splitlines()
+                              if line.startswith(("#define TEMP_TO_IDX", "#define BOOT_CAL_MIN_CURVE_POINTS",
+                                                  "#define TCAL_HYSTERESIS_")))
+    tcal_direction = runtime_header[runtime_header.index("typedef enum {"):
+                                   runtime_header.index("void update_tcal_state")]
     state = mag[mag.index("uint8_t magneto_progress;"):mag.index("static void magneto_update_dir_range")]
     constants = "\n".join(line for line in mag.splitlines() if line.startswith(("#define CALIB_", "#define MIN_ORIENTATION_", "#define THRESHOLD_ACC", "#define SAMPLES_PER_")))
     constants += "\n" + next(line for line in imu.splitlines() if line.startswith("#define CALIB_MIN_POSES_FOR_PARTIAL"))
     source = "\n\n".join((
-        PRELUDE, state, constants, "typedef struct { float x,y,z; } Vector3;",
-        function(util,"v_diff_mag"), function(util,"v_epsilon"),
-        function(mag,"magneto_reset"), function(mag,"magneto_min_dir_range"), HELPERS,
-        function(mag,"manual_finish"), function(mag,"sensor_calibrate_mag"),
-        function(bias,"isAccRest"), function(mag,"sensor_6_sideBias"),
-        function(imu,"imu_step"), function(imu,"imu_failed"), function(imu,"sensor_calibrate_6_side"), TESTS,
+        PRELUDE, tcal_constants, tcal_direction, IMU_LEAVES,
+        state, constants, "typedef struct { float x,y,z; } Vector3;",
+        function(util,"v_finite"), function(util,"v_diff_mag"), function(util,"v_epsilon"), function(util,"apply_BAinv"),
+        function(util,"v_avg"),
+        *(function(magneto,name) for name in (
+            "magneto_center_reset", "magneto_center_update", "magneto_center_get",
+            "magneto_center_min_range", "magneto_center_has_coverage", "magneto_centered_sample",
+            "magneto_coverage_sample", "magneto_norm_sq", "magneto_normalize_direction",
+            "magneto_centered_direction", "mag_bainv_structurally_ok", "magneto_quality_check")),
+        function(mag,"magneto_min_dir_range"),
+        function(mag,"magneto_update_dir_range"), function(mag,"sensor_sample_mag_magneto_sample"),
+        function(calibration,"sensor_calibration_process_mag"),
+        function(mag,"magneto_reset"), HELPERS,
+        function(mag,"manual_finish"), function(mag,"manual_cancelled"),
+        function(mag,"sensor_calibrate_mag"),
+        worker,
+        function(bias,"isAccRest"), function(mag,"sensor_calibration_collect_accel_poses"),
+        function(imu,"imu_step"), function(imu,"imu_failed"), function(imu,"imu_cancelled"),
+        function(runtime,"sensor_tcal_assess_quality"), function(imu,"sensor_calibrate_imu"),
+        function(imu,"sensor_calibrate_accel"), TESTS,
     ))
     with tempfile.TemporaryDirectory(prefix="cal-mag-events-") as directory:
         path = Path(directory)
         (path / "test.c").write_text(source)
         cc = shlex.split(os.environ.get("CC", "cc"))
-        subprocess.run(cc + ["-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "src"), str(path / "test.c"), "-lm", "-o", str(path / "test")], check=True)
+        subprocess.run(cc + ["-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                             "-DCONFIG_CONNECTION_RAW_COLLECTION=1", "-DCONFIG_SENSOR_USE_MAGNETOMETER=1",
+                             "-I", str(ROOT / "src"), str(path / "test.c"), "-lm", "-o", str(path / "test")], check=True)
         subprocess.run([str(path / "test")], check=True)
 
 

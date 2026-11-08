@@ -6,12 +6,57 @@
 /* Compile production diagnostics, replacing only kernel/time and output leaves. */
 #define SLIMENRF_SENSOR
 #define CONFIG_SENSOR_USE_VQF 0
-#define CONFIG_SENSOR_RANGE_STATS 0
+#define CONFIG_VQF_BENCH 0
 float sensor_get_accel_odr(void);
 #include "../../../src/sensor/diagnostics.c"
 
+/* Maintenance facts belong to the single connection owner; the fixture records
+ * only that the sensor side re-announced them. */
+static unsigned maintenance_updates;
+
+void connection_feedback_maintenance_update(void)
+{
+	maintenance_updates++;
+}
+
+/* Semantic LED leaves used by the shared owner helper (system/led.h types). */
+static uint32_t led_identity;
+static unsigned led_requests[LED_SEMANTIC_COUNT];
+
+uint32_t led_request_id(void) { return ++led_identity; }
+uint32_t led_event_id(void) { return ++led_identity; }
+struct led_token led_begin(enum led_owner owner, uint32_t request_id)
+{
+	return (struct led_token){ .owner = owner, .session = ++led_identity, .request_id = request_id };
+}
+enum led_admission led_state(struct led_token token, uint32_t revision, enum led_semantic semantic)
+{
+	(void)token;
+	(void)revision;
+	(void)semantic;
+	return LED_ADMITTED;
+}
+enum led_admission led_result(struct led_token token, uint32_t event_id, enum led_semantic semantic)
+{
+	(void)token;
+	(void)event_id;
+	(void)semantic;
+	return LED_ADMITTED;
+}
+enum led_admission led_request_event(enum led_owner owner, uint32_t request_id, uint32_t event_id,
+				     enum led_semantic semantic)
+{
+	(void)owner;
+	(void)request_id;
+	(void)event_id;
+	led_requests[semantic]++;
+	return LED_ADMITTED;
+}
+
 static int64_t now_ms;
 static unsigned int lock_depth;
+static unsigned int lock_calls;
+static unsigned int clock_calls;
 static unsigned int clock_calls_until_restart;
 static void (*pending_console)(void);
 static void (*print_hook)(void);
@@ -30,6 +75,7 @@ static void restart_session(void)
 k_spinlock_key_t k_spin_lock(struct k_spinlock *lock)
 {
 	assert(!lock->held && !lock_depth);
+	lock_calls++;
 	lock->held = 1;
 	lock_depth++;
 	return 0;
@@ -50,6 +96,7 @@ void k_spin_unlock(struct k_spinlock *lock, k_spinlock_key_t key)
 
 int64_t k_uptime_get(void)
 {
+	clock_calls++;
 	int64_t sampled = now_ms;
 	if (clock_calls_until_restart && --clock_calls_until_restart == 0) {
 		/* A higher-priority console becomes runnable while the sensor checks
@@ -132,7 +179,7 @@ static void emit(unsigned int samples, float value)
 
 static void reset_observations(void)
 {
-	sensor_debug_stop();
+	assert(!sensor_debug_is_active());
 	stopped_count = 0;
 	reports = 0;
 }
@@ -176,14 +223,15 @@ static void test_restart_discards_old_frame_and_sample_credit(void)
 	assert(reports == 0);
 	emit(3, 2);
 	assert(reports == 1 && last_raw_accel == 2);
-	sensor_debug_stop();
+	now_ms = 7000;
+	assert(!sensor_debug_is_active());
 	assert(stopped_count == 1 && stopped_counts[0] == 1);
 }
 
 static void test_restart_during_output_admission(void)
 {
 	reset_observations();
-	now_ms = 6000;
+	now_ms = 8000;
 	sensor_debug_start(2);
 	sensor_diagnostics_reset_frame();
 	collect(4, 9);
@@ -193,68 +241,117 @@ static void test_restart_during_output_admission(void)
 	assert(reports == 0);
 	emit(4, 2);
 	assert(reports == 1 && last_raw_accel == 2);
-	sensor_debug_stop();
+	now_ms = 10000;
+	assert(!sensor_debug_is_active());
 	assert(stopped_count == 1 && stopped_counts[0] == 1);
 }
 
 static void test_reserved_output_keeps_its_session(void)
 {
 	reset_observations();
-	now_ms = 7000;
+	now_ms = 11000;
 	sensor_debug_start(2);
 	sensor_diagnostics_reset_frame();
 	collect(4, 3);
-	now_ms = 7500;
+	now_ms = 11500;
 	/* First clock is the active check; second is the output reservation. */
 	clock_calls_until_restart = 2;
 	output();
 	assert(reports == 1 && last_elapsed == 0.5f && last_raw_accel == 3);
-	sensor_debug_stop();
+	now_ms = 13500;
+	assert(!sensor_debug_is_active());
 	assert(stopped_count == 1 && stopped_counts[0] == 0);
 
-	/* Also allow stop/restart from the slow printk leaf, never under lock. */
+	/* A restart from the slow printk leaf cannot alter a reserved output. */
 	sensor_debug_start(2);
 	print_hook = restart_session;
 	emit(4, 5);
-	sensor_debug_stop();
+	assert(reports == 2 && last_elapsed == 0.0f && last_raw_accel == 5);
+	now_ms = 15500;
+	assert(!sensor_debug_is_active());
 	assert(stopped_count == 2 && stopped_counts[1] == 0);
 }
 
-static void test_stop_report_snapshot(void)
+static void test_expiry_report_snapshot(void)
 {
 	reset_observations();
-	now_ms = 8000;
+	now_ms = 16000;
 	sensor_debug_start(2);
 	emit(4, 1);
 	log_hook = restart_session;
-	sensor_debug_stop();
+	now_ms = 18000;
+	assert(!sensor_debug_is_active());
 	assert(sensor_debug_is_active());
 	assert(stopped_count == 1 && stopped_counts[0] == 1);
-	sensor_debug_stop();
+	now_ms = 20000;
+	assert(!sensor_debug_is_active());
 	assert(stopped_count == 2 && stopped_counts[1] == 0);
 }
 
 static void test_deadline_rejects_unreserved_output(void)
 {
 	reset_observations();
-	now_ms = 9000;
+	now_ms = 24000;
 	sensor_debug_start(1);
 	sensor_diagnostics_reset_frame();
 	collect(4, 1);
-	now_ms = 9999;
+	now_ms = 24999;
 	assert(sensor_debug_is_active());
-	now_ms = 10000;
+	now_ms = 25000;
 	output();
 	assert(reports == 0);
 	assert(stopped_count == 1 && stopped_counts[0] == 0);
 
-	/* Long uptime exercises the real 64-bit timestamp path. */
+	/* The advertised maximum must survive until 60s, including at long uptime. */
 	now_ms = (int64_t)UINT32_MAX + 1234;
-	sensor_debug_start(30);
-	now_ms += 29999;
+	sensor_debug_start(60);
+	now_ms += 59999;
 	assert(sensor_debug_is_active());
 	now_ms++;
 	assert(!sensor_debug_is_active());
+}
+
+static void test_maintenance_notifies_connection_and_led(void)
+{
+	reset_observations();
+	led_requests[LED_SUCCESS] = 0;
+	unsigned int before = maintenance_updates;
+	now_ms = 21000;
+	sensor_debug_start(2);
+	/* Applying a maintenance/raw session re-announces facts to the connection
+	 * owner and submits the owner's own semantic receipt. */
+	assert(maintenance_updates == before + 1);
+	assert(led_requests[LED_SUCCESS] == 1);
+	now_ms = 22999;
+	assert(sensor_diagnostics_maintenance_active());
+	now_ms = 23000;
+	assert(!sensor_diagnostics_maintenance_active());
+	/* Deadline expiry does not emit the explicit-stop feedback or receipt. */
+	assert(maintenance_updates == before + 1);
+	assert(led_requests[LED_SUCCESS] == 1);
+}
+
+static void test_inactive_frame_has_no_sample_session_work(void)
+{
+	now_ms = 30000;
+	assert(!sensor_debug_is_active());
+	sensor_diagnostics_reset_frame();
+	unsigned int locks_before = lock_calls;
+	unsigned int clocks_before = clock_calls;
+	collect(4, 9);
+	assert(lock_calls == locks_before);
+	assert(clock_calls == clocks_before);
+
+	sensor_debug_start(2);
+	locks_before = lock_calls;
+	clocks_before = clock_calls;
+	collect(4, 11);
+	assert(lock_calls == locks_before);
+	assert(clock_calls == clocks_before);
+	output();
+	unsigned int reports_before = reports;
+	emit(4, 2);
+	assert(reports == reports_before + 1 && last_raw_accel == 2);
 }
 
 int main(void)
@@ -263,8 +360,10 @@ int main(void)
 	test_restart_discards_old_frame_and_sample_credit();
 	test_restart_during_output_admission();
 	test_reserved_output_keeps_its_session();
-	test_stop_report_snapshot();
+	test_expiry_report_snapshot();
+	test_maintenance_notifies_connection_and_led();
 	test_deadline_rejects_unreserved_output();
+	test_inactive_frame_has_no_sample_session_work();
 	puts("diagnostics sessions: PASS");
 	return 0;
 }

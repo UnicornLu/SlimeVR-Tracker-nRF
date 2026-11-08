@@ -37,17 +37,22 @@
  * Frame structure (repeats every frame_ticks):
  *   [Slot 0][Slot 1][Slot 2]...[Slot N-1]   (N = total_slots, dynamic)
  *
- * Every slot is 22 network ticks. Normal NoACK traffic may use the owner's
- * slot once per frame. Approximately once per second, each tracker has a
+ * Slot widths are dynamically assigned in network ticks. Normal NoACK traffic
+ * may use the owner's slot once per frame. Approximately once per second, each tracker has a
  * deterministic guarded PING window spanning its slot and the following slot;
  * the following owner remains silent for that frame. Empty opportunities do
  * not cause transmissions.
  *
- * Parameters are dynamically assigned by the receiver via PONG bytes 8-11:
- *   byte 8:  assigned_slot_index (0-15, or 0xFF = unassigned)
- *   byte 9:  total_slots (1-16)
- *   byte 10: slot_ticks (22 for the measured-safe nRF52 guarded mode)
+ * Parameters are dynamically assigned by NORMAL PONG bytes 8-11:
+ *   byte 8:  assigned slot_index (0-15), or 0xFF when unassigned
+ *   byte 9:  total_slots (1-16 for a usable layout); slot_index must be below total
+ *   byte 10: slot_ticks (16-255 accepted by the tracker)
  *   byte 11: config_epoch (wrapping uint8_t)
+ * The receiver uses 16-64 ticks at level 0 and may widen through 254 ticks
+ * on its loss ladder.
+ * This legacy layout is unchanged. The separately requested CHANNEL_CONFIRM
+ * PONG (0x37) carries channel proof, not TDMA parameters.
+ * PONG remains 13 bytes with CRC at byte 12; other command layouts are unchanged.
  *
  * Normal NoACK traffic is limited to one packet per tracker frame. Before
  * queueing, payload-aware admission reserves measured READY->END airtime plus
@@ -75,11 +80,9 @@ void tdma_init(uint8_t tracker_id);
 /**
  * Block until this tracker can safely launch one normal NoACK packet.
  *
- * Admission allows at most one normal NoACK packet per TDMA frame and reserves
- * a payload-size-specific call-to-END budget. A late packet, guarded frame, or
- * second packet in one frame waits for the next usable own slot. Waiting occurs
- * before esb_write_payload(), so the ESB FIFO cannot auto-drain while sleeping.
- * Returns immediately when TDMA or synchronized server time is unavailable.
+ * Admission allows at most one normal NoACK packet per receiver-low32 TDMA
+ * frame. The final frame and frame zero are deferred at rollover. Waits are
+ * bounded and return false when the clock, layout, or opportunity changes.
  */
 bool tdma_wait_for_slot(uint8_t payload_length);
 
@@ -106,6 +109,7 @@ void tdma_print_stats(void);
  * Enable or disable TDMA at runtime.
  */
 void tdma_set_enabled(bool enabled);
+int tdma_user_set_enabled(bool enabled);
 
 /**
  * Check if TDMA is currently active (compiled in AND runtime enabled).
@@ -113,7 +117,23 @@ void tdma_set_enabled(bool enabled);
 bool tdma_is_enabled(void);
 
 /**
- * Current TDMA frame width in 32768 Hz server ticks (0 = no dynamic config yet).
+ * Read-only status-clock eligibility: authoritative sync age limit in ms,
+ * or -1 if TDMA is compiled out, disabled, or has no valid slot config.
+ * Call under irq_lock when snapshotting alongside ESB synchronization state.
+ */
+int64_t tdma_status_clock_max_age_ms(void);
+
+/**
+ * True while a data packet is refused admission only because receiver time is
+ * missing or stale. Every attempt is then rejected before the radio is
+ * touched, so callers that retry a refused payload must back off instead of
+ * polling at millisecond cadence.
+ */
+bool tdma_admission_stalled(void);
+
+/**
+ * Retained TDMA frame width in 32768 Hz network ticks, including while disabled.
+ * Zero means uninitialized; tdma_init() installs the fallback geometry.
  */
 uint16_t tdma_frame_ticks_get(void);
 
@@ -122,14 +142,15 @@ bool tdma_config_get(uint8_t *slot_index, uint8_t *slot_ticks, uint16_t *frame_t
 
 /**
  * Update TDMA parameters from receiver's dynamic config (PONG bytes 8-11).
- * Automatically enables TDMA when valid config is received.
+ * Rejects invalid wire geometry without changing state. Valid geometry returns
+ * true even when TDMA is compiled out; otherwise it publishes and enables TDMA.
  *
  * @param slot_index   Assigned slot index for this tracker (0-15)
  * @param total_slots  Total number of active slots in the frame (1-16)
- * @param slot_ticks   Width of each slot in ticks (14-163)
+ * @param slot_ticks   Width of each slot in network ticks (16-255)
  * @param epoch        Config epoch counter (for change detection)
  */
-void tdma_update_config(uint8_t slot_index, uint8_t total_slots, uint8_t slot_ticks, uint8_t epoch);
+bool tdma_update_config(uint8_t slot_index, uint8_t total_slots, uint8_t slot_ticks, uint8_t epoch);
 
 /**
  * Get the current config epoch (for change detection in PONG processing).

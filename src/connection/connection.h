@@ -31,18 +31,17 @@ void connection_print_ping_stats(void);
 void connection_request_ping_resync(void);
 /** Wake the single connection owner for newly due event work. */
 void connection_tracker_event_wake(void);
-void connection_clocks_request_start(void);
-void connection_clocks_request_start_delay_us(uint32_t delay_us);
-void connection_clocks_request_stop(void);
-void connection_clocks_request_stop_delay_us(uint32_t delay_us);
+/* Recompute maintenance facts after applied raw/debug/bench/capture changes. */
+void connection_feedback_maintenance_update(void);
 
 uint8_t connection_get_id(void);
 void connection_set_id(uint8_t id);
-uint8_t connection_get_packet_sequence(void);
 
 void connection_update_sensor_ids(int imu_id, int mag_id);
-void connection_update_sensor_data(float *q, float *a, int64_t data_time); // ticks
+void connection_update_sensor_data(float *q, float *a);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void connection_update_sensor_mag(float *m);
+#endif
 void connection_update_sensor_temp(float temp);
 void connection_update_battery(bool battery_available, bool plugged, bool charged, uint32_t battery_pptt, int battery_mV);
 void connection_update_status(int status);
@@ -50,6 +49,15 @@ void connection_update_status(int status);
 
 // Raw sensor data collection (runtime controlled via PONG command)
 
+bool connection_get_data_collection(void);
+bool connection_get_data_collection_batch(void);
+uint16_t connection_get_data_collection_batch_rate(void);
+
+// OTA suppression: reduce poll rate when another tracker is being updated
+void connection_set_ota_suppressed(bool suppressed);
+bool connection_get_ota_suppressed(void);
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
 struct raw_imu_sample {
 	float gyr_quat[4];  // accumulated raw gyro quaternion (w,x,y,z)
 	float accel[3];     // g from fifo_process
@@ -58,16 +66,12 @@ struct raw_imu_sample {
 
 // Enable/disable data collection (called from PONG command handler)
 void connection_set_data_collection(bool enable);
-bool connection_get_data_collection(void);
 
 // Returns -EBUSY for an active session's rate change; stop before restarting.
 int connection_set_data_collection_batch(bool enable, uint16_t rate_hz);
-bool connection_get_data_collection_batch(void);
-uint16_t connection_get_data_collection_batch_rate(void);
 
-// OTA suppression: reduce poll rate when another tracker is being updated
-void connection_set_ota_suppressed(bool suppressed);
-bool connection_get_ota_suppressed(void);
+/* Restart identity only, not a coherent snapshot of activity or batch settings. */
+uint32_t connection_get_raw_collection_session(void);
 
 // Queue a raw IMU sample for transmission (called from sensor thread).
 // Samples during the first five seconds of a session are intentionally
@@ -76,7 +80,9 @@ void connection_queue_raw_sample(const struct raw_imu_sample *sample);
 bool connection_raw_collection_startup_done(void);
 
 // Queue uncalibrated magnetometer data for body-frame raw transport.
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void connection_queue_raw_mag(const float mag[3]);
+#endif
 /* Raw meta: gyro_odr = raw TX rate (fusion INT_merge Hz); chip/fusion Hz after mag_id. */
 void connection_send_raw_metadata(float gyro_range, float accel_range,
 				  float gyro_odr, float accel_odr,
@@ -96,6 +102,7 @@ int connection_request_raw_retransmit(uint16_t sequence);
 // Drain queued raw data and transmit (called from connection thread)
 // Returns true if a packet was sent or an admission was deliberately retried.
 bool connection_process_raw_data(void);
+#endif
 
 
 #endif
