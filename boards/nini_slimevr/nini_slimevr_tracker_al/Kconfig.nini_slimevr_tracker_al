@@ -2,4 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 config BOARD_NINI_SLIMEVR_TRACKER_AL
+	bool "NiNi SlimeVR tracker AL (active-low) board"
 	select SOC_NRF52833_QDAA
+	select BOARD_HAS_DTS
+	help
+	  Enable support for the NiNi SlimeVR tracker AL board: two inverted (active-low) PWM LED channels and an I2C magnetometer.
+

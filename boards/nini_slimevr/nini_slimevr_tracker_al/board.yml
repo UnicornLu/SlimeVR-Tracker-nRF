@@ -3,9 +3,7 @@
 
 board:
   name: nini_slimevr_tracker_al
-  full_name: NiNi_Unicorn & MINGYUE Smol SlimeVR MAG (active-low LED)
+  full_name: NiNi_Unicorn & MINGYUE Smol SlimeVR MAG (active-low)
   vendor: nini_slimevr
   socs:
     - name: nrf52833
-      variants:
-      - name: 'LSM'
