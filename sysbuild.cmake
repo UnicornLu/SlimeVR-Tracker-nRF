@@ -8,7 +8,10 @@ endif()
 
 set(uses_uf2_layout FALSE)
 if((DEFINED SB_CONFIG_BOARD AND SB_CONFIG_BOARD MATCHES "uf2") OR
-   (DEFINED SB_CONFIG_BOARD_QUALIFIERS AND SB_CONFIG_BOARD_QUALIFIERS MATCHES "uf2"))
+   (DEFINED SB_CONFIG_BOARD_QUALIFIERS AND SB_CONFIG_BOARD_QUALIFIERS MATCHES "uf2") OR
+   # nini_slimevr_tracker is flashed through the same UF2 bootloader even
+   # though its board name no longer carries the "uf2" suffix.
+   (DEFINED SB_CONFIG_BOARD AND SB_CONFIG_BOARD STREQUAL "nini_slimevr_tracker"))
   set(uses_uf2_layout TRUE)
 endif()
 
