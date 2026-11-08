@@ -63,8 +63,8 @@
 
 
 / {
-	model = "nini_slimevr_mag_uf2";
-	compatible = "nini_slimevr_mag_uf2";
+	model = "nini_slimevr_tracker";
+	compatible = "nini_slimevr_tracker";
 
 	chosen {
 		zephyr,sram = &sram0;
