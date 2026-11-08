@@ -1,0 +1,11 @@
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+board:
+  name: nini_slimevr_tracker_al
+  full_name: NiNi_Unicorn & MINGYUE Smol SlimeVR MAG (active-low LED)
+  vendor: nini_slimevr
+  socs:
+    - name: nrf52833
+      variants:
+      - name: 'LSM'
