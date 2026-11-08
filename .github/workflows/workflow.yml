@@ -107,10 +107,17 @@ jobs:
       - name: 🪁 Install Zephyr SDK
         id: install-sdk
         if: steps.cache-sdk.outputs.cache-hit != 'true'
+        env:
+          SDK_URL: https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${{ env.ZEPHYR_SDK_VERSION }}/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz
         run: |
-          wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${{ env.ZEPHYR_SDK_VERSION }}/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz
-          tar xf zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}_linux-x86_64_minimal.tar.xz -C ~/
-          ~/zephyr-sdk-${{ env.ZEPHYR_SDK_VERSION }}/setup.sh -c -t arm-zephyr-eabi
+          set -euxo pipefail
+          archive="$RUNNER_TEMP/zephyr-sdk.tar.xz"
+          curl -4 -fL --retry 5 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 30 --speed-time 60 --speed-limit 1024 \
+            -o "$archive" "$SDK_URL"
+          ls -l "$archive"
+          tar xf "$archive" -C "$HOME"
+          "$HOME/zephyr-sdk-${ZEPHYR_SDK_VERSION}/setup.sh" -c -t arm-zephyr-eabi
 
       - name: 📦 Cache West Workspace
         id: cache-west
